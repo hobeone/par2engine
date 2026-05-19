@@ -324,7 +324,7 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 		}
 	}()
 
-	// 2. Scan protected files in parallel
+	// 2. Scan protected files in parallel using a shared program-wide semaphore
 	sem := make(chan struct{}, d.numGoroutines)
 	for _, fDesc := range d.recoveryFiles {
 		if ctx.Err() != nil {
@@ -332,12 +332,10 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 		}
 
 		scanWg.Add(1)
-		sem <- struct{}{}
 		go func(fd FileDescPacket) {
 			defer scanWg.Done()
-			defer func() { <-sem }()
 
-			err := d.scanFile(ctx, fd, window, checksumMap, matchChan)
+			err := d.scanFile(ctx, fd, window, sem, checksumMap, matchChan)
 			if err != nil {
 				d.logger.ErrorContext(ctx, "failed to scan file", "file", fd.Filename, "err", err)
 				setScanErr(err)
@@ -395,7 +393,7 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 	return ctx.Err()
 }
 
-func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32Window, checksumMap map[uint32][]checksumLocation, matchChan chan<- matchEvent) error {
+func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32Window, sem chan struct{}, checksumMap map[uint32][]checksumLocation, matchChan chan<- matchEvent) error {
 	f, err := d.root.Open(fd.Filename)
 	if os.IsNotExist(err) {
 		d.mu.Lock()
@@ -437,6 +435,14 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 		chunkWg.Add(1)
 		go func(chunkIdx int64) {
 			defer chunkWg.Done()
+
+			// Throttle concurrency at the chunk level to respect memory limits
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
 
 			start := chunkIdx * scanChunkSize
 			end := start + scanChunkSize + int64(d.sliceByteCount) - 1
