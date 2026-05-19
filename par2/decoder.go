@@ -265,8 +265,23 @@ func (d *Decoder) ShardCounts() ShardCounts {
 func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress) error {
 	d.mu.Lock()
 	d.fileIntegrity = make(map[FileID]*FileIntegrityState)
+	totalShards := 0
 	for _, f := range d.recoveryFiles {
+		if d.sliceByteCount == 0 {
+			d.mu.Unlock()
+			return errors.New("invalid PAR2 set: sliceByteCount is zero")
+		}
 		shards := (f.ByteCount + d.sliceByteCount - 1) / d.sliceByteCount
+		if shards > 32768 {
+			d.mu.Unlock()
+			return fmt.Errorf("invalid PAR2 set: file %s block count (%d) exceeds specification limit (32768)", f.Filename, shards)
+		}
+		totalShards += shards
+		if totalShards > 32768 {
+			d.mu.Unlock()
+			return fmt.Errorf("invalid PAR2 set: total recovery block count (%d) exceeds specification limit (32768)", totalShards)
+		}
+
 		locs := make([]ShardLocation, shards)
 		for i := range locs {
 			locs[i] = ShardLocation{Offset: -1}
