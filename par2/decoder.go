@@ -278,6 +278,8 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 	}
 	d.mu.Unlock()
 
+	window := newCRC32Window(d.sliceByteCount)
+
 	// Build expected checksum map
 	checksumMap := make(map[uint32][]checksumLocation)
 	for fID, ifsc := range d.fileChecksums {
@@ -335,7 +337,7 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 			defer scanWg.Done()
 			defer func() { <-sem }()
 
-			err := d.scanFile(ctx, fd, checksumMap, matchChan)
+			err := d.scanFile(ctx, fd, window, checksumMap, matchChan)
 			if err != nil {
 				d.logger.ErrorContext(ctx, "failed to scan file", "file", fd.Filename, "err", err)
 				setScanErr(err)
@@ -393,7 +395,7 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 	return ctx.Err()
 }
 
-func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, checksumMap map[uint32][]checksumLocation, matchChan chan<- matchEvent) error {
+func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32Window, checksumMap map[uint32][]checksumLocation, matchChan chan<- matchEvent) error {
 	f, err := d.root.Open(fd.Filename)
 	if os.IsNotExist(err) {
 		d.mu.Lock()
@@ -442,7 +444,7 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, checksumMap m
 				end = fileSize
 			}
 
-			d.scanChunk(ctx, f, fd.FileID, start, end, checksumMap, matchChan)
+			d.scanChunk(ctx, f, fd.FileID, window, start, end, checksumMap, matchChan)
 		}(i)
 	}
 
@@ -483,7 +485,7 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, checksumMap m
 	return nil
 }
 
-func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID, start, end int64, checksumMap map[uint32][]checksumLocation, matchChan chan<- matchEvent) {
+func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID, window *crc32Window, start, end int64, checksumMap map[uint32][]checksumLocation, matchChan chan<- matchEvent) {
 	bufferSize := end - start
 	if bufferSize < int64(d.sliceByteCount) {
 		return
@@ -494,7 +496,6 @@ func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID
 		return
 	}
 
-	window := newCRC32Window(d.sliceByteCount)
 	var crcSlice uint32
 	justMissed := false
 
