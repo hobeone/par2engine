@@ -159,7 +159,8 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 	}
 	defer f.Close()
 
-	data, err := io.ReadAll(f)
+	// Limit reading to 100MB to prevent memory exhaustion Denial of Service (DoS)
+	data, err := io.ReadAll(io.LimitReader(f, 100*1024*1024))
 	if err != nil {
 		return err
 	}
@@ -835,7 +836,8 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 	}
 	defer f.Close()
 
-	data, err := io.ReadAll(f)
+	// Limit reading to 100MB to prevent memory exhaustion Denial of Service (DoS)
+	data, err := io.ReadAll(io.LimitReader(f, 100*1024*1024))
 	if err != nil {
 		return err
 	}
