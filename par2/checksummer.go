@@ -1,6 +1,7 @@
 package par2
 
 import (
+	"errors"
 	"hash/crc32"
 )
 
@@ -11,9 +12,9 @@ type crc32Window struct {
 
 // newCRC32Window computes rolling tables to calculate CRC32 in constant time
 // O(1) regardless of the window size. Matches standard IEEE polynomial.
-func newCRC32Window(windowSize int) *crc32Window {
+func newCRC32Window(windowSize int) (*crc32Window, error) {
 	if windowSize < 4 {
-		panic("window size too small for sliding calculation")
+		return nil, errors.New("window size too small for sliding calculation")
 	}
 	a := make([]byte, windowSize+1)
 	crc0 := crc32.ChecksumIEEE(a)
@@ -49,7 +50,7 @@ func newCRC32Window(windowSize int) *crc32Window {
 	return &crc32Window{
 		windowSize:              windowSize,
 		crcOldLeaderMaskedTable: maskedTable,
-	}
+	}, nil
 }
 
 // update rolls the window forward by 1 byte: drops oldLeader and appends newTrailer.

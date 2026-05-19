@@ -8,7 +8,10 @@ import (
 )
 
 func TestNewIdentityMatrix(t *testing.T) {
-	m := NewIdentityMatrix(3)
+	m, err := NewIdentityMatrix(3)
+	if err != nil {
+		t.Fatalf("failed to create identity matrix: %v", err)
+	}
 	expected := []gf16.T{
 		1, 0, 0,
 		0, 1, 0,
@@ -21,7 +24,10 @@ func TestNewIdentityMatrix(t *testing.T) {
 
 func TestNewVandermondeMatrix(t *testing.T) {
 	generators := []gf16.T{2, 3}
-	m := NewVandermondeMatrix(3, 2, generators)
+	m, err := NewVandermondeMatrix(3, 2, generators)
+	if err != nil {
+		t.Fatalf("failed to create Vandermonde matrix: %v", err)
+	}
 	// a[i, j] = gen[j]^i
 	// Row 0: 2^0 = 1, 3^0 = 1
 	// Row 1: 2^1 = 2, 3^1 = 3
@@ -38,10 +44,13 @@ func TestNewVandermondeMatrix(t *testing.T) {
 
 func TestMatrixInverse(t *testing.T) {
 	// Simple 2x2 non-singular matrix
-	m := NewMatrixFromSlice(2, 2, []gf16.T{
+	m, err := NewMatrixFromSlice(2, 2, []gf16.T{
 		3, 5,
 		7, 11,
 	})
+	if err != nil {
+		t.Fatalf("failed to create matrix: %v", err)
+	}
 
 	mInv, err := m.Inverse()
 	if err != nil {
@@ -65,12 +74,15 @@ func TestMatrixInverse(t *testing.T) {
 
 func TestMatrixInverseSingular(t *testing.T) {
 	// Singular matrix (row 1 is multiple of row 0)
-	m := NewMatrixFromSlice(2, 2, []gf16.T{
+	m, err := NewMatrixFromSlice(2, 2, []gf16.T{
 		3, 5,
 		gf16.T(3).Times(gf16.T(2)), gf16.T(5).Times(gf16.T(2)),
 	})
+	if err != nil {
+		t.Fatalf("failed to create matrix: %v", err)
+	}
 
-	_, err := m.Inverse()
+	_, err = m.Inverse()
 	if err == nil {
 		t.Fatal("expected error inverting singular matrix, got nil")
 	}

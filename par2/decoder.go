@@ -1,7 +1,6 @@
 package par2
 
 import (
-	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/binary"
@@ -170,8 +169,6 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 	defer f.Close()
 
 	// Reject PAR2 files exceeding 100MB to prevent memory exhaustion DoS.
-	// We check the actual size rather than using io.LimitReader, which would
-	// silently truncate and cause cryptic parse errors on partial packets.
 	const maxPAR2FileSize = 100 * 1024 * 1024
 	stat, err := f.Stat()
 	if err != nil {
@@ -180,28 +177,27 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 	if stat.Size() > maxPAR2FileSize {
 		return fmt.Errorf("index PAR2 file %s exceeds maximum allowed size (%d bytes > %d byte limit)", indexFilename, stat.Size(), maxPAR2FileSize)
 	}
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return err
-	}
 
-	r := bytes.NewReader(data)
-	for r.Len() > 0 {
+	// Use a loop to stream packet parsing without loading the whole file into memory.
+	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
-		h, err := ReadHeader(r)
+		h, err := ReadHeader(f)
+		if err == io.EOF {
+			break
+		}
 		if err != nil {
 			return fmt.Errorf("failed to read packet header: %w", err)
 		}
 
-		bodyLen := int(h.Length - 64)
-		if bodyLen > r.Len() {
-			return fmt.Errorf("packet declares body length %d but only %d bytes remain in file", bodyLen, r.Len())
+		bodyLen := int64(h.Length - 64)
+		if bodyLen < 0 || bodyLen > 128*1024*1024 { // 128MB max packet body safety limit
+			return errors.New("packet body exceeds safe engine limits")
 		}
 		body := make([]byte, bodyLen)
-		_, err = io.ReadFull(r, body)
+		_, err = io.ReadFull(f, body)
 		if err != nil {
 			return err
 		}
@@ -294,12 +290,12 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 			d.mu.Unlock()
 			return errors.New("invalid PAR2 set: sliceByteCount is zero")
 		}
-		shards := (f.ByteCount + d.sliceByteCount - 1) / d.sliceByteCount
+		shards := (uint64(f.ByteCount) + uint64(d.sliceByteCount) - 1) / uint64(d.sliceByteCount)
 		if shards > 32768 {
 			d.mu.Unlock()
 			return fmt.Errorf("invalid PAR2 set: file %s block count (%d) exceeds specification limit (32768)", f.Filename, shards)
 		}
-		totalShards += shards
+		totalShards += int(shards)
 		if totalShards > 32768 {
 			d.mu.Unlock()
 			return fmt.Errorf("invalid PAR2 set: total recovery block count (%d) exceeds specification limit (32768)", totalShards)
@@ -317,7 +313,10 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 	}
 	d.mu.Unlock()
 
-	window := newCRC32Window(d.sliceByteCount)
+	window, err := newCRC32Window(d.sliceByteCount)
+	if err != nil {
+		return err
+	}
 
 	// Build expected checksum map
 	checksumMap := make(map[uint32][]checksumLocation)
@@ -498,9 +497,9 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 	chunkWg.Wait()
 
 	// Natively verify the last partial block if the file size is not a multiple of sliceByteCount
-	shards := (fd.ByteCount + d.sliceByteCount - 1) / d.sliceByteCount
-	if fd.ByteCount%d.sliceByteCount != 0 {
-		lastBlockStart := int64((shards - 1) * d.sliceByteCount)
+	shards := (uint64(fd.ByteCount) + uint64(d.sliceByteCount) - 1) / uint64(d.sliceByteCount)
+	if uint64(fd.ByteCount)%uint64(d.sliceByteCount) != 0 {
+		lastBlockStart := int64((shards - 1) * uint64(d.sliceByteCount))
 		lastBlockLen := int64(fd.ByteCount) - lastBlockStart
 
 		partialData := make([]byte, lastBlockLen)
@@ -632,7 +631,11 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 	// Establish safe streaming chunksize based on memory limit (default 16MB).
 	// memoryLimit = chunksize * (totalDataShards + usableParityUsed)
 	// chunksize must be a multiple of 16 bytes for Galois aligned performance.
-	chunkSize := d.memoryLimit / int64(totalDataShards+counts.UnusableDataShardCount)
+	denom := int64(totalDataShards + counts.UnusableDataShardCount)
+	if denom <= 0 {
+		return errors.New("invalid shard configuration for repair")
+	}
+	chunkSize := d.memoryLimit / denom
 	if chunkSize > int64(d.sliceByteCount) {
 		chunkSize = int64(d.sliceByteCount)
 	}
@@ -889,37 +892,27 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 	}
 	defer f.Close()
 
-	// Reject PAR2 files exceeding 100MB to prevent memory exhaustion DoS.
-	const maxPAR2FileSize = 100 * 1024 * 1024
-	stat, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("failed to stat volume file: %w", err)
-	}
-	if stat.Size() > maxPAR2FileSize {
-		return fmt.Errorf("volume PAR2 file %s exceeds maximum allowed size (%d bytes > %d byte limit)", filename, stat.Size(), maxPAR2FileSize)
-	}
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return err
-	}
-
-	r := bytes.NewReader(data)
-	for r.Len() > 0 {
+	// Use a buffered reader to stream packet parsing without loading the whole file into memory.
+	// This prevents OOM attacks from massive recovery volume files.
+	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
-		h, err := ReadHeader(r)
+		h, err := ReadHeaderFromFile(f)
+		if err == io.EOF {
+			break
+		}
 		if err != nil {
 			return err
 		}
 
-		bodyLen := int(h.Length - 64)
-		if bodyLen > r.Len() {
-			return fmt.Errorf("packet declares body length %d but only %d bytes remain in file", bodyLen, r.Len())
+		bodyLen := int64(h.Length - 64)
+		if bodyLen < 0 || bodyLen > 128*1024*1024 { // 128MB max packet body safety limit
+			return errors.New("packet body exceeds safe engine limits")
 		}
 		body := make([]byte, bodyLen)
-		_, err = io.ReadFull(r, body)
+		_, err = io.ReadFull(f, body)
 		if err != nil {
 			return err
 		}
