@@ -8,8 +8,8 @@ HOWTO Pre-Generate the Golden Dataset:
 1. Compile the genperf helper tool:
    go build -o genperf ./cmd/genperf
 
-2. Run it to create the 18GB unique block dataset:
-   ./genperf ~/software/par2_perf_data
+2. Run it to create the unique block dataset (optional custom size in GB as 2nd arg, defaults to 18):
+   ./genperf ~/software/par2_perf_data 18
 
 3. Generate the canonical PAR2 set (BlockSize=4MB, ParityBlockCount=230) using C++ par2:
    cd ~/software/par2_perf_data
