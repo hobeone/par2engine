@@ -159,8 +159,18 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 	}
 	defer f.Close()
 
-	// Limit reading to 100MB to prevent memory exhaustion Denial of Service (DoS)
-	data, err := io.ReadAll(io.LimitReader(f, 100*1024*1024))
+	// Reject PAR2 files exceeding 100MB to prevent memory exhaustion DoS.
+	// We check the actual size rather than using io.LimitReader, which would
+	// silently truncate and cause cryptic parse errors on partial packets.
+	const maxPAR2FileSize = 100 * 1024 * 1024
+	stat, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat index file: %w", err)
+	}
+	if stat.Size() > maxPAR2FileSize {
+		return fmt.Errorf("index PAR2 file %s exceeds maximum allowed size (%d bytes > %d byte limit)", indexFilename, stat.Size(), maxPAR2FileSize)
+	}
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return err
 	}
@@ -177,8 +187,11 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 		}
 
 		bodyLen := int(h.Length - 64)
+		if bodyLen > r.Len() {
+			return fmt.Errorf("packet declares body length %d but only %d bytes remain in file", bodyLen, r.Len())
+		}
 		body := make([]byte, bodyLen)
-		_, err = r.Read(body)
+		_, err = io.ReadFull(r, body)
 		if err != nil {
 			return err
 		}
@@ -576,6 +589,17 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 
 	d.logger.InfoContext(ctx, "Starting pipelined repair...", "missing", counts.UnusableDataShardCount)
 
+	// Validate that all parity shards have the correct length. A malicious PAR2
+	// file could contain a recovery packet whose data is shorter than sliceByteCount
+	// (while still passing the per-packet MD5 integrity check). Without this guard,
+	// the slice expression parityBytes[offset:offset+currChunkSize] would panic.
+	for exp, parityBytes := range d.parityShards {
+		if len(parityBytes) != d.sliceByteCount {
+			return fmt.Errorf("recovery packet exponent %d has data length %d, expected sliceByteCount %d",
+				exp, len(parityBytes), d.sliceByteCount)
+		}
+	}
+
 	// Total data shards in PAR2 set
 	totalDataShards := 0
 	for _, f := range d.recoveryFiles {
@@ -813,6 +837,10 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 func (d *Decoder) loadVolumeFiles(ctx context.Context, indexFilename string) error {
 	prefix := strings.TrimSuffix(indexFilename, ".par2")
 
+	// NOTE: os.ReadDir is used here instead of d.root because Go's os.Root API
+	// does not expose a directory listing method. This is an accepted limitation:
+	// d.absRootDir was resolved via filepath.EvalSymlinks at construction time,
+	// and all actual file opens below go through d.root.Open which is sandboxed.
 	entries, err := os.ReadDir(d.absRootDir)
 	if err != nil {
 		return fmt.Errorf("failed to read sandboxed directory: %w", err)
@@ -851,8 +879,16 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 	}
 	defer f.Close()
 
-	// Limit reading to 100MB to prevent memory exhaustion Denial of Service (DoS)
-	data, err := io.ReadAll(io.LimitReader(f, 100*1024*1024))
+	// Reject PAR2 files exceeding 100MB to prevent memory exhaustion DoS.
+	const maxPAR2FileSize = 100 * 1024 * 1024
+	stat, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat volume file: %w", err)
+	}
+	if stat.Size() > maxPAR2FileSize {
+		return fmt.Errorf("volume PAR2 file %s exceeds maximum allowed size (%d bytes > %d byte limit)", filename, stat.Size(), maxPAR2FileSize)
+	}
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return err
 	}
@@ -869,8 +905,11 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 		}
 
 		bodyLen := int(h.Length - 64)
+		if bodyLen > r.Len() {
+			return fmt.Errorf("packet declares body length %d but only %d bytes remain in file", bodyLen, r.Len())
+		}
 		body := make([]byte, bodyLen)
-		_, err = r.Read(body)
+		_, err = io.ReadFull(r, body)
 		if err != nil {
 			return err
 		}

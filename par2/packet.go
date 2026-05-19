@@ -294,8 +294,14 @@ func ParseRecoveryPacket(body []byte) (*RecoveryPacket, error) {
 		return nil, errors.New("recovery exponent exceeds Galois field capacity")
 	}
 
+	// Copy parity data into its own allocation to avoid pinning the entire
+	// file buffer in memory (the returned slice would otherwise alias body,
+	// which aliases the full file read buffer).
+	dataCopy := make([]byte, len(body[4:]))
+	copy(dataCopy, body[4:])
+
 	return &RecoveryPacket{
 		Exponent: uint16(exp),
-		Data:     body[4:],
+		Data:     dataCopy,
 	}, nil
 }

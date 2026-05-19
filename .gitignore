@@ -1,6 +1,6 @@
 # Binaries
-par2engine-cli
-gopar
+/par2engine-cli
+/gopar
 
 # Testing & Coverage
 *.test
