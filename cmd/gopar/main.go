@@ -38,13 +38,15 @@ func runCLI() int {
 		memMB      int64
 		cpuProfile string
 		memProfile string
-		verbose    bool
+		maxFileSizeMB int64
+		verbose       bool
 	)
 
 	flagSet.IntVar(&numThreads, "t", runtime.NumCPU(), "number of concurrent processing threads")
 	flagSet.Int64Var(&memMB, "m", 16, "memory limit in megabytes for data buffers")
 	flagSet.StringVar(&cpuProfile, "cpuprofile", "", "write CPU profile to file")
 	flagSet.StringVar(&memProfile, "memprofile", "", "write memory profile to file")
+	flagSet.Int64Var(&maxFileSizeMB, "max-file-size", 100, "maximum PAR2 index file size in megabytes")
 	flagSet.BoolVar(&verbose, "v", false, "enable verbose structured slog logging")
 
 	// Parse flags
@@ -120,7 +122,14 @@ func runCLI() int {
 
 	// Initialize Decoder
 	memLimitBytes := memMB * 1024 * 1024
-	d, err := par2.NewDecoder(ctx, par2Path, numThreads, memLimitBytes, logger)
+	maxFileLimitBytes := maxFileSizeMB * 1024 * 1024
+	// Allow packets to be up to 1.25x the file limit, or at least the default 128MB
+	maxPacketLimitBytes := maxFileLimitBytes * 5 / 4
+	if maxPacketLimitBytes < 128*1024*1024 {
+		maxPacketLimitBytes = 128 * 1024 * 1024
+	}
+
+	d, err := par2.NewDecoder(ctx, par2Path, numThreads, memLimitBytes, maxFileLimitBytes, maxPacketLimitBytes, logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error initializing PAR2 decoder: %v\n", err)
 		return ExitInvalidCommandLineArguments
