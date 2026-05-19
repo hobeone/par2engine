@@ -220,6 +220,11 @@ func TestPerfLarge(t *testing.T) {
 	if err != nil {
 		t.Fatal("repaired small-3.dat not found on disk!")
 	}
+	t.Logf("small-3: origLen=%d repLen=%d", len(smallOriginals["small-3.dat"]), len(repaired3))
+	if len(repaired3) >= 16 {
+		t.Logf("small-3 orig: %x", smallOriginals["small-3.dat"][:16])
+		t.Logf("small-3 rep : %x", repaired3[:16])
+	}
 	if !bytes.Equal(repaired3, smallOriginals["small-3.dat"]) {
 		t.Fatal("repaired small-3.dat is not identical to original!")
 	}
@@ -227,6 +232,11 @@ func TestPerfLarge(t *testing.T) {
 	repaired7, err := os.ReadFile(filepath.Join(dir, "small-7.dat"))
 	if err != nil {
 		t.Fatal("repaired small-7.dat not found on disk!")
+	}
+	t.Logf("small-7: origLen=%d repLen=%d", len(smallOriginals["small-7.dat"]), len(repaired7))
+	if len(repaired7) >= 16 {
+		t.Logf("small-7 orig: %x", smallOriginals["small-7.dat"][:16])
+		t.Logf("small-7 rep : %x", repaired7[:16])
 	}
 	if !bytes.Equal(repaired7, smallOriginals["small-7.dat"]) {
 		t.Fatal("repaired small-7.dat is not identical to original!")
