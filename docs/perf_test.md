@@ -73,6 +73,45 @@ Future AI runs and CI/CD pipelines **MUST** satisfy the following performance th
 
 ---
 
-## 4. Running the Performance Test & Profiling
+## 4. Execution & Gathering Performance Information (pprof Profiling)
 
-For details on how to compile the CLI, run the performance suite manually, and capture CPU/Memory profiling reports using `pprof`, refer to the [Gathering Performance Information section](file:///usr/local/google/home/hobe/.gemini/jetski/brain/cfd71f8c-b998-40d6-8dc6-8a89a44790d9/perf_test_plan.md#5-gathering-performance-information-pprof-profiling) in `perf_test_plan.md`.
+### Standard Execution
+To run the E2E 18GB parallel performance benchmark test suite manually:
+```bash
+# 1. Compile the CLI binary first
+go build -o par2engine-cli ./cmd/gopar
+
+# 2. Run the performance tag test suite
+go test -tags=perf -v -timeout=20m ./tests/... -run=TestPerfLarge
+```
+
+### Subprocess Profiling
+Standard `go test -cpuprofile=cpu.prof` flags only profile the Go test runner process, which spends its time sleeping while waiting for the subprocess command to finish. To gather profiles of the actual parallel reconstruction engine, we must collect profiling statistics **directly inside the `par2engine-cli` process**.
+
+We have implemented custom flag forwarding (`-perf.cpuprofile` and `-perf.memprofile`) inside `tests/perf_large_test.go` which automatically maps absolute path outputs to the `par2engine-cli` subprocess execution.
+
+#### 1. CPU Profile Capture
+To collect CPU profiling of the repair operation:
+```bash
+# Run the test forwarding the CPU profile file target to the subprocess
+go test -tags=perf -v -timeout=20m ./tests/... -run=TestPerfLarge -args -perf.cpuprofile=cpu.prof
+```
+
+Once the test completes, analyze CPU hotspots using standard Go tools:
+```bash
+go tool pprof -http=:8080 cpu.prof
+```
+This opens an interactive web browser. Select **"Flame Graph"** or **"Top"** to identify which mathematical loops in `gf16` or I/O channels inside `decoder.go` consume the most thread time.
+
+#### 2. Memory/Heap Profile Capture
+To collect Memory allocation / heap profiling:
+```bash
+# Run the test forwarding the Memory profile file target to the subprocess
+go test -tags=perf -v -timeout=20m ./tests/... -run=TestPerfLarge -args -perf.memprofile=mem.prof
+```
+
+Analyze memory allocation stacks to verify allocations on streaming math and I/O pipelines remain fully static (`0 allocs/op` growth):
+```bash
+go tool pprof -http=:8080 mem.prof
+```
+
