@@ -92,6 +92,24 @@ func TestRSEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("mismatched_lengths", func(t *testing.T) {
+		dataCopy := cloneShards(originalData)
+		parityCopy := cloneShards(parity)
+
+		// Make shard 1 have different length
+		dataCopy[1] = make([]byte, shardSize+1)
+
+		err := coder.Reconstruct(ctx, dataCopy, parityCopy, 0)
+		if err == nil || err.Error() != "mismatched shard lengths" {
+			t.Fatalf("got err = %v, want 'mismatched shard lengths'", err)
+		}
+
+		_, err = coder.GenerateParity(ctx, dataCopy, 0)
+		if err == nil || err.Error() != "mismatched shard lengths" {
+			t.Fatalf("got err = %v, want 'mismatched shard lengths'", err)
+		}
+	})
+
 	t.Run("not_enough_parity", func(t *testing.T) {
 		dataCopy := cloneShards(originalData)
 		parityCopy := cloneShards(parity)

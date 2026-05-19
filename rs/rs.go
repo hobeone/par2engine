@@ -48,7 +48,10 @@ func NewCoderPAR2Vandermonde(dataShards, parityShards int) (*Coder, error) {
 		return nil, errors.New("too many parity shards for GF(2^16)")
 	}
 
-	parityMatrix := NewVandermondeMatrix(parityShards, dataShards, generators)
+	parityMatrix, err := NewVandermondeMatrix(parityShards, dataShards, generators)
+	if err != nil {
+		return nil, err
+	}
 	return &Coder{
 		dataShards:   dataShards,
 		parityShards: parityShards,
@@ -74,8 +77,11 @@ func applyMatrixSlice(ctx context.Context, m Matrix, in, out [][]byte, outStart,
 }
 
 func applyMatrixParallelData(ctx context.Context, m Matrix, in, out [][]byte, numGoroutines int) error {
+	if len(in) == 0 || len(out) == 0 {
+		return nil
+	}
 	if len(in[0]) != len(out[0]) {
-		panic("mismatched data slice lengths")
+		return errors.New("mismatched data slice lengths")
 	}
 	if numGoroutines < 1 {
 		numGoroutines = DefaultNumGoroutines()
@@ -117,7 +123,10 @@ func applyMatrixParallelData(ctx context.Context, m Matrix, in, out [][]byte, nu
 }
 
 func makeReconstructionMatrix(dataShards int, availableRows, missingRows, usedParityRows []int, parityMatrix Matrix) (Matrix, error) {
-	m := NewMatrix(len(usedParityRows), len(usedParityRows))
+	m, err := NewMatrix(len(usedParityRows), len(usedParityRows))
+	if err != nil {
+		return Matrix{}, err
+	}
 	for i := 0; i < len(usedParityRows); i++ {
 		for j := 0; j < len(usedParityRows); j++ {
 			k := usedParityRows[i]
@@ -126,7 +135,10 @@ func makeReconstructionMatrix(dataShards int, availableRows, missingRows, usedPa
 		}
 	}
 
-	n := NewMatrix(len(usedParityRows), dataShards)
+	n, err := NewMatrix(len(usedParityRows), dataShards)
+	if err != nil {
+		return Matrix{}, err
+	}
 	for i := 0; i < len(usedParityRows); i++ {
 		for j := 0; j < dataShards; j++ {
 			if j < len(availableRows) {
@@ -144,6 +156,33 @@ func makeReconstructionMatrix(dataShards int, availableRows, missingRows, usedPa
 	return m.RowReduceForInverse(n)
 }
 
+func validateShardLengths(data, parity [][]byte) (int, error) {
+	sliceLen := -1
+	check := func(s []byte) error {
+		if s == nil {
+			return nil
+		}
+		if sliceLen == -1 {
+			sliceLen = len(s)
+		} else if len(s) != sliceLen {
+			return errors.New("mismatched shard lengths")
+		}
+		return nil
+	}
+
+	for _, s := range data {
+		if err := check(s); err != nil {
+			return 0, err
+		}
+	}
+	for _, s := range parity {
+		if err := check(s); err != nil {
+			return 0, err
+		}
+	}
+	return sliceLen, nil
+}
+
 // ErrNotEnoughParity is returned when there are not enough parity shards to reconstruct.
 var ErrNotEnoughParity = errors.New("not enough parity shards to perform reconstruction")
 
@@ -155,14 +194,17 @@ func (c *Coder) Reconstruct(ctx context.Context, data, parity [][]byte, numGorou
 		return ctx.Err()
 	}
 
+	sliceLen, err := validateShardLengths(data, parity)
+	if err != nil {
+		return err
+	}
+
 	var availableRows, missingRows []int
 	var input [][]byte
-	var sliceLen int
 	for i, dataShard := range data {
 		if dataShard != nil {
 			availableRows = append(availableRows, i)
 			input = append(input, dataShard)
-			sliceLen = len(dataShard)
 		} else {
 			missingRows = append(missingRows, i)
 		}
@@ -178,9 +220,6 @@ func (c *Coder) Reconstruct(ctx context.Context, data, parity [][]byte, numGorou
 		if parity[i] != nil {
 			usedParityRows = append(usedParityRows, i)
 			input = append(input, parity[i])
-			if sliceLen == 0 {
-				sliceLen = len(parity[i])
-			}
 		}
 	}
 
@@ -219,10 +258,18 @@ func (c *Coder) GenerateParity(ctx context.Context, data [][]byte, numGoroutines
 	if len(data) != c.dataShards {
 		return nil, errors.New("invalid data shard count")
 	}
+	sliceLen, err := validateShardLengths(data, nil)
+	if err != nil {
+		return nil, err
+	}
+	if sliceLen == -1 {
+		sliceLen = 0
+	}
+
 	parity := make([][]byte, c.parityShards)
 	for i := range parity {
-		parity[i] = make([]byte, len(data[0]))
+		parity[i] = make([]byte, sliceLen)
 	}
-	err := applyMatrixParallelData(ctx, c.parityMatrix, data, parity, numGoroutines)
+	err = applyMatrixParallelData(ctx, c.parityMatrix, data, parity, numGoroutines)
 	return parity, err
 }

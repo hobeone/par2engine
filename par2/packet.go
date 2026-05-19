@@ -5,7 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/binary"
 	"errors"
-	"math"
+	"io"
 	"path"
 	"path/filepath"
 	"sort"
@@ -83,8 +83,8 @@ type RecoveryPacket struct {
 	Data     []byte
 }
 
-// ReadHeader parses the standard 64-byte packet header from a buffer.
-func ReadHeader(r *bytes.Reader) (Header, error) {
+// ReadHeader parses the standard 64-byte packet header from an io.Reader.
+func ReadHeader(r io.Reader) (Header, error) {
 	var h Header
 	err := binary.Read(r, binary.LittleEndian, &h)
 	if err != nil {
@@ -97,6 +97,11 @@ func ReadHeader(r *bytes.Reader) (Header, error) {
 		return Header{}, errors.New("invalid PAR2 packet length")
 	}
 	return h, nil
+}
+
+// ReadHeaderFromFile is a convenience wrapper for ReadHeader that handles EOF.
+func ReadHeaderFromFile(r io.Reader) (Header, error) {
+	return ReadHeader(r)
 }
 
 // ComputePacketHash computes the MD5 hash of a packet body.
@@ -290,8 +295,8 @@ func ParseRecoveryPacket(body []byte) (*RecoveryPacket, error) {
 		return nil, errors.New("invalid recovery packet body alignment")
 	}
 	exp := binary.LittleEndian.Uint32(body[0:4])
-	if exp > math.MaxUint16 {
-		return nil, errors.New("recovery exponent exceeds Galois field capacity")
+	if exp > 32767 {
+		return nil, errors.New("recovery exponent exceeds safe engine limit (32767)")
 	}
 
 	// Copy parity data into its own allocation to avoid pinning the entire

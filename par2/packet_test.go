@@ -148,5 +148,12 @@ func TestParseRecoveryPacket(t *testing.T) {
 	if len(p.Data) != 8 {
 		t.Fatalf("got Data size %d, want 8", len(p.Data))
 	}
+
+	// Test exponent exceeding limit
+	binary.LittleEndian.PutUint32(body[0:4], 40000)
+	_, err = ParseRecoveryPacket(body)
+	if err == nil || err.Error() != "recovery exponent exceeds safe engine limit (32767)" {
+		t.Fatalf("got err = %v, want 'recovery exponent exceeds safe engine limit (32767)'", err)
+	}
 }
 
