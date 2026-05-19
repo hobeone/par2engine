@@ -293,6 +293,8 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 		}
 	}
 
+	lookupTable := newCRCLookupTable(checksumMap)
+
 	matchChan := make(chan matchEvent, 100)
 	var scanWg sync.WaitGroup
 
@@ -335,7 +337,7 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 		go func(fd FileDescPacket) {
 			defer scanWg.Done()
 
-			err := d.scanFile(ctx, fd, window, sem, checksumMap, matchChan)
+			err := d.scanFile(ctx, fd, window, sem, lookupTable, matchChan)
 			if err != nil {
 				d.logger.ErrorContext(ctx, "failed to scan file", "file", fd.Filename, "err", err)
 				setScanErr(err)
@@ -393,7 +395,7 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 	return ctx.Err()
 }
 
-func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32Window, sem chan struct{}, checksumMap map[uint32][]checksumLocation, matchChan chan<- matchEvent) error {
+func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32Window, sem chan struct{}, lookupTable *crcLookupTable, matchChan chan<- matchEvent) error {
 	f, err := d.root.Open(fd.Filename)
 	if os.IsNotExist(err) {
 		d.mu.Lock()
@@ -450,7 +452,7 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 				end = fileSize
 			}
 
-			d.scanChunk(ctx, f, fd.FileID, window, start, end, checksumMap, matchChan)
+			d.scanChunk(ctx, f, fd.FileID, window, start, end, lookupTable, matchChan)
 		}(i)
 	}
 
@@ -473,7 +475,7 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 		copy(paddedBlock, partialData)
 
 		crcVal := crc32.ChecksumIEEE(paddedBlock)
-		if locations, found := checksumMap[crcVal]; found {
+		if locations, found := lookupTable.Lookup(crcVal); found {
 			blockHash := md5.Sum(paddedBlock)
 			for _, loc := range locations {
 				if loc.md5Hash == blockHash {
@@ -491,7 +493,7 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 	return nil
 }
 
-func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID, window *crc32Window, start, end int64, checksumMap map[uint32][]checksumLocation, matchChan chan<- matchEvent) {
+func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID, window *crc32Window, start, end int64, lookupTable *crcLookupTable, matchChan chan<- matchEvent) {
 	bufferSize := end - start
 	if bufferSize < int64(d.sliceByteCount) {
 		return
@@ -517,7 +519,7 @@ func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID
 			crcSlice = crc32.ChecksumIEEE(slice)
 		}
 
-		locations, found := checksumMap[crcSlice]
+		locations, found := lookupTable.Lookup(crcSlice)
 		if !found {
 			j++
 			justMissed = true
@@ -875,4 +877,58 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 	}
 
 	return nil
+}
+
+type crcTableEntry struct {
+	crc   uint32
+	valid bool
+	locs  []checksumLocation
+}
+
+type crcLookupTable struct {
+	mask  uint32
+	table []crcTableEntry
+}
+
+func newCRCLookupTable(checksumMap map[uint32][]checksumLocation) *crcLookupTable {
+	numEntries := len(checksumMap)
+	size := 16
+	for size < numEntries*4 {
+		size *= 2
+	}
+
+	t := &crcLookupTable{
+		mask:  uint32(size - 1),
+		table: make([]crcTableEntry, size),
+	}
+
+	for crc, locs := range checksumMap {
+		idx := crc & t.mask
+		for {
+			if !t.table[idx].valid {
+				t.table[idx] = crcTableEntry{
+					crc:   crc,
+					valid: true,
+					locs:  locs,
+				}
+				break
+			}
+			idx = (idx + 1) & t.mask
+		}
+	}
+	return t
+}
+
+func (t *crcLookupTable) Lookup(crc uint32) ([]checksumLocation, bool) {
+	idx := crc & t.mask
+	for {
+		entry := &t.table[idx]
+		if !entry.valid {
+			return nil, false
+		}
+		if entry.crc == crc {
+			return entry.locs, true
+		}
+		idx = (idx + 1) & t.mask
+	}
 }
