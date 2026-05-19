@@ -98,7 +98,7 @@ Once the golden dataset is generated, execute the Go performance tests by pointi
 #### 1. Workspace Copy Path Override
 By default, the test copies the 18GB dataset to a Go temporary directory inside `/tmp` (which is often a RAM-backed `tmpfs` disk on Linux and could exhaust system memory!). 
 
-To avoid this, you can specify an optional **`PAR2_PERF_WORKSPACE`** environment variable pointing to a folder on a physical, fast SSD drive (e.g., `/usr/local/google/home/hobe/software/par2_perf_scratch`). 
+To avoid this, you can specify an optional **`PAR2_PERF_WORKSPACE`** environment variable pointing to a folder on a physical, fast SSD drive (e.g., `/home/hobe/software/par2_perf_scratch`). 
 - When specified, a dedicated sub-run folder will be created inside it, and it **will NOT be automatically deleted** after completion (allowing you to inspect and run standard CLI commands on the damaged dataset manually!).
 - Reminder: delete these custom workspace folders periodically to reclaim disk space.
 

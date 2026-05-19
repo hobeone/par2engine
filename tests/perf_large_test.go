@@ -19,13 +19,6 @@ HOWTO Pre-Generate the Golden Dataset:
 HOWTO Run Verification-Only Profiling:
 
    export PAR2_PERF_DIR=/home/hobe/software/par2_perf_data
-   # Optional: specify a fast SSD directory for scratch files instead of RAM-backed /tmp
-   export PAR2_PERF_WORKSPACE=/home/hobe/software/par2_perf_scratch
-   
----
-HOWTO Run Full Repair Profiling:
-
-   export PAR2_PERF_DIR=/home/hobe/software/par2_perf_data
    export PAR2_PERF_WORKSPACE=/home/hobe/software/par2_perf_scratch
    go build -o par2engine-cli ./cmd/gopar
    go test -tags=perf -v ./tests/... -run=TestPerfLarge -args -perf.verify_only=true -perf.cpuprofile=cpu_verify.prof
@@ -33,8 +26,8 @@ HOWTO Run Full Repair Profiling:
 ---
 HOWTO Run Full Repair Profiling:
 
-   export PAR2_PERF_DIR=/usr/local/google/home/hobe/software/par2_perf_data
-   export PAR2_PERF_WORKSPACE=/usr/local/google/home/hobe/software/par2_perf_scratch
+   export PAR2_PERF_DIR=/home/hobe/software/par2_perf_data
+   export PAR2_PERF_WORKSPACE=/home/hobe/software/par2_perf_scratch
    
    go build -o par2engine-cli ./cmd/gopar
    go test -tags=perf -v ./tests/... -run=TestPerfLarge -args -perf.cpuprofile=cpu_repair.prof
