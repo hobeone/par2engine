@@ -59,6 +59,16 @@ func (sc ShardCounts) RepairPossible() bool {
 	return sc.UsableParityShardCount >= sc.UnusableDataShardCount
 }
 
+// BlocksNeeded returns the number of additional recovery blocks required
+// to repair the set. Returns 0 when repair is not needed or is already possible.
+func (sc ShardCounts) BlocksNeeded() int {
+	deficit := sc.UnusableDataShardCount - sc.UsableParityShardCount
+	if deficit < 0 {
+		return 0
+	}
+	return deficit
+}
+
 // Decoder is the core PAR2 verification and repair engine.
 type Decoder struct {
 	numGoroutines int
