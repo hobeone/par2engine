@@ -72,6 +72,8 @@ func (sc ShardCounts) BlocksNeeded() int {
 type Decoder struct {
 	numGoroutines int
 	memoryLimit   int64
+	maxFileSize   int64
+	maxPacketSize int64
 	logger        *slog.Logger
 
 	root *os.Root // sandboxed target folder directory root (Go 1.24+)
@@ -102,12 +104,18 @@ type matchEvent struct {
 
 // NewDecoder opens a sandboxed target directory relative to the index par2 file,
 // parses the index par2 manifest, and returns a Decoder.
-func NewDecoder(ctx context.Context, par2Path string, numGoroutines int, memLimit int64, logger *slog.Logger) (*Decoder, error) {
+func NewDecoder(ctx context.Context, par2Path string, numGoroutines int, memLimit int64, maxFileSize int64, maxPacketSize int64, logger *slog.Logger) (*Decoder, error) {
 	if numGoroutines <= 0 {
 		numGoroutines = rs.DefaultNumGoroutines()
 	}
 	if memLimit <= 0 {
 		memLimit = 16 * 1024 * 1024 // 16MB default memory limit
+	}
+	if maxFileSize <= 0 {
+		maxFileSize = 100 * 1024 * 1024 // 100MB default index file size limit
+	}
+	if maxPacketSize <= 0 {
+		maxPacketSize = 128 * 1024 * 1024 // 128MB default packet body limit
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -128,6 +136,8 @@ func NewDecoder(ctx context.Context, par2Path string, numGoroutines int, memLimi
 	d := &Decoder{
 		numGoroutines: numGoroutines,
 		memoryLimit:   memLimit,
+		maxFileSize:   maxFileSize,
+		maxPacketSize: maxPacketSize,
 		logger:        logger,
 		root:          root,
 		absRootDir:    absDir,
@@ -168,14 +178,13 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 	}
 	defer f.Close()
 
-	// Reject PAR2 files exceeding 100MB to prevent memory exhaustion DoS.
-	const maxPAR2FileSize = 100 * 1024 * 1024
+	// Reject PAR2 files exceeding maximum allowed size to prevent memory exhaustion DoS.
 	stat, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("failed to stat index file: %w", err)
 	}
-	if stat.Size() > maxPAR2FileSize {
-		return fmt.Errorf("index PAR2 file %s exceeds maximum allowed size (%d bytes > %d byte limit)", indexFilename, stat.Size(), maxPAR2FileSize)
+	if stat.Size() > d.maxFileSize {
+		return fmt.Errorf("index PAR2 file %s exceeds maximum allowed size (%d bytes > %d byte limit)", indexFilename, stat.Size(), d.maxFileSize)
 	}
 
 	// Use a loop to stream packet parsing without loading the whole file into memory.
@@ -193,7 +202,7 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 		}
 
 		bodyLen := int64(h.Length - 64)
-		if bodyLen < 0 || bodyLen > 128*1024*1024 { // 128MB max packet body safety limit
+		if bodyLen < 0 || bodyLen > d.maxPacketSize { // 128MB max packet body safety limit
 			return errors.New("packet body exceeds safe engine limits")
 		}
 		body := make([]byte, bodyLen)
@@ -908,7 +917,7 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 		}
 
 		bodyLen := int64(h.Length - 64)
-		if bodyLen < 0 || bodyLen > 128*1024*1024 { // 128MB max packet body safety limit
+		if bodyLen < 0 || bodyLen > d.maxPacketSize { // 128MB max packet body safety limit
 			return errors.New("packet body exceeds safe engine limits")
 		}
 		body := make([]byte, bodyLen)
