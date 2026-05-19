@@ -202,7 +202,7 @@ func TestPerfLarge(t *testing.T) {
 
 	// 3. Execute verify command using par2engine-cli (Forward profiles if verifyOnly is true)
 	t.Log("Executing par2engine-cli verify...")
-	verifyArgs := []string{"verify"}
+	var verifyArgs []string
 	if *verifyOnly {
 		if *cpuprofile != "" {
 			absCPU, _ := filepath.Abs(*cpuprofile)
@@ -213,7 +213,7 @@ func TestPerfLarge(t *testing.T) {
 			verifyArgs = append(verifyArgs, "-memprofile", absMem)
 		}
 	}
-	verifyArgs = append(verifyArgs, par2Path)
+	verifyArgs = append(verifyArgs, "verify", par2Path)
 
 	cmdVerify := exec.Command(cliPath, verifyArgs...)
 	cmdVerify.Dir = dir
@@ -266,7 +266,7 @@ func TestPerfLarge(t *testing.T) {
 	var startMS runtime.MemStats
 	runtime.ReadMemStats(&startMS)
 
-	repairArgs := []string{"repair"}
+	var repairArgs []string
 	if *cpuprofile != "" {
 		absCPU, _ := filepath.Abs(*cpuprofile)
 		repairArgs = append(repairArgs, "-cpuprofile", absCPU)
@@ -275,7 +275,7 @@ func TestPerfLarge(t *testing.T) {
 		absMem, _ := filepath.Abs(*memprofile)
 		repairArgs = append(repairArgs, "-memprofile", absMem)
 	}
-	repairArgs = append(repairArgs, par2Path)
+	repairArgs = append(repairArgs, "repair", par2Path)
 
 	cmdRepair := exec.Command(cliPath, repairArgs...)
 	cmdRepair.Dir = dir
