@@ -1,0 +1,158 @@
+package rs
+
+import (
+	"bytes"
+	"context"
+	"math/rand/v2"
+	"testing"
+)
+
+func TestRSEndToEnd(t *testing.T) {
+	dataShards := 4
+	parityShards := 2
+	coder, err := NewCoderPAR2Vandermonde(dataShards, parityShards)
+	if err != nil {
+		t.Fatalf("NewCoder failed: %v", err)
+	}
+
+	shardSize := 64 // small shard size for fast tests
+
+	// 1. Generate random data shards
+	r := rand.New(rand.NewPCG(123, 456))
+	originalData := make([][]byte, dataShards)
+	for i := range originalData {
+		originalData[i] = make([]byte, shardSize)
+		for j := range originalData[i] {
+			originalData[i][j] = byte(r.Uint32())
+		}
+	}
+
+	// Clone data so we can corrupt it and compare later
+	cloneShards := func(shards [][]byte) [][]byte {
+		cloned := make([][]byte, len(shards))
+		for i := range shards {
+			if shards[i] != nil {
+				cloned[i] = make([]byte, len(shards[i]))
+				copy(cloned[i], shards[i])
+			}
+		}
+		return cloned
+	}
+
+	ctx := context.Background()
+
+	// 2. Encode to generate parity
+	parity, err := coder.GenerateParity(ctx, originalData, 0)
+	if err != nil {
+		t.Fatalf("GenerateParity failed: %v", err)
+	}
+	if len(parity) != parityShards {
+		t.Fatalf("got %d parity shards, want %d", len(parity), parityShards)
+	}
+
+	t.Run("loss_two_data_shards", func(t *testing.T) {
+		dataCopy := cloneShards(originalData)
+		parityCopy := cloneShards(parity)
+
+		// Corrupt data: lose shard 1 and 3
+		dataCopy[1] = nil
+		dataCopy[3] = nil
+
+		err := coder.Reconstruct(ctx, dataCopy, parityCopy, 0)
+		if err != nil {
+			t.Fatalf("Reconstruct failed: %v", err)
+		}
+
+		// Check bitwise identical
+		for i := range originalData {
+			if !bytes.Equal(dataCopy[i], originalData[i]) {
+				t.Fatalf("shard %d mismatch after reconstruction", i)
+			}
+		}
+	})
+
+	t.Run("loss_one_data_one_parity", func(t *testing.T) {
+		dataCopy := cloneShards(originalData)
+		parityCopy := cloneShards(parity)
+
+		// Corrupt: lose data shard 2 and parity shard 0
+		dataCopy[2] = nil
+		parityCopy[0] = nil
+
+		err := coder.Reconstruct(ctx, dataCopy, parityCopy, 0)
+		if err != nil {
+			t.Fatalf("Reconstruct failed: %v", err)
+		}
+
+		// Check bitwise identical for data
+		for i := range originalData {
+			if !bytes.Equal(dataCopy[i], originalData[i]) {
+				t.Fatalf("shard %d mismatch after reconstruction", i)
+			}
+		}
+	})
+
+	t.Run("not_enough_parity", func(t *testing.T) {
+		dataCopy := cloneShards(originalData)
+		parityCopy := cloneShards(parity)
+
+		// Corrupt: lose data shard 0, 1, 2 (needs 3, but we only have 2 parity shards)
+		dataCopy[0] = nil
+		dataCopy[1] = nil
+		dataCopy[2] = nil
+
+		err := coder.Reconstruct(ctx, dataCopy, parityCopy, 0)
+		if !errorsIs(err, ErrNotEnoughParity) {
+			t.Fatalf("got err = %v, want ErrNotEnoughParity", err)
+		}
+	})
+}
+
+func TestRSContextCancellation(t *testing.T) {
+	dataShards := 4
+	parityShards := 2
+	coder, err := NewCoderPAR2Vandermonde(dataShards, parityShards)
+	if err != nil {
+		t.Fatalf("NewCoder failed: %v", err)
+	}
+
+	// Use a huge shard size to ensure multiplication takes enough time to cancel
+	shardSize := 1024 * 1024 // 1MB Shards
+
+	r := rand.New(rand.NewPCG(42, 42))
+	data := make([][]byte, dataShards)
+	for i := range data {
+		data[i] = make([]byte, shardSize)
+		for j := range data[i] {
+			data[i][j] = byte(r.Uint32())
+		}
+	}
+
+	ctx := context.Background()
+	parity, err := coder.GenerateParity(ctx, data, 1)
+	if err != nil {
+		t.Fatalf("GenerateParity failed: %v", err)
+	}
+
+	// Corrupt shards
+	data[1] = nil
+	data[2] = nil
+
+	// Reconstruct with cancelled context
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel() // cancel immediately
+
+	err = coder.Reconstruct(cancelCtx, data, parity, 1)
+	if !errorsIs(err, context.Canceled) {
+		t.Fatalf("got err = %v, want context.Canceled", err)
+	}
+}
+
+// Simple helper to avoid errors package imports in tests if not needed,
+// or just standard errors.Is equivalent.
+func errorsIs(err, target error) bool {
+	if err == nil || target == nil {
+		return err == target
+	}
+	return err.Error() == target.Error()
+}

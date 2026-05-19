@@ -1,0 +1,22 @@
+# Binaries
+par2engine-cli
+gopar
+
+# Testing & Coverage
+*.test
+*.out
+*.prof
+*.pprof
+cpu.prof
+mem.prof
+
+# Local Workspace & Dependency Locks
+go.work
+go.work.sum
+
+# Editor / OS files
+.idea/
+.vscode/
+.DS_Store
+*~
+*.swp
