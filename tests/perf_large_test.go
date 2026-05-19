@@ -2,17 +2,41 @@
 
 package tests
 
+/*
+HOWTO Pre-Generate the Golden Dataset:
+
+1. Create a dedicated directory for the golden dataset:
+   mkdir -p /usr/local/google/home/hobe/software/par2_perf_data
+   cd /usr/local/google/home/hobe/software/par2_perf_data
+
+2. Create an 18GB large-file.dat sequentially with a repeating semi-random pattern:
+   dd if=/dev/urandom of=pattern.dat bs=16M count=1
+   for i in {1..1152}; do cat pattern.dat >> large-file.dat; done
+   rm pattern.dat
+
+3. Create 10 small files (sizes 1-4MB):
+   for i in {0..9}; do dd if=/dev/urandom of=small-$i.dat bs=1M count=$((1 + RANDOM % 4)); done
+
+4. Create the canonical PAR2 set (BlockSize=4MB, ParityCount=230):
+   par2 c -s4194304 -c230 set.par2 large-file.dat small-*.dat
+
+5. Run the performance test targeting this folder:
+   export PAR2_PERF_DIR=/usr/local/google/home/hobe/software/par2_perf_data
+   go build -o par2engine-cli ./cmd/gopar
+   go test -tags=perf -v ./tests/... -run=TestPerfLarge -args -perf.cpuprofile=cpu.prof
+*/
+
 import (
 	"bytes"
 	"crypto/md5"
 	"flag"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -20,67 +44,72 @@ import (
 var cpuprofile = flag.String("perf.cpuprofile", "", "write cpu profile of repair to file")
 var memprofile = flag.String("perf.memprofile", "", "write mem profile of repair to file")
 
+func copyFile(src, dest string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, in)
+	return err
+}
 
 func TestPerfLarge(t *testing.T) {
-	fixturesDir := "/usr/local/google/home/hobe/software/par2cmdline/tests"
-	if _, err := os.Stat(fixturesDir); err != nil {
-		t.Skip("par2cmdline workspace tests folder not found, skipping performance E2E test")
+	perfDir := os.Getenv("PAR2_PERF_DIR")
+	if perfDir == "" {
+		t.Skip("PAR2_PERF_DIR environment variable is not set. Skipping E2E 18GB performance test.\n" +
+			"To run this test, pre-generate the dataset inside a folder (see instructions in comments) " +
+			"and run:\n" +
+			"  export PAR2_PERF_DIR=/path/to/folder && go test -tags=perf -v ./tests/... -run=TestPerfLarge")
 	}
 
-	dir := "/usr/local/google/home/hobe/software/par2engine/perf_workspace"
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatalf("failed to create perf workspace: %v", err)
+	// Check that the golden dataset exists in perfDir
+	largeFilePathSrc := filepath.Join(perfDir, "large-file.dat")
+	if _, err := os.Stat(largeFilePathSrc); err != nil {
+		t.Fatalf("Golden large-file.dat not found in PAR2_PERF_DIR (%s): %v", perfDir, err)
 	}
-	defer os.RemoveAll(dir)
+	par2PathSrc := filepath.Join(perfDir, "set.par2")
+	if _, err := os.Stat(par2PathSrc); err != nil {
+		t.Fatalf("Golden set.par2 index not found in PAR2_PERF_DIR (%s): %v", perfDir, err)
+	}
 
+	// Create temporary workspace directory
+	dir := t.TempDir()
 	t.Logf("Performance test workspace initialized at %s", dir)
 
-	// 1. Generate 16MB buffer of random bytes
-	t.Log("Generating 16MB pattern buffer...")
-	r := rand.New(rand.NewPCG(42, 42))
-	pattern := make([]byte, 16*1024*1024)
-	for i := range pattern {
-		pattern[i] = byte(r.Uint32())
-	}
-
-	// 2. Write 18GB semi-random file (16MB written 1152 times)
-	largeFilePath := filepath.Join(dir, "large-file.dat")
-	t.Log("Writing 18GB large-file.dat sequentially...")
-	largeFile, err := os.OpenFile(largeFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	// Resolve and load all small files, large file, and PAR2 volume files from perfDir
+	entries, err := os.ReadDir(perfDir)
 	if err != nil {
-		t.Fatalf("failed to create large file: %v", err)
+		t.Fatalf("failed to read PAR2_PERF_DIR: %v", err)
 	}
 
-	startWrite := time.Now()
-	for i := 0; i < 1152; i++ {
-		_, err = largeFile.Write(pattern)
-		if err != nil {
-			largeFile.Close()
-			t.Fatalf("failed writing chunk %d to large-file: %v", i, err)
+	t.Log("Copying golden dataset to temporary workspace...")
+	startCopy := time.Now()
+	for _, entry := range entries {
+		name := entry.Name()
+		// Copy all files related to the set (.dat and .par2)
+		if strings.HasSuffix(name, ".dat") || strings.HasSuffix(name, ".par2") {
+			src := filepath.Join(perfDir, name)
+			dest := filepath.Join(dir, name)
+			if err := copyFile(src, dest); err != nil {
+				t.Fatalf("failed to copy %s: %v", name, err)
+			}
 		}
 	}
-	largeFile.Close()
-	t.Logf("Successfully wrote 18GB large-file.dat in %s", time.Since(startWrite))
+	t.Logf("Successfully copied golden dataset in %s", time.Since(startCopy))
 
-	// 3. Generate 10 small files (sizes 1-4MB)
-	t.Log("Generating 10 small files...")
-	smallOriginals := make(map[string][]byte)
-	for i := 0; i < 10; i++ {
-		name := fmt.Sprintf("small-%d.dat", i)
-		size := (1 + rand.IntN(4)) * 1024 * 1024
-		data := make([]byte, size)
-		for j := range data {
-			data[j] = byte(r.Uint32())
-		}
-		smallOriginals[name] = data
-		err = os.WriteFile(filepath.Join(dir, name), data, 0644)
-		if err != nil {
-			t.Fatalf("failed to write %s: %v", name, err)
-		}
-	}
+	largeFilePath := filepath.Join(dir, "large-file.dat")
+	par2Path := filepath.Join(dir, "set.par2")
 
-	// 4. Calculate pre-corruption MD5 hashes of the files
-	t.Log("Computing pre-corruption reference MD5 hashes...")
+	// 1. Save small files originals and compute pre-corruption hashes of the golden files
+	t.Log("Computing pre-corruption reference MD5 hashes from workspace copies...")
 	computeMD5 := func(path string) [16]byte {
 		f, err := os.Open(path)
 		if err != nil {
@@ -93,27 +122,20 @@ func TestPerfLarge(t *testing.T) {
 		copy(h[:], hasher.Sum(nil))
 		return h
 	}
+
 	origLargeHash := computeMD5(largeFilePath)
 
-	// 5. Create PAR2 set using canonical par2 CLI (Block Size = 4MB, Parity Block Count = 230)
-	t.Log("Invoking host's par2 CLI to generate recovery set (BlockSize=4MB, Count=230)...")
-	par2Path := filepath.Join(dir, "set.par2")
-	createCmd := exec.Command("par2", "c", "-s4194304", "-c230", par2Path, largeFilePath)
-	// Append small files
+	smallOriginals := make(map[string][]byte)
 	for i := 0; i < 10; i++ {
 		name := fmt.Sprintf("small-%d.dat", i)
-		createCmd.Args = append(createCmd.Args, filepath.Join(dir, name))
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("failed to read golden small file %s: %v", name, err)
+		}
+		smallOriginals[name] = data
 	}
-	createCmd.Dir = dir
 
-	startCreate := time.Now()
-	out, err := createCmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("failed to create par2 set via C++ par2: %v\n%s", err, out)
-	}
-	t.Logf("PAR2 set created successfully in %s", time.Since(startCreate))
-
-	// 6. Corrupt files:
+	// 2. Corrupt files just like Usenet packages:
 	t.Log("Simulating package corruptions...")
 	// Delete small-3.dat and small-7.dat
 	if err := os.Remove(filepath.Join(dir, "small-3.dat")); err != nil {
@@ -149,7 +171,7 @@ func TestPerfLarge(t *testing.T) {
 		t.Fatalf("failed to resolve CLI binary path: %v", err)
 	}
 
-	// 7. Execute verify command using par2engine-cli
+	// 3. Execute verify command using par2engine-cli
 	t.Log("Executing par2engine-cli verify...")
 	cmdVerify := exec.Command(cliPath, "verify", par2Path)
 	cmdVerify.Dir = dir
@@ -168,7 +190,7 @@ func TestPerfLarge(t *testing.T) {
 	}
 	t.Log("Verification completed correctly. Repair is verified to be possible.")
 
-	// 8. Execute repair command using par2engine-cli (Record RSS and Duration)
+	// 4. Execute repair command using par2engine-cli (Record RSS and Duration)
 	t.Log("Executing par2engine-cli repair...")
 	runtime.GC()
 	var startMS runtime.MemStats
@@ -209,7 +231,7 @@ func TestPerfLarge(t *testing.T) {
 	t.Logf("Memory Delta (RSS Growth): %d MB", (endMS.Sys-startMS.Sys)/(1024*1024))
 	t.Log("==========================================================")
 
-	// 9. Verify correctness of recovered files
+	// 5. Verify correctness of recovered files
 	t.Log("Verifying repaired file checksums byte-for-byte...")
 	postLargeHash := computeMD5(largeFilePath)
 	if postLargeHash != origLargeHash {
