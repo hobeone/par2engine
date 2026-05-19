@@ -703,9 +703,13 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 					return err
 				}
 				offset := fl.diskOffset + (chunkIdx * chunkSize)
-				_, err = f.ReadAt(dataBuffers[i][:currChunkSize], offset)
+				n, err := f.ReadAt(dataBuffers[i][:currChunkSize], offset)
 				if err != nil && err != io.EOF {
 					return err
+				}
+				// Zero out the remaining padded slice space past EOF as strictly required by the PAR2 spec!
+				if n < int(currChunkSize) {
+					clear(dataBuffers[i][n:currChunkSize])
 				}
 				activeDataShards = append(activeDataShards, dataBuffers[i][:currChunkSize])
 			} else {
