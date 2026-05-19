@@ -75,15 +75,40 @@ Future AI runs and CI/CD pipelines **MUST** satisfy the following performance th
 
 ## 4. Execution & Gathering Performance Information (pprof Profiling)
 
-### Standard Execution
-To run the E2E 18GB parallel performance benchmark test suite manually:
+### Pre-Generating the Golden Dataset
+To avoid spending over 7 minutes generating the massive 18GB dataset on every test run, you should **pre-generate it once** inside a local folder:
+
 ```bash
-# 1. Compile the CLI binary first
+# 1. Create the target directory
+mkdir -p /usr/local/google/home/hobe/software/par2_perf_data
+cd /usr/local/google/home/hobe/software/par2_perf_data
+
+# 2. Create the 18GB large-file.dat sequentially (repeating 16MB pattern)
+dd if=/dev/urandom of=pattern.dat bs=16M count=1
+for i in {1..1152}; do cat pattern.dat >> large-file.dat; done
+rm pattern.dat
+
+# 3. Create 10 small files (sizes 1-4MB)
+for i in {0..9}; do dd if=/dev/urandom of=small-$i.dat bs=1M count=$((1 + RANDOM % 4)); done
+
+# 4. Create canonical PAR2 set (BlockSize=4MB, ParityBlockCount=230) using C++ par2
+par2 c -s4194304 -c230 set.par2 large-file.dat small-*.dat
+```
+
+### Test Execution
+Once the golden dataset is generated, execute the Go performance tests by pointing to the folder via the **`PAR2_PERF_DIR`** environment variable. 
+
+The test will automatically create a clean isolated temporary workspace, **copy** the files into it, apply simulated corruptions, and run verification and repair safely without altering the golden master directory.
+
+```bash
+# 1. Compile the Go par2engine-cli binary
 go build -o par2engine-cli ./cmd/gopar
 
-# 2. Run the performance tag test suite
+# 2. Run the performance test targeting the golden directory
+export PAR2_PERF_DIR=/usr/local/google/home/hobe/software/par2_perf_data
 go test -tags=perf -v -timeout=20m ./tests/... -run=TestPerfLarge
 ```
+
 
 ### Subprocess Profiling
 Standard `go test -cpuprofile=cpu.prof` flags only profile the Go test runner process, which spends its time sleeping while waiting for the subprocess command to finish. To gather profiles of the actual parallel reconstruction engine, we must collect profiling statistics **directly inside the `par2engine-cli` process**.
