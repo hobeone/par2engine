@@ -508,8 +508,11 @@ func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID
 	justMissed := false
 
 	for j := 0; j <= len(data)-d.sliceByteCount; {
-		if ctx.Err() != nil {
-			return
+		// Only check context cancellation once every 65,536 bytes to eliminate atomic lock overheads in tight loops
+		if j&0xFFFF == 0 {
+			if ctx.Err() != nil {
+				return
+			}
 		}
 
 		slice := data[j : j+d.sliceByteCount]
