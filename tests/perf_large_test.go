@@ -205,11 +205,11 @@ func TestPerfLarge(t *testing.T) {
 	var verifyArgs []string
 	if *verifyOnly {
 		if *cpuprofile != "" {
-			absCPU, _ := filepath.Abs(*cpuprofile)
+			absCPU := resolveProfilePath(*cpuprofile)
 			verifyArgs = append(verifyArgs, "-cpuprofile", absCPU)
 		}
 		if *memprofile != "" {
-			absMem, _ := filepath.Abs(*memprofile)
+			absMem := resolveProfilePath(*memprofile)
 			verifyArgs = append(verifyArgs, "-memprofile", absMem)
 		}
 	}
@@ -268,11 +268,11 @@ func TestPerfLarge(t *testing.T) {
 
 	var repairArgs []string
 	if *cpuprofile != "" {
-		absCPU, _ := filepath.Abs(*cpuprofile)
+		absCPU := resolveProfilePath(*cpuprofile)
 		repairArgs = append(repairArgs, "-cpuprofile", absCPU)
 	}
 	if *memprofile != "" {
-		absMem, _ := filepath.Abs(*memprofile)
+		absMem := resolveProfilePath(*memprofile)
 		repairArgs = append(repairArgs, "-memprofile", absMem)
 	}
 	repairArgs = append(repairArgs, "repair", par2Path)
@@ -335,4 +335,16 @@ func TestPerfLarge(t *testing.T) {
 	}
 
 	t.Log("PERFECT RECONSTRUCTION VERIFIED! All files are byte-for-byte restored.")
+}
+
+func resolveProfilePath(path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	pwd := os.Getenv("PWD")
+	if pwd != "" {
+		return filepath.Join(pwd, path)
+	}
+	abs, _ := filepath.Abs(path)
+	return abs
 }
