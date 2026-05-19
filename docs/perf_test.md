@@ -84,8 +84,9 @@ To avoid spending over 7 minutes generating the massive 18GB dataset on every te
 # 1. Compile the genperf helper tool
 go build -o genperf ./cmd/genperf
 
-# 2. Run it to create the 18GB unique block dataset and 10 small files
-./genperf $HOME/par2_perf_data
+# 2. Run it to create the unique block dataset and 10 small files
+# (Specify custom size in GB as second argument, defaults to 18)
+./genperf $HOME/par2_perf_data 18
 
 # 3. Create the canonical PAR2 set (BlockSize=4MB, ParityBlockCount=230) using C++ par2
 cd $HOME/par2_perf_data
