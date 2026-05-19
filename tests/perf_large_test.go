@@ -9,19 +9,24 @@ HOWTO Pre-Generate the Golden Dataset:
    go build -o genperf ./cmd/genperf
 
 2. Run it to create the 18GB unique block dataset:
-   ./genperf /usr/local/google/home/hobe/software/par2_perf_data
+   ./genperf ~/software/par2_perf_data
 
 3. Generate the canonical PAR2 set (BlockSize=4MB, ParityBlockCount=230) using C++ par2:
-   cd /usr/local/google/home/hobe/software/par2_perf_data
+   cd ~/software/par2_perf_data
    par2 c -s4194304 -c230 set.par2 large-file.dat small-*.dat
 
 ---
 HOWTO Run Verification-Only Profiling:
 
-   export PAR2_PERF_DIR=/usr/local/google/home/hobe/software/par2_perf_data
+   export PAR2_PERF_DIR=/home/hobe/software/par2_perf_data
    # Optional: specify a fast SSD directory for scratch files instead of RAM-backed /tmp
-   export PAR2_PERF_WORKSPACE=/usr/local/google/home/hobe/software/par2_perf_scratch
+   export PAR2_PERF_WORKSPACE=/home/hobe/software/par2_perf_scratch
    
+---
+HOWTO Run Full Repair Profiling:
+
+   export PAR2_PERF_DIR=/home/hobe/software/par2_perf_data
+   export PAR2_PERF_WORKSPACE=/home/hobe/software/par2_perf_scratch
    go build -o par2engine-cli ./cmd/gopar
    go test -tags=perf -v ./tests/... -run=TestPerfLarge -args -perf.verify_only=true -perf.cpuprofile=cpu_verify.prof
 
