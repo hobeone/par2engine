@@ -22,8 +22,10 @@ The performance test is designed to stress the parallel execution scaling and me
 
 When you run `go test -tags=perf -v ./tests/... -run=TestPerfLarge`, the test execution harness automatically runs through the following phases:
 
-### Phase 1: Fast Semi-Random File Generation
-To avoid the CPU bottleneck of generating 18GB of random data, the harness pre-allocates a **16 MB buffer** filled with random bytes, and writes it sequentially **1152 times** to `large-file.dat` on disk. This completes in under **15 seconds** on modern SSDs while guaranteeing non-zero mathematically complex bytes for Reed-Solomon coding and rolling CRC calculations.
+### Phase 1: Fast Unique-Block File Generation
+To ensure that corrupted bytes in `large-file.dat` cannot be bypassed by the sliding window detector matching identical healthy copies elsewhere in the file, we generate the 18GB file such that **every single 4MB block is 100% unique**. 
+
+This is achieved by writing a unique 64-bit block index `j` inside the first 8 bytes of each 4MB block during sequential generation using our custom `genperf` tool. This guarantees that any single block byte corruption forces a full Reed-Solomon matrix recovery, while maintaining SSD-level sequential write speed (completing in under 20 seconds).
 
 ### Phase 2: PAR2 Set Creation (Canonical Baseline)
 The harness invokes the host system's standard C++ `par2` CLI binary to create the canonical PAR2 set:
@@ -76,22 +78,17 @@ Future AI runs and CI/CD pipelines **MUST** satisfy the following performance th
 ## 4. Execution & Gathering Performance Information (pprof Profiling)
 
 ### Pre-Generating the Golden Dataset
-To avoid spending over 7 minutes generating the massive 18GB dataset on every test run, you should **pre-generate it once** inside a local folder:
+To avoid spending over 7 minutes generating the massive 18GB dataset on every test run, you should **pre-generate it once** inside a local folder using our compiled `genperf` tool. This tool automatically formats each 4MB block with a unique index to prevent duplicate-block scanning bypasses:
 
 ```bash
-# 1. Create the target directory
-mkdir -p /usr/local/google/home/hobe/software/par2_perf_data
+# 1. Compile the genperf helper tool
+go build -o genperf ./cmd/genperf
+
+# 2. Run it to create the 18GB unique block dataset and 10 small files
+./genperf /usr/local/google/home/hobe/software/par2_perf_data
+
+# 3. Create the canonical PAR2 set (BlockSize=4MB, ParityBlockCount=230) using C++ par2
 cd /usr/local/google/home/hobe/software/par2_perf_data
-
-# 2. Create the 18GB large-file.dat sequentially (repeating 16MB pattern)
-dd if=/dev/urandom of=pattern.dat bs=16M count=1
-for i in {1..1152}; do cat pattern.dat >> large-file.dat; done
-rm pattern.dat
-
-# 3. Create 10 small files (sizes 1-4MB)
-for i in {0..9}; do dd if=/dev/urandom of=small-$i.dat bs=1M count=$((1 + RANDOM % 4)); done
-
-# 4. Create canonical PAR2 set (BlockSize=4MB, ParityBlockCount=230) using C++ par2
 par2 c -s4194304 -c230 set.par2 large-file.dat small-*.dat
 ```
 
