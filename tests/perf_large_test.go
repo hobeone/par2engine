@@ -6,8 +6,8 @@ package tests
 HOWTO Pre-Generate the Golden Dataset:
 
 1. Create a dedicated directory for the golden dataset:
-   mkdir -p /usr/local/google/home/hobe/software/par2_perf_data
-   cd /usr/local/google/home/hobe/software/par2_perf_data
+   mkdir -p ~/software/par2_perf_data
+   cd ~/software/par2_perf_data
 
 2. Create an 18GB large-file.dat sequentially with a repeating semi-random pattern:
    dd if=/dev/urandom of=pattern.dat bs=16M count=1
@@ -21,7 +21,7 @@ HOWTO Pre-Generate the Golden Dataset:
    par2 c -s4194304 -c230 set.par2 large-file.dat small-*.dat
 
 5. Run the performance test targeting this folder:
-   export PAR2_PERF_DIR=/usr/local/google/home/hobe/software/par2_perf_data
+   export PAR2_PERF_DIR=~/software/par2_perf_data
    go build -o par2engine-cli ./cmd/gopar
    go test -tags=perf -v ./tests/... -run=TestPerfLarge -args -perf.cpuprofile=cpu.prof
 */

@@ -80,8 +80,8 @@ To avoid spending over 7 minutes generating the massive 18GB dataset on every te
 
 ```bash
 # 1. Create the target directory
-mkdir -p /usr/local/google/home/hobe/software/par2_perf_data
-cd /usr/local/google/home/hobe/software/par2_perf_data
+mkdir -p /home/hobe/software/par2_perf_data
+cd /home/hobe/software/par2_perf_data
 
 # 2. Create the 18GB large-file.dat sequentially (repeating 16MB pattern)
 dd if=/dev/urandom of=pattern.dat bs=16M count=1
@@ -96,7 +96,7 @@ par2 c -s4194304 -c230 set.par2 large-file.dat small-*.dat
 ```
 
 ### Test Execution
-Once the golden dataset is generated, execute the Go performance tests by pointing to the folder via the **`PAR2_PERF_DIR`** environment variable. 
+Once the golden dataset is generated, execute the Go performance tests by pointing to the folder via the **`PAR2_PERF_DIR`** environment variable.
 
 The test will automatically create a clean isolated temporary workspace, **copy** the files into it, apply simulated corruptions, and run verification and repair safely without altering the golden master directory.
 
@@ -105,7 +105,7 @@ The test will automatically create a clean isolated temporary workspace, **copy*
 go build -o par2engine-cli ./cmd/gopar
 
 # 2. Run the performance test targeting the golden directory
-export PAR2_PERF_DIR=/usr/local/google/home/hobe/software/par2_perf_data
+export PAR2_PERF_DIR=/home/hobe/software/par2_perf_data
 go test -tags=perf -v -timeout=20m ./tests/... -run=TestPerfLarge
 ```
 
@@ -139,4 +139,3 @@ Analyze memory allocation stacks to verify allocations on streaming math and I/O
 ```bash
 go tool pprof -http=:8080 mem.prof
 ```
-
