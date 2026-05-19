@@ -92,19 +92,26 @@ cd /usr/local/google/home/hobe/software/par2_perf_data
 par2 c -s4194304 -c230 set.par2 large-file.dat small-*.dat
 ```
 
-### Test Execution
+### Test Execution & Workspace Configuration
 Once the golden dataset is generated, execute the Go performance tests by pointing to the folder via the **`PAR2_PERF_DIR`** environment variable. 
 
-The test will automatically create a clean isolated temporary workspace, **copy** the files into it, apply simulated corruptions, and run verification and repair safely without altering the golden master directory.
+#### 1. Workspace Copy Path Override
+By default, the test copies the 18GB dataset to a Go temporary directory inside `/tmp` (which is often a RAM-backed `tmpfs` disk on Linux and could exhaust system memory!). 
+
+To avoid this, you can specify an optional **`PAR2_PERF_WORKSPACE`** environment variable pointing to a folder on a physical, fast SSD drive (e.g., `/usr/local/google/home/hobe/software/par2_perf_scratch`). 
+- When specified, a dedicated sub-run folder will be created inside it, and it **will NOT be automatically deleted** after completion (allowing you to inspect and run standard CLI commands on the damaged dataset manually!).
+- Reminder: delete these custom workspace folders periodically to reclaim disk space.
 
 ```bash
 # 1. Compile the Go par2engine-cli binary
 go build -o par2engine-cli ./cmd/gopar
 
-# 2. Run the performance test targeting the golden directory
+# 2. Run the full verification & repair test suite using custom workspace
 export PAR2_PERF_DIR=/usr/local/google/home/hobe/software/par2_perf_data
+export PAR2_PERF_WORKSPACE=/usr/local/google/home/hobe/software/par2_perf_scratch
 go test -tags=perf -v -timeout=20m ./tests/... -run=TestPerfLarge
 ```
+
 
 
 ### Subprocess Profiling
@@ -113,10 +120,18 @@ Standard `go test -cpuprofile=cpu.prof` flags only profile the Go test runner pr
 We have implemented custom flag forwarding (`-perf.cpuprofile` and `-perf.memprofile`) inside `tests/perf_large_test.go` which automatically maps absolute path outputs to the `par2engine-cli` subprocess execution.
 
 #### 1. CPU Profile Capture
-To collect CPU profiling of the repair operation:
+
+**To profile the REPAIR operation (Reed-Solomon reconstruction math)**:
 ```bash
-# Run the test forwarding the CPU profile file target to the subprocess
-go test -tags=perf -v -timeout=20m ./tests/... -run=TestPerfLarge -args -perf.cpuprofile=cpu.prof
+# Run the test forwarding the CPU profile target to the repair subprocess execution
+go test -tags=perf -v -timeout=20m ./tests/... -run=TestPerfLarge -args -perf.cpuprofile=cpu_repair.prof
+```
+
+**To profile the VERIFICATION scan phase ONLY (sliding window and CRCs)**:
+You can pass the **`-perf.verify_only=true`** flag to halt the test execution immediately after the verification scan completes. This allows you to profile the scanning and checksumming of 18GB directly, saving minutes of RS repair time:
+```bash
+# Run the test capturing the CPU profile of the verification scanning phase only
+go test -tags=perf -v -timeout=20m ./tests/... -run=TestPerfLarge -args -perf.verify_only=true -perf.cpuprofile=cpu_verify.prof
 ```
 
 Once the test completes, analyze CPU hotspots using standard Go tools:

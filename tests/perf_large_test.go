@@ -5,25 +5,34 @@ package tests
 /*
 HOWTO Pre-Generate the Golden Dataset:
 
-1. Create a dedicated directory for the golden dataset:
-   mkdir -p /usr/local/google/home/hobe/software/par2_perf_data
+1. Compile the genperf helper tool:
+   go build -o genperf ./cmd/genperf
+
+2. Run it to create the 18GB unique block dataset:
+   ./genperf /usr/local/google/home/hobe/software/par2_perf_data
+
+3. Generate the canonical PAR2 set (BlockSize=4MB, ParityBlockCount=230) using C++ par2:
    cd /usr/local/google/home/hobe/software/par2_perf_data
-
-2. Create an 18GB large-file.dat sequentially with a repeating semi-random pattern:
-   dd if=/dev/urandom of=pattern.dat bs=16M count=1
-   for i in {1..1152}; do cat pattern.dat >> large-file.dat; done
-   rm pattern.dat
-
-3. Create 10 small files (sizes 1-4MB):
-   for i in {0..9}; do dd if=/dev/urandom of=small-$i.dat bs=1M count=$((1 + RANDOM % 4)); done
-
-4. Create the canonical PAR2 set (BlockSize=4MB, ParityCount=230):
    par2 c -s4194304 -c230 set.par2 large-file.dat small-*.dat
 
-5. Run the performance test targeting this folder:
+---
+HOWTO Run Verification-Only Profiling:
+
    export PAR2_PERF_DIR=/usr/local/google/home/hobe/software/par2_perf_data
+   # Optional: specify a fast SSD directory for scratch files instead of RAM-backed /tmp
+   export PAR2_PERF_WORKSPACE=/usr/local/google/home/hobe/software/par2_perf_scratch
+   
    go build -o par2engine-cli ./cmd/gopar
-   go test -tags=perf -v ./tests/... -run=TestPerfLarge -args -perf.cpuprofile=cpu.prof
+   go test -tags=perf -v ./tests/... -run=TestPerfLarge -args -perf.verify_only=true -perf.cpuprofile=cpu_verify.prof
+
+---
+HOWTO Run Full Repair Profiling:
+
+   export PAR2_PERF_DIR=/usr/local/google/home/hobe/software/par2_perf_data
+   export PAR2_PERF_WORKSPACE=/usr/local/google/home/hobe/software/par2_perf_scratch
+   
+   go build -o par2engine-cli ./cmd/gopar
+   go test -tags=perf -v ./tests/... -run=TestPerfLarge -args -perf.cpuprofile=cpu_repair.prof
 */
 
 import (
@@ -41,8 +50,9 @@ import (
 	"time"
 )
 
-var cpuprofile = flag.String("perf.cpuprofile", "", "write cpu profile of repair to file")
-var memprofile = flag.String("perf.memprofile", "", "write mem profile of repair to file")
+var cpuprofile = flag.String("perf.cpuprofile", "", "write cpu profile to file")
+var memprofile = flag.String("perf.memprofile", "", "write mem profile to file")
+var verifyOnly = flag.Bool("perf.verify_only", false, "only run the verification scan phase and profile it")
 
 func copyFile(src, dest string) error {
 	in, err := os.Open(src)
@@ -80,9 +90,29 @@ func TestPerfLarge(t *testing.T) {
 		t.Fatalf("Golden set.par2 index not found in PAR2_PERF_DIR (%s): %v", perfDir, err)
 	}
 
-	// Create temporary workspace directory
-	dir := t.TempDir()
-	t.Logf("Performance test workspace initialized at %s", dir)
+	// Create workspace directory: either user-specified scratch disk or fallback automated TempDir
+	workspaceDir := os.Getenv("PAR2_PERF_WORKSPACE")
+	var dir string
+	var keepWorkspace bool
+	if workspaceDir != "" {
+		// Ensure it exists
+		if err := os.MkdirAll(workspaceDir, 0755); err != nil {
+			t.Fatalf("failed to create custom workspace parent directory: %v", err)
+		}
+		dir = filepath.Join(workspaceDir, fmt.Sprintf("par2-perf-run-%d", time.Now().Unix()))
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("failed to create custom workspace run directory: %v", err)
+		}
+		keepWorkspace = true
+		t.Logf("Performance test workspace initialized at CUSTOM location (will NOT be automatically deleted): %s", dir)
+	} else {
+		dir = t.TempDir()
+		t.Logf("Performance test workspace initialized at standard TempDir (will be automatically deleted): %s", dir)
+	}
+
+	if !keepWorkspace {
+		defer os.RemoveAll(dir)
+	}
 
 	// Resolve and load all small files, large file, and PAR2 volume files from perfDir
 	entries, err := os.ReadDir(perfDir)
@@ -94,7 +124,6 @@ func TestPerfLarge(t *testing.T) {
 	startCopy := time.Now()
 	for _, entry := range entries {
 		name := entry.Name()
-		// Copy all files related to the set (.dat and .par2)
 		if strings.HasSuffix(name, ".dat") || strings.HasSuffix(name, ".par2") {
 			src := filepath.Join(perfDir, name)
 			dest := filepath.Join(dir, name)
@@ -171,11 +200,38 @@ func TestPerfLarge(t *testing.T) {
 		t.Fatalf("failed to resolve CLI binary path: %v", err)
 	}
 
-	// 3. Execute verify command using par2engine-cli
+	// 3. Execute verify command using par2engine-cli (Forward profiles if verifyOnly is true)
 	t.Log("Executing par2engine-cli verify...")
-	cmdVerify := exec.Command(cliPath, "verify", par2Path)
+	verifyArgs := []string{"verify"}
+	if *verifyOnly {
+		if *cpuprofile != "" {
+			absCPU, _ := filepath.Abs(*cpuprofile)
+			verifyArgs = append(verifyArgs, "-cpuprofile", absCPU)
+		}
+		if *memprofile != "" {
+			absMem, _ := filepath.Abs(*memprofile)
+			verifyArgs = append(verifyArgs, "-memprofile", absMem)
+		}
+	}
+	verifyArgs = append(verifyArgs, par2Path)
+
+	cmdVerify := exec.Command(cliPath, verifyArgs...)
 	cmdVerify.Dir = dir
+
+	startVerify := time.Now()
+	var startVMS runtime.MemStats
+	if *verifyOnly {
+		runtime.GC()
+		runtime.ReadMemStats(&startVMS)
+	}
+
 	outVerify, errVerify := cmdVerify.CombinedOutput()
+	verifyDuration := time.Since(startVerify)
+
+	var endVMS runtime.MemStats
+	if *verifyOnly {
+		runtime.ReadMemStats(&endVMS)
+	}
 
 	// Expect exit code 1 (ExitRepairPossible)
 	var exitErr *exec.ExitError
@@ -188,6 +244,20 @@ func TestPerfLarge(t *testing.T) {
 	} else {
 		t.Fatalf("verify failed with system error: %v", errVerify)
 	}
+
+	if *verifyOnly {
+		t.Logf("Verify CLI Output:\n%s", outVerify)
+		t.Log("================ VERIFY-ONLY PERFORMANCE RESULTS ================")
+		t.Logf("Total Verify Duration  : %s", verifyDuration)
+		t.Logf("Verification Speed     : %.2f MB/s", 18432.0/verifyDuration.Seconds())
+		t.Logf("Memory Stats (Start RSS): %d MB", startVMS.Sys/(1024*1024))
+		t.Logf("Memory Stats (End RSS)  : %d MB", endVMS.Sys/(1024*1024))
+		t.Logf("Memory Delta (RSS Growth): %d MB", (endVMS.Sys-startVMS.Sys)/(1024*1024))
+		t.Log("==========================================================")
+		t.Log("Verification completed correctly. Halting test due to verify_only flag.")
+		return // EXIT EARLY
+	}
+
 	t.Log("Verification completed correctly. Repair is verified to be possible.")
 
 	// 4. Execute repair command using par2engine-cli (Record RSS and Duration)
