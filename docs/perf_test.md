@@ -85,10 +85,10 @@ To avoid spending over 7 minutes generating the massive 18GB dataset on every te
 go build -o genperf ./cmd/genperf
 
 # 2. Run it to create the 18GB unique block dataset and 10 small files
-./genperf /home/hobe/software/par2_perf_data
+./genperf $HOME/par2_perf_data
 
 # 3. Create the canonical PAR2 set (BlockSize=4MB, ParityBlockCount=230) using C++ par2
-cd /home/hobe/software/par2_perf_data
+cd $HOME/par2_perf_data
 par2 c -s4194304 -c230 set.par2 large-file.dat small-*.dat
 ```
 
@@ -98,7 +98,7 @@ Once the golden dataset is generated, execute the Go performance tests by pointi
 #### 1. Workspace Copy Path Override
 By default, the test copies the 18GB dataset to a Go temporary directory inside `/tmp` (which is often a RAM-backed `tmpfs` disk on Linux and could exhaust system memory!). 
 
-To avoid this, you can specify an optional **`PAR2_PERF_WORKSPACE`** environment variable pointing to a folder on a physical, fast SSD drive (e.g., `/home/hobe/software/par2_perf_scratch`). 
+To avoid this, you can specify an optional **`PAR2_PERF_WORKSPACE`** environment variable pointing to a folder on a physical, fast SSD drive (e.g., `$HOME/par2_perf_scratch`). 
 - When specified, a dedicated sub-run folder will be created inside it, and it **will NOT be automatically deleted** after completion (allowing you to inspect and run standard CLI commands on the damaged dataset manually!).
 - Reminder: delete these custom workspace folders periodically to reclaim disk space.
 
@@ -107,8 +107,8 @@ To avoid this, you can specify an optional **`PAR2_PERF_WORKSPACE`** environment
 go build -o par2engine-cli ./cmd/gopar
 
 # 2. Run the full verification & repair test suite using custom workspace
-export PAR2_PERF_DIR=/home/hobe/software/par2_perf_data
-export PAR2_PERF_WORKSPACE=/home/hobe/software/par2_perf_scratch
+export PAR2_PERF_DIR=$HOME/par2_perf_data
+export PAR2_PERF_WORKSPACE=$HOME/par2_perf_scratch
 go test -tags=perf -v -timeout=20m ./tests/... -run=TestPerfLarge
 ```
 

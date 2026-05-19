@@ -18,16 +18,16 @@ HOWTO Pre-Generate the Golden Dataset:
 ---
 HOWTO Run Verification-Only Profiling:
 
-   export PAR2_PERF_DIR=/home/hobe/software/par2_perf_data
-   export PAR2_PERF_WORKSPACE=/home/hobe/software/par2_perf_scratch
+   export PAR2_PERF_DIR=$HOME/par2_perf_data
+   export PAR2_PERF_WORKSPACE=$HOME/par2_perf_scratch
    go build -o par2engine-cli ./cmd/gopar
    go test -tags=perf -v ./tests/... -run=TestPerfLarge -args -perf.verify_only=true -perf.cpuprofile=cpu_verify.prof
 
 ---
 HOWTO Run Full Repair Profiling:
 
-   export PAR2_PERF_DIR=/home/hobe/software/par2_perf_data
-   export PAR2_PERF_WORKSPACE=/home/hobe/software/par2_perf_scratch
+   export PAR2_PERF_DIR=$HOME/par2_perf_data
+   export PAR2_PERF_WORKSPACE=$HOME/par2_perf_scratch
    
    go build -o par2engine-cli ./cmd/gopar
    go test -tags=perf -v ./tests/... -run=TestPerfLarge -args -perf.cpuprofile=cpu_repair.prof

@@ -9,8 +9,10 @@ import (
 )
 
 func TestIntegrationWithCanonicalFixtures(t *testing.T) {
-	// Resolve absolute path to par2cmdline test archives in the workspace
-	fixturesDir := "/home/hobe/software/par2cmdline/tests"
+	fixturesDir, err := filepath.Abs("../../par2cmdline/tests")
+	if err != nil {
+		t.Fatalf("failed to resolve relative fixtures dir: %v", err)
+	}
 	flatDataArchive := filepath.Join(fixturesDir, "flatdata.tar.gz")
 	par2DataArchive := filepath.Join(fixturesDir, "flatdata-par2files.tar.gz")
 
