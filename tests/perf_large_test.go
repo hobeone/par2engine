@@ -5,6 +5,7 @@ package tests
 import (
 	"bytes"
 	"crypto/md5"
+	"flag"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -15,6 +16,10 @@ import (
 	"testing"
 	"time"
 )
+
+var cpuprofile = flag.String("perf.cpuprofile", "", "write cpu profile of repair to file")
+var memprofile = flag.String("perf.memprofile", "", "write mem profile of repair to file")
+
 
 func TestPerfLarge(t *testing.T) {
 	fixturesDir := "/usr/local/google/home/hobe/software/par2cmdline/tests"
@@ -169,7 +174,18 @@ func TestPerfLarge(t *testing.T) {
 	var startMS runtime.MemStats
 	runtime.ReadMemStats(&startMS)
 
-	cmdRepair := exec.Command(cliPath, "repair", par2Path)
+	repairArgs := []string{"repair"}
+	if *cpuprofile != "" {
+		absCPU, _ := filepath.Abs(*cpuprofile)
+		repairArgs = append(repairArgs, "-cpuprofile", absCPU)
+	}
+	if *memprofile != "" {
+		absMem, _ := filepath.Abs(*memprofile)
+		repairArgs = append(repairArgs, "-memprofile", absMem)
+	}
+	repairArgs = append(repairArgs, par2Path)
+
+	cmdRepair := exec.Command(cliPath, repairArgs...)
 	cmdRepair.Dir = dir
 
 	startRepair := time.Now()
