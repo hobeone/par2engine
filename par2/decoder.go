@@ -509,11 +509,18 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 	}
 
 	// Scan candidate files not already resolved by the pre-scan phase.
+	// Also skip any candidate whose path matches a protected file: scanFile
+	// already covers that file, and running both concurrently causes a race
+	// where the collector may attribute blocks to the synthetic FileID.
+	protectedNames := make(map[string]bool, len(d.protectedFiles))
+	for _, fd := range d.protectedFiles {
+		protectedNames[fd.Filename] = true
+	}
 	for path, fileID := range d.candidateFiles {
 		if ctx.Err() != nil {
 			break
 		}
-		if resolvedCandidates[path] {
+		if resolvedCandidates[path] || protectedNames[path] {
 			continue
 		}
 		scanWg.Add(1)
@@ -831,6 +838,9 @@ func (d *Decoder) detectRenameCandidate(ctx context.Context, fd FileDescPacket, 
 	}
 	if candidatePath == "" {
 		return "" // source isn't a registered candidate
+	}
+	if candidatePath == fd.Filename {
+		return "" // same filename — not a rename
 	}
 
 	// Verify all shards come from this same candidate at consecutive offsets.
