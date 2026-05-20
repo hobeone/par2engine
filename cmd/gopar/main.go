@@ -19,7 +19,7 @@ import (
 // stringSliceFlag is a flag.Value that accumulates repeated -flag values.
 type stringSliceFlag []string
 
-func (s *stringSliceFlag) String() string  { return strings.Join(*s, ", ") }
+func (s *stringSliceFlag) String() string { return strings.Join(*s, ", ") }
 func (s *stringSliceFlag) Set(v string) error {
 	*s = append(*s, v)
 	return nil
@@ -27,11 +27,11 @@ func (s *stringSliceFlag) Set(v string) error {
 
 // Exit codes matching par2cmdline standard specifications
 const (
-	ExitSuccess                      = 0
-	ExitRepairPossible               = 1 // verification failed but repair is possible
-	ExitRepairNotPossible            = 2 // verification failed and not enough parity, or repair failed
-	ExitInvalidCommandLineArguments  = 3 // bad flags or arguments
-	ExitLogicError                   = 4 // unexpected runtime crash or logic issue
+	ExitSuccess                     = 0
+	ExitRepairPossible              = 1 // verification failed but repair is possible
+	ExitRepairNotPossible           = 2 // verification failed and not enough parity, or repair failed
+	ExitInvalidCommandLineArguments = 3 // bad flags or arguments
+	ExitLogicError                  = 4 // unexpected runtime crash or logic issue
 )
 
 func main() {
@@ -42,7 +42,7 @@ func runCLI() int {
 	name := filepath.Base(os.Args[0])
 
 	flagSet := flag.NewFlagSet(name, flag.ContinueOnError)
-	
+
 	var (
 		numThreads    int
 		memMB         int64
@@ -140,10 +140,7 @@ func runCLI() int {
 	memLimitBytes := memMB * 1024 * 1024
 	maxFileLimitBytes := maxFileSizeMB * 1024 * 1024
 	// Allow packets to be up to 1.25x the file limit, or at least the default 128MB
-	maxPacketLimitBytes := maxFileLimitBytes * 5 / 4
-	if maxPacketLimitBytes < 128*1024*1024 {
-		maxPacketLimitBytes = 128 * 1024 * 1024
-	}
+	maxPacketLimitBytes := max(maxFileLimitBytes*5/4, 128*1024*1024)
 
 	d, err := par2.NewDecoder(ctx, par2Path, par2.DecoderOptions{
 		NumGoroutines: numThreads,

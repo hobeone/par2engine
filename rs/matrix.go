@@ -48,7 +48,7 @@ func NewIdentityMatrix(n int) (Matrix, error) {
 		return Matrix{}, err
 	}
 	elements := make([]gf16.T, n*n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		elements[i*n+i] = 1
 	}
 	return Matrix{n, n, elements}, nil
@@ -64,8 +64,8 @@ func NewVandermondeMatrix(rows, cols int, generators []gf16.T) (Matrix, error) {
 		return Matrix{}, errors.New("too few generators for Vandermonde matrix")
 	}
 	elements := make([]gf16.T, rows*cols)
-	for i := 0; i < rows; i++ {
-		for j := 0; j < cols; j++ {
+	for i := range rows {
+		for j := range cols {
 			elements[i*cols+j] = generators[j].Pow(uint32(i))
 		}
 	}
@@ -81,8 +81,8 @@ func NewCauchyMatrix(rows, cols int, x, y []gf16.T) (Matrix, error) {
 		return Matrix{}, errors.New("insufficient x or y elements for Cauchy matrix")
 	}
 	elements := make([]gf16.T, rows*cols)
-	for i := 0; i < rows; i++ {
-		for j := 0; j < cols; j++ {
+	for i := range rows {
+		for j := range cols {
 			sum := x[i] ^ y[j]
 			if sum == 0 {
 				return Matrix{}, errors.New("Cauchy matrix division by zero")

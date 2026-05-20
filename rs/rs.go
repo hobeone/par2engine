@@ -27,7 +27,7 @@ var generators []gf16.T
 func init() {
 	// Generate PAR2 generator elements (primitive elements of order 65535).
 	// 65535 = 3 * 5 * 17 * 257. We check exponents relatively prime to 65535.
-	for i := 0; i < (1 << 16); i++ {
+	for i := range 1 << 16 {
 		if i%3 == 0 || i%5 == 0 || i%17 == 0 || i%257 == 0 {
 			continue
 		}
@@ -90,10 +90,7 @@ func applyMatrixParallelData(ctx context.Context, m Matrix, in, out [][]byte, nu
 	dataLength := len(out[0])
 	// Split bytes within the shards for horizontal thread scaling.
 	// Capped at multiples of 16 bytes for optimal SIMD memory alignments.
-	perGoroutineDataLength := (dataLength + numGoroutines - 1) / numGoroutines
-	if perGoroutineDataLength < 16 {
-		perGoroutineDataLength = 16
-	}
+	perGoroutineDataLength := max((dataLength+numGoroutines-1)/numGoroutines, 16)
 	rem := perGoroutineDataLength % 16
 	if rem != 0 {
 		perGoroutineDataLength += (16 - rem)
@@ -107,14 +104,11 @@ func applyMatrixParallelData(ctx context.Context, m Matrix, in, out [][]byte, nu
 
 	var wg sync.WaitGroup
 	wg.Add(actualNumGoroutines)
-	for i := 0; i < actualNumGoroutines; i++ {
+	for i := range actualNumGoroutines {
 		go func(i int) {
 			defer wg.Done()
 			start := i * perGoroutineDataLength
-			end := start + perGoroutineDataLength
-			if end > dataLength {
-				end = dataLength
-			}
+			end := min(start+perGoroutineDataLength, dataLength)
 			applyMatrixSlice(ctx, m, in, out, 0, m.Rows(), start, end)
 		}(i)
 	}
@@ -127,8 +121,8 @@ func makeReconstructionMatrix(dataShards int, availableRows, missingRows, usedPa
 	if err != nil {
 		return Matrix{}, err
 	}
-	for i := 0; i < len(usedParityRows); i++ {
-		for j := 0; j < len(usedParityRows); j++ {
+	for i := range usedParityRows {
+		for j := range usedParityRows {
 			k := usedParityRows[i]
 			l := missingRows[j]
 			m.Set(i, j, parityMatrix.At(k, l))
@@ -139,8 +133,8 @@ func makeReconstructionMatrix(dataShards int, availableRows, missingRows, usedPa
 	if err != nil {
 		return Matrix{}, err
 	}
-	for i := 0; i < len(usedParityRows); i++ {
-		for j := 0; j < dataShards; j++ {
+	for i := range usedParityRows {
+		for j := range dataShards {
 			if j < len(availableRows) {
 				k := usedParityRows[i]
 				l := availableRows[j]

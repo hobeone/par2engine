@@ -21,7 +21,7 @@ func TestCRC32Window(t *testing.T) {
 	currentCRC := crc32.ChecksumIEEE(data[:windowSize])
 
 	// 2. Slide window and verify against full ChecksumIEEE
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		oldByte := data[i]
 		newByte := data[i+windowSize]
 		currentCRC = w.update(currentCRC, oldByte, newByte)
