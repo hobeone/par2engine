@@ -529,3 +529,63 @@ func TestRenameMisnamedFile(t *testing.T) {
 		t.Fatalf("expected no repair needed after rename, got %d unusable shards", counts2.UnusableDataShardCount)
 	}
 }
+
+func TestDecoderMaliciousIFSCPacket(t *testing.T) {
+	dir := t.TempDir()
+	dummyFile := filepath.Join(dir, "dummy.dat")
+	if err := os.WriteFile(dummyFile, []byte("hello world"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Decoder{
+		numGoroutines: 1,
+		memoryLimit:   1024,
+		logger:        slog.Default(),
+		fileChecksums: make(map[FileID]*IFSCPacket),
+		parityShards:  make(map[uint16][]byte),
+		fileIntegrity: make(map[FileID]*FileIntegrityState),
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("OpenRoot failed: %v", err)
+	}
+	d.root = root
+	defer func() { _ = d.Close() }()
+
+	fd := FileDescPacket{
+		FileID:    FileID{0x01},
+		Filename:  "dummy.dat",
+		ByteCount: 11,
+	}
+	d.protectedFiles = append(d.protectedFiles, fd)
+
+	maliciousFID := FileID{0x02}
+	d.fileChecksums[maliciousFID] = &IFSCPacket{
+		FileID: maliciousFID,
+		ChecksumPairs: []ChecksumPair{
+			{
+				MD5:   [16]byte{0xAA},
+				CRC32: [4]byte{0xBB},
+			},
+		},
+	}
+	d.fileChecksums[fd.FileID] = &IFSCPacket{
+		FileID: fd.FileID,
+		ChecksumPairs: []ChecksumPair{
+			{
+				MD5:   [16]byte{0xCC},
+				CRC32: [4]byte{0xDD},
+			},
+		},
+	}
+
+	d.sliceByteCount = 11
+
+	ctx := context.Background()
+	err = d.VerifyScans(ctx)
+	if err != nil {
+		t.Fatalf("VerifyScans failed: %v", err)
+	}
+}
+
