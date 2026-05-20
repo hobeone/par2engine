@@ -803,7 +803,7 @@ func (d *Decoder) prescanCandidateMatches(ctx context.Context) map[string]bool {
 		}
 		d.mu.Unlock()
 
-		d.logger.InfoContext(ctx, "Candidate is a full content match — rename required",
+		d.logger.DebugContext(ctx, "Candidate pre-scan: full content match confirmed",
 			"candidate", candidatePath, "target", fd.Filename)
 		resolved[candidatePath] = true
 	}
