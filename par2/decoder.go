@@ -389,6 +389,11 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 			d.mu.Lock()
 			state := d.fileIntegrity[match.targetFileID]
 			if state.ShardLocations[match.shardIndex].Offset == -1 {
+				d.logger.Debug("Block match found",
+					"targetFile", state.Filename,
+					"shardIdx", match.shardIndex,
+					"sourceFileID", fmt.Sprintf("%x", match.sourceFileID[:4]),
+					"offset", match.offset)
 				state.ShardLocations[match.shardIndex] = ShardLocation{
 					FileID: match.sourceFileID,
 					Offset: match.offset,
@@ -427,8 +432,8 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 	}
 
 	// Post-scan global hash check
+	d.logger.DebugContext(ctx, "Starting post-scan MD5 hash verification phase")
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	for _, fd := range d.protectedFiles {
 		state := d.fileIntegrity[fd.FileID]
 		if state.Missing || state.SizeMismatch {
@@ -440,20 +445,30 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 			expected := int64(idx * d.sliceByteCount)
 			if loc.Offset != expected || loc.FileID != fd.FileID {
 				allConsecutive = false
+				d.logger.Debug("File requires partial reconstruction or reordering",
+					"file", fd.Filename,
+					"shardIdx", idx,
+					"expectedOffset", expected,
+					"actualOffset", loc.Offset)
 				break
 			}
 		}
 
 		if allConsecutive {
-			// Standard full file MD5 check
+			// Standard full file MD5 check — unlock while doing I/O to avoid holding
+			// the mutex across potentially slow disk reads.
+			d.mu.Unlock()
+			d.logger.DebugContext(ctx, "Running MD5 hash check", "file", fd.Filename)
 			f, err := d.root.Open(fd.Filename)
 			if err != nil {
+				d.mu.Lock()
 				state.Missing = true
 				continue
 			}
 			hasher := md5.New()
 			_, copyErr := io.Copy(hasher, f)
 			f.Close()
+			d.mu.Lock()
 			if copyErr != nil {
 				d.logger.WarnContext(ctx, "I/O error during MD5 verification", "file", fd.Filename, "err", copyErr)
 				state.HashMismatch = true
@@ -468,6 +483,38 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 		} else {
 			state.HashMismatch = true
 		}
+	}
+
+	// Compute counts while still holding the lock — calling d.ShardCounts() here
+	// would deadlock because it also acquires d.mu.
+	usableData, unusableData := 0, 0
+	for _, state := range d.fileIntegrity {
+		for _, loc := range state.ShardLocations {
+			if loc.Offset == -1 {
+				unusableData++
+			} else {
+				usableData++
+			}
+		}
+	}
+	finalCounts := ShardCounts{
+		UsableDataShardCount:   usableData,
+		UnusableDataShardCount: unusableData,
+		UsableParityShardCount: len(d.parityShards),
+	}
+	d.mu.Unlock()
+
+	d.logger.DebugContext(ctx, "Post-scan complete",
+		"usableDataShards", finalCounts.UsableDataShardCount,
+		"unusableDataShards", finalCounts.UnusableDataShardCount,
+		"usableParityShards", finalCounts.UsableParityShardCount)
+
+	if finalCounts.RepairNeeded() {
+		d.logger.Warn("Verification found missing or corrupt blocks",
+			"missingBlocks", finalCounts.UnusableDataShardCount,
+			"availableParity", finalCounts.UsableParityShardCount)
+	} else {
+		d.logger.Info("Verification successful: all blocks found and verified")
 	}
 
 	return ctx.Err()
@@ -493,6 +540,7 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 	d.mu.Lock()
 	state := d.fileIntegrity[fd.FileID]
 	if stat.Size() != int64(fd.ByteCount) {
+		d.logger.Warn("File size mismatch", "file", fd.Filename, "expected", fd.ByteCount, "actual", stat.Size())
 		state.SizeMismatch = true
 	}
 	d.mu.Unlock()
@@ -610,27 +658,61 @@ func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID
 			crcSlice = crc32.ChecksumIEEE(slice)
 		}
 
+		absPos := start + int64(j)
+		atShardBoundary := absPos%int64(d.sliceByteCount) == 0
+
 		locations, found := lookupTable.Lookup(crcSlice)
 		if !found {
+			if atShardBoundary {
+				d.logger.DebugContext(ctx, "Shard boundary CRC miss",
+					"file", sourceFileID,
+					"absOffset", absPos,
+					"shardIdx", absPos/int64(d.sliceByteCount),
+					"viaRolling", justMissed,
+					"crc", fmt.Sprintf("%08x", crcSlice))
+			}
 			j++
 			justMissed = true
 			continue
 		}
 
 		blockHash := md5.Sum(slice)
+		md5Matched := false
 		for _, loc := range locations {
 			if loc.md5Hash == blockHash {
+				md5Matched = true
 				matchChan <- matchEvent{
 					targetFileID: loc.fileID,
 					shardIndex:   loc.shardIndex,
 					sourceFileID: sourceFileID,
-					offset:       start + int64(j),
+					offset:       absPos,
 				}
 			}
 		}
 
-		j += d.sliceByteCount
-		justMissed = false
+		if md5Matched {
+			// True shard match: advance past this block.
+			j += d.sliceByteCount
+			justMissed = false
+		} else {
+			// CRC collision with no MD5 confirmation — treat as a miss and slide
+			// one byte forward. Jumping by sliceByteCount here would skip past real
+			// shard boundaries that fall in the next sliceByteCount bytes.
+			if atShardBoundary {
+				d.logger.DebugContext(ctx, "Shard boundary CRC hit but MD5 mismatch",
+					"file", sourceFileID,
+					"absOffset", absPos,
+					"shardIdx", absPos/int64(d.sliceByteCount),
+					"viaRolling", justMissed,
+					"crc", fmt.Sprintf("%08x", crcSlice))
+			} else {
+				d.logger.DebugContext(ctx, "CRC collision at non-boundary (sliding, not jumping)",
+					"file", sourceFileID,
+					"absOffset", absPos)
+			}
+			j++
+			justMissed = true
+		}
 	}
 	return nil
 }

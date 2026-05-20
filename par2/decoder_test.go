@@ -3,6 +3,8 @@ package par2
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"hash/crc32"
 	"log/slog"
 	"math/rand/v2"
 	"os"
@@ -208,4 +210,145 @@ func osIsPermissionOrNotExist(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "permission denied") || strings.Contains(msg, "no such file") || strings.Contains(msg, "does not exist") || strings.Contains(msg, "outside root")
+}
+
+// TestScanChunkCRCCollisionDoesNotSkipShard is a regression test for the bug
+// where a CRC-only match at a non-shard-boundary position caused the scanner to
+// jump forward by sliceByteCount, skipping the real shard that followed.
+//
+// Setup:
+//   - sliceByteCount = 8
+//   - chunk starts at absolute offset 6 (not a shard boundary)
+//   - real shard 1 is at absolute offset 8, i.e. relative j=2 within this chunk
+//   - the lookup table contains a false entry for the data at j=0 (wrong MD5)
+//
+// With the bug: CRC hit at j=0 → jump to j=8 → shard at j=2 skipped.
+// With the fix:  CRC hit at j=0, MD5 wrong → slide j++ → reach j=2 via rolling CRC → shard found.
+func TestScanChunkCRCCollisionDoesNotSkipShard(t *testing.T) {
+	const sliceSize = 8
+
+	// Deterministic file data: 24 bytes.
+	data := make([]byte, 24)
+	for i := range data {
+		data[i] = byte(i*37 + 5)
+	}
+
+	tmp, err := os.CreateTemp(t.TempDir(), "scantest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tmp.Close()
+	if _, err := tmp.Write(data); err != nil {
+		t.Fatal(err)
+	}
+
+	// Chunk covers absolute [6, 24). Within this chunk:
+	//   j=0 → absolute 6  (NOT a shard boundary; 6 % 8 != 0)
+	//   j=2 → absolute 8  (shard 1; 8 % 8 == 0)
+	const chunkStart, chunkEnd = int64(6), int64(24)
+	chunkData := data[chunkStart:chunkEnd]
+
+	// Data that will be seen by the scanner at j=0 (the collision position).
+	collisionSlice := chunkData[0:sliceSize]
+	collisionCRC := crc32.ChecksumIEEE(collisionSlice)
+
+	// Data that the scanner sees at j=2 (the real shard).
+	const realJ = 2
+	realSlice := chunkData[realJ : realJ+sliceSize]
+	realCRC := crc32.ChecksumIEEE(realSlice)
+	realMD5 := md5.Sum(realSlice)
+
+	if collisionCRC == realCRC {
+		t.Skip("test data produces identical CRCs at j=0 and j=2; adjust the seed")
+	}
+
+	var targetFileID FileID
+
+	checksumMap := make(map[uint32][]checksumLocation)
+	// False positive: j=0 CRC is in the table but with the wrong MD5.
+	checksumMap[collisionCRC] = []checksumLocation{{
+		fileID:     targetFileID,
+		shardIndex: 99,
+		md5Hash:    [16]byte{0xFF}, // intentionally wrong
+	}}
+	// Real shard 1 at absolute offset 8.
+	checksumMap[realCRC] = []checksumLocation{{
+		fileID:     targetFileID,
+		shardIndex: 1,
+		md5Hash:    realMD5,
+	}}
+
+	lookupTable := newCRCLookupTable(checksumMap)
+
+	window, err := newCRC32Window(sliceSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Decoder{sliceByteCount: sliceSize, logger: slog.Default()}
+
+	matchChan := make(chan matchEvent, 10)
+	if err := d.scanChunk(context.Background(), tmp, targetFileID, window, chunkStart, chunkEnd, lookupTable, matchChan); err != nil {
+		t.Fatalf("scanChunk: %v", err)
+	}
+	close(matchChan)
+
+	var found bool
+	for ev := range matchChan {
+		if ev.shardIndex == 1 && ev.offset == chunkStart+realJ {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("shard 1 at absolute offset 8 was not found; CRC collision at j=0 may have caused it to be skipped")
+	}
+}
+
+// TestDecoderEndToEndMultiChunk verifies that VerifyScans correctly finds all
+// shards in files that span multiple 32 MB scan chunks. This exercises the
+// cross-chunk-boundary scanning path that was affected by the CRC collision bug.
+func TestDecoderEndToEndMultiChunk(t *testing.T) {
+	_, ok := hasPar2()
+	if !ok {
+		t.Skip("par2 binary not found in PATH; skipping multi-chunk integration test")
+	}
+
+	dir := t.TempDir()
+
+	// 40 MB file — large enough to cross the 32 MB scanChunkSize boundary.
+	const fileSize = 40 * 1024 * 1024
+	r := rand.New(rand.NewPCG(99, 99))
+	fileData := make([]byte, fileSize)
+	for i := range fileData {
+		fileData[i] = byte(r.Uint32())
+	}
+
+	inputFile := filepath.Join(dir, "bigfile.dat")
+	if err := os.WriteFile(inputFile, fileData, 0644); err != nil {
+		t.Fatalf("write bigfile: %v", err)
+	}
+
+	// Use a 10 MB slice size (matching the real-world case that exposed the bug)
+	// and generate enough parity blocks for a full integrity check.
+	par2Path := filepath.Join(dir, "big.par2")
+	out, err := exec.Command("par2", "c", "-s10485760", "-c4", par2Path, inputFile).CombinedOutput()
+	if err != nil {
+		t.Fatalf("par2 create: %v\n%s", err, out)
+	}
+
+	d, err := NewDecoder(context.Background(), par2Path, DecoderOptions{Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("NewDecoder: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.VerifyScans(context.Background()); err != nil {
+		t.Fatalf("VerifyScans: %v", err)
+	}
+
+	counts := d.ShardCounts()
+	if counts.UnusableDataShardCount != 0 {
+		t.Errorf("expected 0 unusable shards, got %d — a shard crossing a chunk boundary was likely missed",
+			counts.UnusableDataShardCount)
+	}
 }
