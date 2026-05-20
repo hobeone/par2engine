@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -444,7 +445,7 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 
 func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32Window, sem chan struct{}, lookupTable *crcLookupTable, matchChan chan<- matchEvent) error {
 	f, err := d.root.Open(fd.Filename)
-	if os.IsNotExist(err) {
+	if errors.Is(err, fs.ErrNotExist) {
 		d.mu.Lock()
 		d.fileIntegrity[fd.FileID].Missing = true
 		d.mu.Unlock()
