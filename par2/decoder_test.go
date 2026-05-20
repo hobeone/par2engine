@@ -67,7 +67,7 @@ func TestDecoderEndToEnd(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewDecoder failed: %v", err)
 		}
-		defer d.Close()
+		defer func() { _ = d.Close() }()
 
 		err = d.VerifyScans(ctx)
 		if err != nil {
@@ -105,7 +105,7 @@ func TestDecoderEndToEnd(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewDecoder failed: %v", err)
 		}
-		defer d.Close()
+		defer func() { _ = d.Close() }()
 
 		// Scan
 		err = d.VerifyScans(ctx)
@@ -192,7 +192,7 @@ func TestDecoderSandboxing(t *testing.T) {
 		t.Fatalf("OpenRoot failed: %v", err)
 	}
 	d.root = root
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 
 	// Attempt to open a file outside the root (e.g., absolute path on Unix, or drive path on Windows, or relative traversal)
 	_, err = d.root.Open("../escaped.dat")
@@ -237,7 +237,7 @@ func TestScanChunkCRCCollisionDoesNotSkipShard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tmp.Close()
+	defer func() { _ = tmp.Close() }()
 	if _, err := tmp.Write(data); err != nil {
 		t.Fatal(err)
 	}
@@ -340,7 +340,7 @@ func TestDecoderEndToEndMultiChunk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDecoder: %v", err)
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 
 	if err := d.VerifyScans(context.Background()); err != nil {
 		t.Fatalf("VerifyScans: %v", err)
@@ -394,7 +394,7 @@ func TestAddCandidateFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDecoder: %v", err)
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 
 	// Without AddCandidateFile the correct file is reported missing.
 	if err := d.VerifyScans(ctx); err != nil {
@@ -455,7 +455,7 @@ func TestRenameMisnamedFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDecoder: %v", err)
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 
 	// Register the wrongly-named file as a candidate.
 	if err := d.AddCandidateFile("wrong_name.dat"); err != nil {
@@ -520,7 +520,7 @@ func TestRenameMisnamedFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDecoder re-verify: %v", err)
 	}
-	defer d2.Close()
+	defer func() { _ = d2.Close() }()
 	if err := d2.VerifyScans(ctx); err != nil {
 		t.Fatalf("VerifyScans re-verify: %v", err)
 	}

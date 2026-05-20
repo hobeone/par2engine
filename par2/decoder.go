@@ -80,7 +80,6 @@ type Decoder struct {
 	logger        *slog.Logger
 
 	root       *os.Root // sandboxed target folder directory root (Go 1.24+)
-	absRootDir string   // absolute resolved target folder directory path
 
 	sliceByteCount int
 	recoverySetID  [16]byte
@@ -154,7 +153,6 @@ func NewDecoder(ctx context.Context, par2Path string, opts DecoderOptions) (*Dec
 		maxPacketSize:    opts.MaxPacketSize,
 		logger:           opts.Logger,
 		root:             root,
-		absRootDir:       absDir,
 		fileChecksums:    make(map[FileID]*IFSCPacket),
 		parityShards:     make(map[uint16][]byte),
 		fileIntegrity:    make(map[FileID]*FileIntegrityState),
@@ -163,13 +161,13 @@ func NewDecoder(ctx context.Context, par2Path string, opts DecoderOptions) (*Dec
 
 	err = d.loadIndexFile(ctx, indexFilename)
 	if err != nil {
-		root.Close()
+		_ = root.Close()
 		return nil, err
 	}
 
 	err = d.loadVolumeFiles(ctx, indexFilename)
 	if err != nil {
-		root.Close()
+		_ = root.Close()
 		return nil, err
 	}
 
@@ -212,7 +210,7 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 	if err != nil {
 		return fmt.Errorf("failed to open index par2 file: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Reject PAR2 files exceeding maximum allowed size to prevent memory exhaustion DoS.
 	stat, err := f.Stat()
@@ -424,7 +422,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 		} else if err != nil {
 			return err
 		}
-		f.Close()
+		_ = f.Close()
 	}
 
 	// ── Phase 5: pre-scan candidates for full content matches ────────────────
@@ -589,7 +587,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 			}
 			hasher := md5.New()
 			_, copyErr := io.Copy(hasher, f)
-			f.Close()
+			_ = f.Close()
 			d.mu.Lock()
 			if copyErr != nil {
 				d.logger.WarnContext(ctx, "I/O error during MD5 verification", "file", fd.Filename, "err", copyErr)
@@ -758,7 +756,7 @@ func (d *Decoder) prescanCandidateMatches(ctx context.Context) map[string]bool {
 
 		stat, err := f.Stat()
 		if err != nil {
-			f.Close()
+			_ = f.Close()
 			continue
 		}
 		fileSize := stat.Size()
@@ -770,18 +768,18 @@ func (d *Decoder) prescanCandidateMatches(ctx context.Context) map[string]bool {
 
 		fd, ok := missingByQuickKey[quickKey{fileSize, quickHash}]
 		if !ok {
-			f.Close()
+			_ = f.Close()
 			continue
 		}
 
 		// 16 KB matched — compute full-file MD5 to confirm.
 		hasher := md5.New()
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			f.Close()
+			_ = f.Close()
 			continue
 		}
 		_, copyErr := io.Copy(hasher, f)
-		f.Close()
+		_ = f.Close()
 		if copyErr != nil {
 			continue
 		}
@@ -869,7 +867,7 @@ func (d *Decoder) detectRenameCandidate(ctx context.Context, fd FileDescPacket, 
 	}
 	hasher := md5.New()
 	_, copyErr := io.Copy(hasher, f)
-	f.Close()
+	_ = f.Close()
 	d.mu.Lock()
 	if copyErr != nil {
 		d.logger.WarnContext(ctx, "I/O error during rename candidate MD5 check",
@@ -902,12 +900,9 @@ func (d *Decoder) renameMisnamedFiles(ctx context.Context) int {
 			continue
 		}
 
-		srcAbs := filepath.Join(d.absRootDir, state.RenameSource)
-		dstAbs := filepath.Join(d.absRootDir, fd.Filename)
-
-		// Ensure the target directory exists.
-		if dir := filepath.Dir(dstAbs); dir != "." {
-			if err := os.MkdirAll(dir, 0755); err != nil {
+		// Ensure the target directory exists using sandbox root.
+		if dir := filepath.Dir(fd.Filename); dir != "." {
+			if err := d.root.MkdirAll(dir, 0755); err != nil {
 				d.logger.WarnContext(ctx, "Failed to create directory for rename, falling back to repair",
 					"dir", dir, "err", err)
 				state.RenameSource = ""
@@ -916,7 +911,7 @@ func (d *Decoder) renameMisnamedFiles(ctx context.Context) int {
 			}
 		}
 
-		if err := os.Rename(srcAbs, dstAbs); err != nil {
+		if err := d.root.Rename(state.RenameSource, fd.Filename); err != nil {
 			d.logger.WarnContext(ctx, "Rename failed, falling back to repair",
 				"from", state.RenameSource, "to", fd.Filename, "err", err)
 			// Clear rename state and mark as needing reconstruction.
@@ -954,7 +949,7 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 	} else if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	stat, err := f.Stat()
 	if err != nil {
@@ -1064,7 +1059,7 @@ func (d *Decoder) scanCandidateFile(ctx context.Context, path string, fileID Fil
 	} else if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	stat, err := f.Stat()
 	if err != nil {
@@ -1374,7 +1369,7 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 	}
 	defer func() {
 		for _, f := range openFiles {
-			f.Close()
+			_ = f.Close()
 		}
 	}()
 
@@ -1502,11 +1497,14 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 func (d *Decoder) loadVolumeFiles(ctx context.Context, indexFilename string) error {
 	prefix := strings.TrimSuffix(indexFilename, ".par2")
 
-	// NOTE: os.ReadDir is used here instead of d.root because Go's os.Root API
-	// does not expose a directory listing method. This is an accepted limitation:
-	// d.absRootDir was resolved via filepath.EvalSymlinks at construction time,
-	// and all actual file opens below go through d.root.Open which is sandboxed.
-	entries, err := os.ReadDir(d.absRootDir)
+	// Open the sandbox root directory to list files safely within the sandbox.
+	dirFile, err := d.root.Open(".")
+	if err != nil {
+		return fmt.Errorf("failed to open sandboxed directory: %w", err)
+	}
+	defer func() { _ = dirFile.Close() }()
+
+	entries, err := dirFile.ReadDir(-1)
 	if err != nil {
 		return fmt.Errorf("failed to read sandboxed directory: %w", err)
 	}
@@ -1542,7 +1540,7 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Reject volume files exceeding maximum allowed size to prevent memory exhaustion.
 	stat, err := f.Stat()

@@ -101,7 +101,7 @@ func runCLI() int {
 			fmt.Fprintf(os.Stderr, "Error: failed to create CPU profile file: %v\n", err)
 			return ExitLogicError
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		if err := pprof.StartCPUProfile(f); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: failed to start CPU profiling: %v\n", err)
 			return ExitLogicError
@@ -117,7 +117,7 @@ func runCLI() int {
 				fmt.Fprintf(os.Stderr, "Error: failed to create memory profile file: %v\n", err)
 				return
 			}
-			defer f.Close()
+			defer func() { _ = f.Close() }()
 			runtime.GC() // get up-to-date statistics
 			if err := pprof.WriteHeapProfile(f); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: failed to write memory profile: %v\n", err)
@@ -153,7 +153,7 @@ func runCLI() int {
 		fmt.Fprintf(os.Stderr, "Error initializing PAR2 decoder: %v\n", err)
 		return ExitInvalidCommandLineArguments
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 
 	par2Dir := filepath.Dir(par2Path)
 	for _, c := range candidates {
@@ -256,8 +256,6 @@ func runCLI() int {
 		printUsage(name, flagSet)
 		return ExitInvalidCommandLineArguments
 	}
-
-	return ExitLogicError
 }
 
 func printUsage(name string, fs *flag.FlagSet) {
