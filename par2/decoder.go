@@ -40,6 +40,7 @@ type FileIntegrityState struct {
 	Missing        bool
 	SizeMismatch   bool
 	HashMismatch   bool
+	Verified       bool            // true if full-file MD5 was already verified OK
 	RenameSource   string          // non-empty when a candidate file is a perfect content match under a different name
 	ShardLocations []ShardLocation // maps expected shardIndex -> where it is actually located
 }
@@ -431,6 +432,11 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 	// skip the expensive sliding-window block scan for that candidate.
 	resolvedCandidates := d.prescanCandidateMatches(ctx)
 
+	// ── Phase 5a: pre-scan protected files for perfect matches ───────────────
+	// Check if any protected files are already 100% healthy on disk to skip
+	// the sliding-window scan for them.
+	d.prescanProtectedMatches(ctx)
+
 	// ── Phase 6: build checksum map and run the block-level scan ─────────────
 	window, err := newCRC32Window(d.sliceByteCount)
 	if err != nil {
@@ -491,15 +497,17 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 
 	sem := make(chan struct{}, d.numGoroutines)
 
-	// Scan protected files that exist on disk (missing ones have nothing to scan).
+	// Scan protected files that exist on disk and are not already pre-verified.
 	for _, fDesc := range d.protectedFiles {
 		if ctx.Err() != nil {
 			break
 		}
 		d.mu.Lock()
-		missing := d.fileIntegrity[fDesc.FileID].Missing
+		state := d.fileIntegrity[fDesc.FileID]
+		missing := state.Missing
+		verified := state.Verified
 		d.mu.Unlock()
-		if missing {
+		if missing || verified {
 			continue
 		}
 		scanWg.Add(1)
@@ -550,6 +558,9 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 	d.mu.Lock()
 	for _, fd := range d.protectedFiles {
 		state := d.fileIntegrity[fd.FileID]
+		if state.Verified {
+			continue
+		}
 		if state.SizeMismatch {
 			continue
 		}
@@ -799,6 +810,7 @@ func (d *Decoder) prescanCandidateMatches(ctx context.Context) map[string]bool {
 		d.mu.Lock()
 		state := d.fileIntegrity[fd.FileID]
 		state.RenameSource = candidatePath
+		state.Verified = true
 		for i := range state.ShardLocations {
 			state.ShardLocations[i] = ShardLocation{
 				FileID: candidateID,
@@ -813,6 +825,92 @@ func (d *Decoder) prescanCandidateMatches(ctx context.Context) map[string]bool {
 	}
 
 	return resolved
+}
+
+// prescanProtectedMatches checks if any protected files are already perfectly healthy
+// on disk by comparing their size, 16 KB hash, and full-file MD5.
+// If a file matches, it populates ShardLocations directly and skips the sliding-window scan.
+func (d *Decoder) prescanProtectedMatches(ctx context.Context) {
+	const quickHashSize = 16 * 1024
+
+	for i := range d.protectedFiles {
+		if ctx.Err() != nil {
+			break
+		}
+		fd := &d.protectedFiles[i]
+
+		d.mu.Lock()
+		missing := d.fileIntegrity[fd.FileID].Missing
+		d.mu.Unlock()
+		if missing {
+			continue
+		}
+
+		f, err := d.root.Open(fd.Filename)
+		if err != nil {
+			continue
+		}
+
+		stat, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			continue
+		}
+		fileSize := stat.Size()
+
+		if fileSize != int64(fd.ByteCount) {
+			_ = f.Close()
+			continue
+		}
+
+		// Quick filter: read first 16 KB and hash it.
+		quick := make([]byte, min(quickHashSize, int(fileSize)))
+		n, err := f.ReadAt(quick, 0)
+		if err != nil && err != io.EOF {
+			_ = f.Close()
+			continue
+		}
+		quickHash := md5.Sum(quick[:n])
+
+		if quickHash != fd.SixteenKHash {
+			_ = f.Close()
+			continue
+		}
+
+		// 16 KB matched — compute full-file MD5 to confirm.
+		hasher := md5.New()
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			_ = f.Close()
+			continue
+		}
+		_, copyErr := io.Copy(hasher, f)
+		_ = f.Close()
+		if copyErr != nil {
+			continue
+		}
+		var fullHash [16]byte
+		copy(fullHash[:], hasher.Sum(nil))
+		if fullHash != fd.Hash {
+			continue
+		}
+
+		// Perfect match: populate ShardLocations directly
+		d.mu.Lock()
+		state := d.fileIntegrity[fd.FileID]
+		state.Missing = false
+		state.SizeMismatch = false
+		state.HashMismatch = false
+		state.Verified = true
+		for idx := range state.ShardLocations {
+			state.ShardLocations[idx] = ShardLocation{
+				FileID: fd.FileID,
+				Offset: int64(idx * d.sliceByteCount),
+			}
+		}
+		d.mu.Unlock()
+
+		d.logger.DebugContext(ctx, "Protected file pre-scan: verified OK (skipping sliding scan)", "file", fd.Filename)
+	}
 }
 
 // detectRenameCandidate checks whether all shards of a protected file were
