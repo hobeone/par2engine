@@ -409,6 +409,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 		go func(fd FileDescPacket) {
 			defer scanWg.Done()
 
+			d.logger.InfoContext(ctx, "Scanning file for checksum matches", "file", fd.Filename)
 			err := d.scanFile(ctx, fd, window, sem, lookupTable, matchChan)
 			if err != nil {
 				d.logger.ErrorContext(ctx, "failed to scan file", "file", fd.Filename, "err", err)
