@@ -696,12 +696,18 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 		"misnamed", renameCount,
 		"recoveryBlocks", len(d.parityShards))
 
-	if finalCounts.RepairNeeded() {
+	switch {
+	case finalCounts.UnusableDataShardCount > 0:
 		d.logger.Warn("Verification found missing or corrupt blocks",
 			"missingBlocks", finalCounts.UnusableDataShardCount,
+			"damagedFiles", damagedCount,
+			"missingFiles", missingCount,
 			"availableParity", finalCounts.UsableParityShardCount)
-	} else {
-		d.logger.Info("No repair needed. All files are healthy.")
+	case finalCounts.RenamesNeeded > 0:
+		d.logger.Info("All file content is intact — repair will rename misnamed file(s)",
+			"filesToRename", finalCounts.RenamesNeeded)
+	default:
+		d.logger.Info("All files verified OK.")
 	}
 
 	return ctx.Err()
