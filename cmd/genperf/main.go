@@ -59,12 +59,15 @@ func main() {
 		binary.LittleEndian.PutUint64(block[:8], j)
 		_, err = largeFile.Write(block)
 		if err != nil {
-			largeFile.Close()
+			_ = largeFile.Close()
 			fmt.Fprintf(os.Stderr, "Error writing block %d: %v\n", j, err)
 			os.Exit(1)
 		}
 	}
-	largeFile.Close()
+	if err := largeFile.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error closing large file: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Printf("Successfully generated %dGB unique-block file in %s!\n", sizeGB, time.Since(startLarge))
 
 	// 2. Generate 10 small files (1-4MB)
