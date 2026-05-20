@@ -85,7 +85,7 @@ func NewCauchyMatrix(rows, cols int, x, y []gf16.T) (Matrix, error) {
 		for j := range cols {
 			sum := x[i] ^ y[j]
 			if sum == 0 {
-				return Matrix{}, errors.New("Cauchy matrix division by zero")
+				return Matrix{}, errors.New("cauchy matrix division by zero")
 			}
 			elements[i*cols+j] = sum.Inverse()
 		}
