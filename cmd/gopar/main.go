@@ -129,7 +129,13 @@ func runCLI() int {
 		maxPacketLimitBytes = 128 * 1024 * 1024
 	}
 
-	d, err := par2.NewDecoder(ctx, par2Path, numThreads, memLimitBytes, maxFileLimitBytes, maxPacketLimitBytes, logger)
+	d, err := par2.NewDecoder(ctx, par2Path, par2.DecoderOptions{
+		NumGoroutines: numThreads,
+		MemoryLimit:   memLimitBytes,
+		MaxFileSize:   maxFileLimitBytes,
+		MaxPacketSize: maxPacketLimitBytes,
+		Logger:        logger,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error initializing PAR2 decoder: %v\n", err)
 		return ExitInvalidCommandLineArguments

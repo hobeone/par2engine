@@ -61,7 +61,7 @@ func TestDecoderEndToEnd(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("verify_healthy_set", func(t *testing.T) {
-		d, err := NewDecoder(ctx, par2Path, 0, 0, 0, 0, nil)
+		d, err := NewDecoder(ctx, par2Path, DecoderOptions{})
 		if err != nil {
 			t.Fatalf("NewDecoder failed: %v", err)
 		}
@@ -99,7 +99,7 @@ func TestDecoderEndToEnd(t *testing.T) {
 		}
 
 		// Open decoder
-		d, err := NewDecoder(ctx, par2Path, 2, 64*1024, 0, 0, nil) // 2 threads, tiny memory limit (64KB buffer) to test streaming!
+		d, err := NewDecoder(ctx, par2Path, DecoderOptions{NumGoroutines: 2, MemoryLimit: 64 * 1024}) // 2 threads, tiny memory limit (64KB buffer) to test streaming!
 		if err != nil {
 			t.Fatalf("NewDecoder failed: %v", err)
 		}
