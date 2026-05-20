@@ -88,10 +88,10 @@ type Decoder struct {
 	fileChecksums  map[FileID]*IFSCPacket
 	parityShards   map[uint16][]byte // exponent -> parity bytes loaded from par2 files
 
-	fileIntegrity   map[FileID]*FileIntegrityState
-	candidateFiles  map[string]FileID // extra files to scan; path → synthetic FileID
-	parityFileBlocks map[string]int   // par2 filename → number of recovery blocks it contributes
-	mu              sync.Mutex        // protects shared state updates
+	fileIntegrity    map[FileID]*FileIntegrityState
+	candidateFiles   map[string]FileID // extra files to scan; path → synthetic FileID
+	parityFileBlocks map[string]int    // par2 filename → number of recovery blocks it contributes
+	mu               sync.Mutex        // protects shared state updates
 }
 
 type checksumLocation struct {
@@ -148,13 +148,13 @@ func NewDecoder(ctx context.Context, par2Path string, opts DecoderOptions) (*Dec
 	}
 
 	d := &Decoder{
-		numGoroutines: opts.NumGoroutines,
-		memoryLimit:   opts.MemoryLimit,
-		maxFileSize:   opts.MaxFileSize,
-		maxPacketSize: opts.MaxPacketSize,
-		logger:        opts.Logger,
-		root:          root,
-		absRootDir:    absDir,
+		numGoroutines:    opts.NumGoroutines,
+		memoryLimit:      opts.MemoryLimit,
+		maxFileSize:      opts.MaxFileSize,
+		maxPacketSize:    opts.MaxPacketSize,
+		logger:           opts.Logger,
+		root:             root,
+		absRootDir:       absDir,
 		fileChecksums:    make(map[FileID]*IFSCPacket),
 		parityShards:     make(map[uint16][]byte),
 		fileIntegrity:    make(map[FileID]*FileIntegrityState),
@@ -598,7 +598,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 					"actual", fmt.Sprintf("%x", fileHash))
 				state.HashMismatch = true
 			} else {
-				d.logger.InfoContext(ctx, "File hash verified OK", "file", fd.Filename)
+				d.logger.DebugContext(ctx, "File hash verified OK", "file", fd.Filename)
 			}
 		} else if rename := d.detectRenameCandidate(ctx, fd, state); rename != "" {
 			// All shards found in a single candidate file at consecutive offsets
@@ -669,7 +669,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 				"found", state.RenameSource)
 			renameCount++
 		default:
-			d.logger.InfoContext(ctx, "File status: OK", "file", fd.Filename)
+			d.logger.DebugContext(ctx, "File status: OK", "file", fd.Filename)
 			okCount++
 		}
 	}
