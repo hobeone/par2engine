@@ -155,10 +155,34 @@ func runCLI() int {
 	}
 	defer d.Close()
 
+	par2Dir := filepath.Dir(par2Path)
 	for _, c := range candidates {
-		if err := d.AddCandidateFile(c); err != nil {
-			fmt.Fprintf(os.Stderr, "Error adding candidate file %q: %v\n", c, err)
+		if !strings.ContainsAny(c, "*?[") {
+			if err := d.AddCandidateFile(c); err != nil {
+				fmt.Fprintf(os.Stderr, "Error adding candidate file %q: %v\n", c, err)
+				return ExitInvalidCommandLineArguments
+			}
+			continue
+		}
+		matches, err := filepath.Glob(filepath.Join(par2Dir, c))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid glob pattern %q: %v\n", c, err)
 			return ExitInvalidCommandLineArguments
+		}
+		if len(matches) == 0 {
+			logger.Warn("No files matched glob pattern", "pattern", c)
+			continue
+		}
+		for _, match := range matches {
+			rel, err := filepath.Rel(par2Dir, match)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving path %q: %v\n", match, err)
+				return ExitInvalidCommandLineArguments
+			}
+			if err := d.AddCandidateFile(rel); err != nil {
+				fmt.Fprintf(os.Stderr, "Error adding candidate file %q: %v\n", rel, err)
+				return ExitInvalidCommandLineArguments
+			}
 		}
 	}
 
