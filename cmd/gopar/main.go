@@ -208,7 +208,7 @@ func runCLI() int {
 			return ExitSuccess
 		}
 		if counts.RepairPossible() {
-			logger.Warn("Repair is REQUIRED and POSSIBLE.", "missingBlocks", counts.UnusableDataShardCount, "availableParity", counts.UsableParityShardCount)
+			logger.Warn("Repair is REQUIRED and POSSIBLE.", "missingBlocks", counts.UnusableDataShardCount, "availableParity", counts.UsableParityShardCount, "filesToRename", counts.RenamesNeeded)
 			return ExitRepairPossible
 		}
 		logger.Error("Repair is REQUIRED but NOT possible.", "missingBlocks", counts.UnusableDataShardCount, "availableParity", counts.UsableParityShardCount)
