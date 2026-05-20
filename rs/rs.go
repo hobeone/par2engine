@@ -180,12 +180,23 @@ func validateShardLengths(data, parity [][]byte) (int, error) {
 // ErrNotEnoughParity is returned when there are not enough parity shards to reconstruct.
 var ErrNotEnoughParity = errors.New("not enough parity shards to perform reconstruction")
 
+var (
+	ErrInvalidDataShardCount   = errors.New("invalid data shard count")
+	ErrInvalidParityShardCount = errors.New("invalid parity shard count")
+)
+
 // Reconstruct takes a list of data shards and parity shards, some of which
 // can be nil (representing missing shards), and reconstructs the missing data
 // shards in-place inside the data slice.
 func (c *Coder) Reconstruct(ctx context.Context, data, parity [][]byte, numGoroutines int) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
+	}
+	if len(data) != c.dataShards {
+		return ErrInvalidDataShardCount
+	}
+	if len(parity) > c.parityShards {
+		return ErrInvalidParityShardCount
 	}
 
 	sliceLen, err := validateShardLengths(data, parity)
