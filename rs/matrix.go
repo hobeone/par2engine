@@ -149,6 +149,7 @@ func (m Matrix) swapRows(i, j int) {
 
 // castTToByteSlice safely casts a []gf16.T to []byte using modern unsafe.Slice (Go 1.17+).
 // Zero-allocation and compiler-optimized.
+// NOTE: assumes little-endian host (x86/ARM64). PAR2 uses LE byte order.
 func castTToByteSlice(ts []gf16.T) []byte {
 	if len(ts) == 0 {
 		return nil

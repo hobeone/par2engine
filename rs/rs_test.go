@@ -3,6 +3,7 @@ package rs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"math/rand/v2"
 	"testing"
 )
@@ -120,7 +121,7 @@ func TestRSEndToEnd(t *testing.T) {
 		dataCopy[2] = nil
 
 		err := coder.Reconstruct(ctx, dataCopy, parityCopy, 0)
-		if !errorsIs(err, ErrNotEnoughParity) {
+		if !errors.Is(err, ErrNotEnoughParity) {
 			t.Fatalf("got err = %v, want ErrNotEnoughParity", err)
 		}
 	})
@@ -161,16 +162,8 @@ func TestRSContextCancellation(t *testing.T) {
 	cancel() // cancel immediately
 
 	err = coder.Reconstruct(cancelCtx, data, parity, 1)
-	if !errorsIs(err, context.Canceled) {
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got err = %v, want context.Canceled", err)
 	}
 }
 
-// Simple helper to avoid errors package imports in tests if not needed,
-// or just standard errors.Is equivalent.
-func errorsIs(err, target error) bool {
-	if err == nil || target == nil {
-		return err == target
-	}
-	return err.Error() == target.Error()
-}

@@ -164,13 +164,15 @@ func DefangPath(filename string) (string, error) {
 }
 
 func computeFileID(sixteenKHash [16]byte, byteCount uint64, filenameBytes []byte) FileID {
-	var hashInput []byte
-	hashInput = append(hashInput, sixteenKHash[:]...)
+	h := md5.New()
+	h.Write(sixteenKHash[:])
 	var byteCountBytes [8]byte
 	binary.LittleEndian.PutUint64(byteCountBytes[:], byteCount)
-	hashInput = append(hashInput, byteCountBytes[:]...)
-	hashInput = append(hashInput, filenameBytes...)
-	return md5.Sum(hashInput)
+	h.Write(byteCountBytes[:])
+	h.Write(filenameBytes)
+	var result FileID
+	copy(result[:], h.Sum(nil))
+	return result
 }
 
 // ParseMainPacket parses a Main Packet body.
