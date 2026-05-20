@@ -921,6 +921,15 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 	}
 	defer f.Close()
 
+	// Reject volume files exceeding maximum allowed size to prevent memory exhaustion.
+	stat, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat volume file: %w", err)
+	}
+	if stat.Size() > d.maxFileSize {
+		return fmt.Errorf("volume file %s exceeds maximum allowed size (%d bytes > %d byte limit)", filename, stat.Size(), d.maxFileSize)
+	}
+
 	// Use a buffered reader to stream packet parsing without loading the whole file into memory.
 	// This prevents OOM attacks from massive recovery volume files.
 	for {
