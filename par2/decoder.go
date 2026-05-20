@@ -125,7 +125,7 @@ func NewDecoder(ctx context.Context, par2Path string, opts DecoderOptions) (*Dec
 		opts.MaxFileSize = 100 * 1024 * 1024 // 100MB default index file size limit
 	}
 	if opts.MaxPacketSize <= 0 {
-		opts.MaxPacketSize = 128 * 1024 * 1024 // 128MB default packet body limit
+		opts.MaxPacketSize = 128 * 1024 * 1024 // default packet body limit
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
