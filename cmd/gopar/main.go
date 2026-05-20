@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/hobeone/par2engine/par2"
+	"runtime/debug"
 )
 
 // Exit codes matching par2cmdline standard specifications
@@ -40,6 +41,7 @@ func runCLI() int {
 		memProfile string
 		maxFileSizeMB int64
 		verbose       bool
+		versionFlag   bool
 	)
 
 	flagSet.IntVar(&numThreads, "t", runtime.NumCPU(), "number of concurrent processing threads")
@@ -48,11 +50,21 @@ func runCLI() int {
 	flagSet.StringVar(&memProfile, "memprofile", "", "write memory profile to file")
 	flagSet.Int64Var(&maxFileSizeMB, "max-file-size", 100, "maximum PAR2 index file size in megabytes")
 	flagSet.BoolVar(&verbose, "v", false, "enable verbose structured slog logging")
+	flagSet.BoolVar(&versionFlag, "version", false, "print version information")
 
 	// Parse flags
 	err := flagSet.Parse(os.Args[1:])
 	if err != nil {
 		return ExitInvalidCommandLineArguments
+	}
+
+	if versionFlag {
+		v := "unknown"
+		if info, ok := debug.ReadBuildInfo(); ok {
+			v = info.Main.Version
+		}
+		fmt.Printf("%s version %s\n", name, v)
+		return ExitSuccess
 	}
 
 	args := flagSet.Args()
@@ -210,6 +222,7 @@ func runCLI() int {
 }
 
 func printUsage(name string, fs *flag.FlagSet) {
+	fmt.Fprintf(os.Stderr, "PAR2 Engine - High-performance verification and repair\n")
 	fmt.Fprintf(os.Stderr, "\nUsage:\n")
 	fmt.Fprintf(os.Stderr, "  %s [options] verify <set.par2> : Verify the integrity of the files\n", name)
 	fmt.Fprintf(os.Stderr, "  %s [options] repair <set.par2> : Repair corrupt/missing files\n", name)
