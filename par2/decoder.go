@@ -705,10 +705,6 @@ func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID
 					"shardIdx", absPos/int64(d.sliceByteCount),
 					"viaRolling", justMissed,
 					"crc", fmt.Sprintf("%08x", crcSlice))
-			} else {
-				d.logger.DebugContext(ctx, "CRC collision at non-boundary (sliding, not jumping)",
-					"file", sourceFileID,
-					"absOffset", absPos)
 			}
 			j++
 			justMissed = true
@@ -850,6 +846,11 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 		var f *os.File
 		var err error
 		if needsWrite[name] {
+			if dir := filepath.Dir(name); dir != "." {
+				if err = d.root.MkdirAll(dir, 0755); err != nil {
+					return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
+				}
+			}
 			f, err = d.root.OpenFile(name, os.O_RDWR|os.O_CREATE, 0644)
 		} else {
 			f, err = d.root.Open(name)
