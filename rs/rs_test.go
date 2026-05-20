@@ -167,3 +167,44 @@ func TestRSContextCancellation(t *testing.T) {
 	}
 }
 
+func TestRSInputValidation(t *testing.T) {
+	coder, err := NewCoderPAR2Vandermonde(4, 2)
+	if err != nil {
+		t.Fatalf("NewCoder failed: %v", err)
+	}
+
+	ctx := context.Background()
+	validData := make([][]byte, 4)
+	for i := range validData {
+		validData[i] = make([]byte, 64)
+	}
+	validParity := make([][]byte, 2)
+	for i := range validParity {
+		validParity[i] = make([]byte, 64)
+	}
+
+	t.Run("invalid_data_shard_count_too_few", func(t *testing.T) {
+		tooFewData := make([][]byte, 3)
+		err := coder.Reconstruct(ctx, tooFewData, validParity, 0)
+		if !errors.Is(err, ErrInvalidDataShardCount) {
+			t.Fatalf("got err = %v, want ErrInvalidDataShardCount", err)
+		}
+	})
+
+	t.Run("invalid_data_shard_count_too_many", func(t *testing.T) {
+		tooManyData := make([][]byte, 5)
+		err := coder.Reconstruct(ctx, tooManyData, validParity, 0)
+		if !errors.Is(err, ErrInvalidDataShardCount) {
+			t.Fatalf("got err = %v, want ErrInvalidDataShardCount", err)
+		}
+	})
+
+	t.Run("invalid_parity_shard_count_too_many", func(t *testing.T) {
+		tooManyParity := make([][]byte, 3)
+		err := coder.Reconstruct(ctx, validData, tooManyParity, 0)
+		if !errors.Is(err, ErrInvalidParityShardCount) {
+			t.Fatalf("got err = %v, want ErrInvalidParityShardCount", err)
+		}
+	})
+}
+
