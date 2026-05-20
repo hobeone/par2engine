@@ -427,8 +427,13 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 				continue
 			}
 			hasher := md5.New()
-			_, _ = io.Copy(hasher, f)
+			_, copyErr := io.Copy(hasher, f)
 			f.Close()
+			if copyErr != nil {
+				d.logger.WarnContext(ctx, "I/O error during MD5 verification", "file", fd.Filename, "err", copyErr)
+				state.HashMismatch = true
+				continue
+			}
 			var fileHash [16]byte
 			copy(fileHash[:], hasher.Sum(nil))
 			d.logger.InfoContext(ctx, "MD5 verification", "file", fd.Filename, "got", fmt.Sprintf("%x", fileHash), "want", fmt.Sprintf("%x", fd.Hash))
