@@ -171,7 +171,7 @@ func TestDecoderEndToEnd(t *testing.T) {
 func TestDecoderSandboxing(t *testing.T) {
 	// Verify that os.Root sandboxing correctly throws an error if we try to escape
 	dir := t.TempDir()
-	
+
 	// Create a decoder inside target directory
 	dummyIndex := filepath.Join(dir, "dummy.par2")
 	if err := os.WriteFile(dummyIndex, []byte("PAR2\x00PKT"), 0644); err != nil {
@@ -186,7 +186,7 @@ func TestDecoderSandboxing(t *testing.T) {
 		parityShards:  make(map[uint16][]byte),
 		fileIntegrity: make(map[FileID]*FileIntegrityState),
 	}
-	
+
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		t.Fatalf("OpenRoot failed: %v", err)
@@ -414,5 +414,118 @@ func TestAddCandidateFile(t *testing.T) {
 	counts := d.ShardCounts()
 	if counts.UnusableDataShardCount != 0 {
 		t.Errorf("expected 0 unusable shards after registering candidate, got %d", counts.UnusableDataShardCount)
+	}
+}
+
+// TestRenameMisnamedFile verifies that a file with the wrong name is detected
+// during verification and renamed (not reconstructed) during repair.
+func TestRenameMisnamedFile(t *testing.T) {
+	_, ok := hasPar2()
+	if !ok {
+		t.Skip("par2 binary not found in PATH")
+	}
+
+	dir := t.TempDir()
+	r := rand.New(rand.NewPCG(88, 88))
+	fileData := make([]byte, 64*1024)
+	for i := range fileData {
+		fileData[i] = byte(r.Uint32())
+	}
+
+	// Write the file under its correct name and build a PAR2 set.
+	correctName := filepath.Join(dir, "correct.dat")
+	if err := os.WriteFile(correctName, fileData, 0644); err != nil {
+		t.Fatal(err)
+	}
+	par2Path := filepath.Join(dir, "set.par2")
+	out, err := exec.Command("par2", "c", "-s16384", "-c4", par2Path, correctName).CombinedOutput()
+	if err != nil {
+		t.Fatalf("par2 create: %v\n%s", err, out)
+	}
+
+	// Rename: delete correct name, leave only the wrong name.
+	wrongName := filepath.Join(dir, "wrong_name.dat")
+	if err := os.Rename(correctName, wrongName); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	d, err := NewDecoder(ctx, par2Path, DecoderOptions{Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("NewDecoder: %v", err)
+	}
+	defer d.Close()
+
+	// Register the wrongly-named file as a candidate.
+	if err := d.AddCandidateFile("wrong_name.dat"); err != nil {
+		t.Fatalf("AddCandidateFile: %v", err)
+	}
+
+	// Verify: should detect the rename candidate, NOT report as damaged.
+	if err := d.VerifyScans(ctx); err != nil {
+		t.Fatalf("VerifyScans: %v", err)
+	}
+
+	// All shards should be usable (found in the candidate).
+	counts := d.ShardCounts()
+	if counts.UnusableDataShardCount != 0 {
+		t.Fatalf("expected 0 unusable shards, got %d", counts.UnusableDataShardCount)
+	}
+
+	// The file should have RenameSource set, not HashMismatch.
+	d.mu.Lock()
+	var renameFound bool
+	for _, fd := range d.protectedFiles {
+		state := d.fileIntegrity[fd.FileID]
+		if state.RenameSource != "" {
+			renameFound = true
+			if state.HashMismatch {
+				t.Error("file with RenameSource should not have HashMismatch set")
+			}
+		}
+	}
+	d.mu.Unlock()
+	if !renameFound {
+		t.Fatal("expected at least one file with RenameSource set")
+	}
+
+	// Repair: should rename, not reconstruct.
+	progressChan := make(chan Progress, 10)
+	go func() {
+		for range progressChan {
+		}
+	}()
+
+	if err := d.Repair(ctx, progressChan); err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+
+	// Assert: correct name exists with original content.
+	repaired, err := os.ReadFile(correctName)
+	if err != nil {
+		t.Fatalf("correct.dat should exist after repair: %v", err)
+	}
+	if !bytes.Equal(repaired, fileData) {
+		t.Fatal("repaired file content does not match original")
+	}
+
+	// Assert: wrong name is gone.
+	if _, err := os.Stat(wrongName); !os.IsNotExist(err) {
+		t.Fatal("wrong_name.dat should not exist after rename")
+	}
+
+	// Re-verify: should be fully healthy now.
+	d2, err := NewDecoder(ctx, par2Path, DecoderOptions{Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("NewDecoder re-verify: %v", err)
+	}
+	defer d2.Close()
+	if err := d2.VerifyScans(ctx); err != nil {
+		t.Fatalf("VerifyScans re-verify: %v", err)
+	}
+	counts2 := d2.ShardCounts()
+	if counts2.RepairNeeded() {
+		t.Fatalf("expected no repair needed after rename, got %d unusable shards", counts2.UnusableDataShardCount)
 	}
 }
