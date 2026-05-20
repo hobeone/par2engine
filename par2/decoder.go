@@ -252,7 +252,11 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 			if err != nil {
 				return err
 			}
-			d.parityShards[p.Exponent] = p.Data
+			if _, exists := d.parityShards[p.Exponent]; exists {
+				d.logger.WarnContext(ctx, "duplicate recovery packet exponent, skipping", "exponent", p.Exponent)
+			} else {
+				d.parityShards[p.Exponent] = p.Data
+			}
 		}
 	}
 
@@ -971,7 +975,11 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 				return err
 			}
 			d.mu.Lock()
-			d.parityShards[p.Exponent] = p.Data
+			if _, exists := d.parityShards[p.Exponent]; exists {
+				d.logger.WarnContext(ctx, "duplicate recovery packet exponent, skipping", "exponent", p.Exponent, "file", filename)
+			} else {
+				d.parityShards[p.Exponent] = p.Data
+			}
 			d.mu.Unlock()
 		}
 	}
