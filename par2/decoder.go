@@ -273,7 +273,7 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 				return err
 			}
 			d.protectedFiles = append(d.protectedFiles, *p)
-			d.logger.InfoContext(ctx, "PAR2 set contains protected file", "file", p.Filename, "size", p.ByteCount)
+			d.logger.DebugContext(ctx, "PAR2 set contains protected file", "file", p.Filename, "size", p.ByteCount)
 
 		case IFSCPacketType:
 			p, err := ParseIFSCPacket(body)
