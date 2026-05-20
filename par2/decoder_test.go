@@ -352,3 +352,67 @@ func TestDecoderEndToEndMultiChunk(t *testing.T) {
 			counts.UnusableDataShardCount)
 	}
 }
+
+// TestAddCandidateFile verifies that a file with the wrong name is still
+// recognised and used as a repair source when registered via AddCandidateFile.
+func TestAddCandidateFile(t *testing.T) {
+	_, ok := hasPar2()
+	if !ok {
+		t.Skip("par2 binary not found in PATH")
+	}
+
+	dir := t.TempDir()
+	r := rand.New(rand.NewPCG(77, 77))
+	fileData := make([]byte, 64*1024)
+	for i := range fileData {
+		fileData[i] = byte(r.Uint32())
+	}
+
+	// Write the file under its correct name and build a PAR2 set.
+	correctName := filepath.Join(dir, "correct.dat")
+	if err := os.WriteFile(correctName, fileData, 0644); err != nil {
+		t.Fatal(err)
+	}
+	par2Path := filepath.Join(dir, "set.par2")
+	out, err := exec.Command("par2", "c", "-s16384", "-c4", par2Path, correctName).CombinedOutput()
+	if err != nil {
+		t.Fatalf("par2 create: %v\n%s", err, out)
+	}
+
+	// Delete the correctly-named file and leave only a wrongly-named copy.
+	wrongName := filepath.Join(dir, "wrong_name.dat")
+	if err := os.WriteFile(wrongName, fileData, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(correctName); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	d, err := NewDecoder(ctx, par2Path, DecoderOptions{Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("NewDecoder: %v", err)
+	}
+	defer d.Close()
+
+	// Without AddCandidateFile the correct file is reported missing.
+	if err := d.VerifyScans(ctx); err != nil {
+		t.Fatalf("VerifyScans: %v", err)
+	}
+	if counts := d.ShardCounts(); counts.UnusableDataShardCount == 0 {
+		t.Fatal("expected unusable shards before registering candidate, got 0")
+	}
+
+	// Register the wrongly-named file as a candidate and re-scan.
+	if err := d.AddCandidateFile("wrong_name.dat"); err != nil {
+		t.Fatalf("AddCandidateFile: %v", err)
+	}
+	if err := d.VerifyScans(ctx); err != nil {
+		t.Fatalf("VerifyScans with candidate: %v", err)
+	}
+	counts := d.ShardCounts()
+	if counts.UnusableDataShardCount != 0 {
+		t.Errorf("expected 0 unusable shards after registering candidate, got %d", counts.UnusableDataShardCount)
+	}
+}
