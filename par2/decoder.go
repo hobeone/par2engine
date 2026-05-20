@@ -290,8 +290,8 @@ func (d *Decoder) ShardCounts() ShardCounts {
 	}
 }
 
-// VerifyScans parallelizes file scanning. Exposes a throttled progress channel.
-func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress) error {
+// VerifyScans parallelizes file scanning to check integrity of all protected files.
+func (d *Decoder) VerifyScans(ctx context.Context) error {
 	d.mu.Lock()
 	d.fileIntegrity = make(map[FileID]*FileIntegrityState)
 	totalShards := 0
