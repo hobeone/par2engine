@@ -676,7 +676,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 				"found", state.RenameSource)
 			renameCount++
 		default:
-			d.logger.DebugContext(ctx, "File status: OK", "file", fd.Filename)
+			d.logger.InfoContext(ctx, "File status: OK", "file", fd.Filename)
 			okCount++
 		}
 	}
