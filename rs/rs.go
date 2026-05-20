@@ -6,13 +6,22 @@ import (
 	"runtime"
 	"sync"
 
+	"github.com/klauspost/cpuid/v2"
+
 	"github.com/hobeone/par2engine/gf16"
 )
 
-// DefaultNumGoroutines returns the number of physical CPU cores as default,
-// which is optimal for CPU-intensive SIMD workloads.
+// DefaultNumGoroutines returns the number of physical CPU cores, capped at GOMAXPROCS.
+// Physical cores (not logical/hyperthreaded) are used because GF(2^16) multiplication is
+// compute-bound and memory-bandwidth-sensitive: hyperthreads share L1/L2 cache, adding
+// pressure on the lookup tables without adding useful throughput.
 func DefaultNumGoroutines() int {
-	return runtime.NumCPU()
+	logical := runtime.GOMAXPROCS(0)
+	physical := cpuid.CPU.PhysicalCores
+	if physical > 0 && physical < logical {
+		return physical
+	}
+	return logical
 }
 
 // Coder represents a Reed-Solomon encoder/decoder for PAR2 Vandermonde matrices.
