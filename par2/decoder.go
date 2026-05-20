@@ -480,6 +480,8 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 	// Chunk size: 32MB for internal parallel scanning of single large file
 	const scanChunkSize = 32 * 1024 * 1024
 	var chunkWg sync.WaitGroup
+	var chunkErr error
+	var chunkErrMu sync.Mutex
 
 	numChunks := (fileSize + scanChunkSize - 1) / scanChunkSize
 	for i := int64(0); i < numChunks; i++ {
@@ -505,11 +507,22 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 				end = fileSize
 			}
 
-			d.scanChunk(ctx, f, fd.FileID, window, start, end, lookupTable, matchChan)
+			if err := d.scanChunk(ctx, f, fd.FileID, window, start, end, lookupTable, matchChan); err != nil {
+				d.logger.ErrorContext(ctx, "I/O error during chunk scan", "file", fd.Filename, "offset", start, "err", err)
+				chunkErrMu.Lock()
+				if chunkErr == nil {
+					chunkErr = err
+				}
+				chunkErrMu.Unlock()
+			}
 		}(i)
 	}
 
 	chunkWg.Wait()
+
+	if chunkErr != nil {
+		return chunkErr
+	}
 
 	// Natively verify the last partial block if the file size is not a multiple of sliceByteCount
 	shards := (uint64(fd.ByteCount) + uint64(d.sliceByteCount) - 1) / uint64(d.sliceByteCount)
@@ -546,15 +559,15 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 	return nil
 }
 
-func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID, window *crc32Window, start, end int64, lookupTable *crcLookupTable, matchChan chan<- matchEvent) {
+func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID, window *crc32Window, start, end int64, lookupTable *crcLookupTable, matchChan chan<- matchEvent) error {
 	bufferSize := end - start
 	if bufferSize < int64(d.sliceByteCount) {
-		return
+		return nil
 	}
 	data := make([]byte, bufferSize)
 	_, err := f.ReadAt(data, start)
 	if err != nil && err != io.EOF {
-		return
+		return fmt.Errorf("ReadAt offset %d: %w", start, err)
 	}
 
 	var crcSlice uint32
@@ -564,7 +577,7 @@ func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID
 		// Only check context cancellation once every 65,536 bytes to eliminate atomic lock overheads in tight loops
 		if j&0xFFFF == 0 {
 			if ctx.Err() != nil {
-				return
+				return nil
 			}
 		}
 
@@ -597,6 +610,7 @@ func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID
 		j += d.sliceByteCount
 		justMissed = false
 	}
+	return nil
 }
 
 // Repair performs pipelined, strict memory-limited reconstruction of missing shards.
