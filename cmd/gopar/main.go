@@ -110,15 +110,8 @@ func runCLI() int {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 
 	// Setup graceful cancellation on interrupt signal
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt)
-	go func() {
-		<-sigChan
-		logger.Warn("Interrupt signal received. Shutting down gracefully...")
-		cancel()
-	}()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 
 	// Initialize Decoder
 	memLimitBytes := memMB * 1024 * 1024
@@ -156,8 +149,9 @@ func runCLI() int {
 		"unusableDataBlocks", counts.UnusableDataShardCount,
 		"usableParityBlocks", counts.UsableParityShardCount)
 
-	// If subcommand is verify
-	if cmd == "v" || cmd == "verify" {
+	// Dispatch subcommand
+	switch cmd {
+	case "v", "verify":
 		if !counts.RepairNeeded() {
 			logger.Info("All protected files are healthy and verified.")
 			return ExitSuccess
@@ -168,10 +162,8 @@ func runCLI() int {
 		}
 		logger.Error("Repair is REQUIRED but NOT possible.", "missingBlocks", counts.UnusableDataShardCount, "availableParity", counts.UsableParityShardCount)
 		return ExitRepairNotPossible
-	}
 
-	// If subcommand is repair
-	if cmd == "r" || cmd == "repair" {
+	case "r", "repair":
 		if !counts.RepairNeeded() {
 			logger.Info("No repair needed. All files are healthy.")
 			return ExitSuccess
@@ -207,6 +199,11 @@ func runCLI() int {
 
 		logger.Info("Repair operation completed successfully! All files verified.")
 		return ExitSuccess
+
+	default:
+		logger.Error("Unknown command", "command", cmd)
+		printUsage(name, flagSet)
+		return ExitInvalidCommandLineArguments
 	}
 
 	return ExitLogicError
