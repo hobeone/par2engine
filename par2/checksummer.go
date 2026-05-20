@@ -25,7 +25,7 @@ func newCRC32Window(windowSize int) (*crc32Window, error) {
 
 	a[4] = 0
 	var baseTable [8]uint32
-	for i := uint(0); i < 8; i++ {
+	for i := range uint(8) {
 		a[0] = byte(1 << i)
 		baseTable[i] = crc32.ChecksumIEEE(a)
 	}
@@ -35,7 +35,7 @@ func newCRC32Window(windowSize int) (*crc32Window, error) {
 	for i := 1; i < 256; i++ {
 		var crc uint32
 		crcCount := 0
-		for j := uint(0); j < 8; j++ {
+		for j := range uint(8) {
 			if i&(1<<j) != 0 {
 				crc ^= baseTable[j]
 				crcCount++

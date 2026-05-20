@@ -38,7 +38,7 @@ func main() {
 	fmt.Printf("Generating %dGB unique-block dataset at %s...\n", sizeGB, largeFilePath)
 
 	r := rand.New(rand.NewPCG(42, 42))
-	
+
 	// Allocate 4MB block buffer
 	const blockSize = 4 * 1024 * 1024
 	block := make([]byte, blockSize)
@@ -54,7 +54,7 @@ func main() {
 
 	startLarge := time.Now()
 	totalBlocks := sizeGB * 256 // 4MB blocks (256 blocks per 1GB)
-	for j := uint64(0); j < totalBlocks; j++ {
+	for j := range totalBlocks {
 		// Write the block index inside the first 8 bytes to guarantee block uniqueness!
 		binary.LittleEndian.PutUint64(block[:8], j)
 		_, err = largeFile.Write(block)
@@ -69,7 +69,7 @@ func main() {
 
 	// 2. Generate 10 small files (1-4MB)
 	fmt.Println("Generating 10 small files...")
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		name := fmt.Sprintf("small-%d.dat", i)
 		size := (1 + rand.IntN(4)) * 1024 * 1024
 		data := make([]byte, size)

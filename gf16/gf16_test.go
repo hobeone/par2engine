@@ -54,10 +54,10 @@ func TestPow(t *testing.T) {
 }
 
 func TestCalcTable(t *testing.T) {
-	for c := 0; c < order; c++ {
+	for c := range order {
 		var table MulTable
 		CalcTable(T(c), &table)
-		for j := 0; j < 256; j++ {
+		for j := range 256 {
 			want0 := T(c).Times(T(j))
 			if table.s0[j] != want0 {
 				t.Fatalf("c=%d j=%d table.s0: want %d, got %d", c, j, want0, table.s0[j])
@@ -102,7 +102,7 @@ func TestMulAndAddByteSliceLE(t *testing.T) {
 	}
 	outOrig := make([]byte, len(out))
 	copy(outOrig, out)
-	
+
 	c := T(0x4321)
 
 	MulAndAddByteSliceLE(c, in, out)
@@ -174,7 +174,7 @@ func TestMulByteSliceLE_EdgeCases(t *testing.T) {
 	})
 
 	t.Run("empty_slice", func(t *testing.T) {
-		MulByteSliceLE(0x1234, nil, nil) // Should not panic
+		MulByteSliceLE(0x1234, nil, nil)           // Should not panic
 		MulByteSliceLE(0x1234, []byte{}, []byte{}) // Should not panic
 	})
 }
@@ -202,7 +202,7 @@ func TestMulAndAddByteSliceLE_EdgeCases(t *testing.T) {
 	})
 
 	t.Run("empty_slice", func(t *testing.T) {
-		MulAndAddByteSliceLE(0x1234, nil, nil) // Should not panic
+		MulAndAddByteSliceLE(0x1234, nil, nil)           // Should not panic
 		MulAndAddByteSliceLE(0x1234, []byte{}, []byte{}) // Should not panic
 	})
 }

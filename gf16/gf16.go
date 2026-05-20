@@ -22,12 +22,12 @@ type MulTable struct {
 func init() {
 	// Irreducible polynomial of degree 16 for PAR2: x^16 + x^12 + x^3 + x + 1 -> 0x1100b.
 	// Since the 17th bit shifts out of uint16, the 16-bit mask is 0x100b.
-	
+
 	// g is the generator of GF(2^16).
 	const g T = 3
 
 	x := T(1)
-	for p := 0; p < order-1; p++ {
+	for p := range order - 1 {
 		if x == 1 && p != 0 {
 			panic("repeated power (1)")
 		} else if x != 1 && logTable[x-1] != 0 {
@@ -87,7 +87,7 @@ func MulByteSliceLE(c T, in, out []byte) {
 
 	n := len(in)
 	i := 0
-	
+
 	// Loop unrolled to process 8 bytes (4 elements) at a time
 	for ; i <= n-8; i += 8 {
 		s0 := in[i]
@@ -176,7 +176,7 @@ func (t T) Times(u T) T {
 	if t == 0 || u == 0 {
 		return 0
 	}
-	
+
 	// Slow polynomial multiply if tables are not yet initialized
 	if expTable[1] == 0 {
 		return t.timesPoly(u)
