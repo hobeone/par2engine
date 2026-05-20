@@ -439,6 +439,12 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 
 	checksumMap := make(map[uint32][]checksumLocation)
 	for fID, ifsc := range d.fileChecksums {
+		// Security guard: ignore IFSC checksums for unknown FileIDs to prevent
+		// nil-pointer dereference panic in the collector goroutine.
+		if _, exists := d.fileIntegrity[fID]; !exists {
+			d.logger.WarnContext(ctx, "Ignoring IFSC packet for unknown file ID", "fileID", fmt.Sprintf("%x", fID[:4]))
+			continue
+		}
 		for shardIdx, pair := range ifsc.ChecksumPairs {
 			crcVal := binary.LittleEndian.Uint32(pair.CRC32[:])
 			checksumMap[crcVal] = append(checksumMap[crcVal], checksumLocation{
