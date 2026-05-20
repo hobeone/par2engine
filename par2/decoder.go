@@ -50,10 +50,11 @@ type ShardCounts struct {
 	UnusableDataShardCount   int
 	UsableParityShardCount   int
 	UnusableParityShardCount int
+	RenamesNeeded            int // files whose content is intact in a candidate under a different name
 }
 
 func (sc ShardCounts) RepairNeeded() bool {
-	return sc.UnusableDataShardCount > 0
+	return sc.UnusableDataShardCount > 0 || sc.RenamesNeeded > 0
 }
 
 func (sc ShardCounts) RepairPossible() bool {
@@ -87,9 +88,10 @@ type Decoder struct {
 	fileChecksums  map[FileID]*IFSCPacket
 	parityShards   map[uint16][]byte // exponent -> parity bytes loaded from par2 files
 
-	fileIntegrity  map[FileID]*FileIntegrityState
-	candidateFiles map[string]FileID // extra files to scan; path → synthetic FileID
-	mu             sync.Mutex        // protects shared state updates
+	fileIntegrity   map[FileID]*FileIntegrityState
+	candidateFiles  map[string]FileID // extra files to scan; path → synthetic FileID
+	parityFileBlocks map[string]int   // par2 filename → number of recovery blocks it contributes
+	mu              sync.Mutex        // protects shared state updates
 }
 
 type checksumLocation struct {
@@ -153,9 +155,10 @@ func NewDecoder(ctx context.Context, par2Path string, opts DecoderOptions) (*Dec
 		logger:        opts.Logger,
 		root:          root,
 		absRootDir:    absDir,
-		fileChecksums: make(map[FileID]*IFSCPacket),
-		parityShards:  make(map[uint16][]byte),
-		fileIntegrity: make(map[FileID]*FileIntegrityState),
+		fileChecksums:    make(map[FileID]*IFSCPacket),
+		parityShards:     make(map[uint16][]byte),
+		fileIntegrity:    make(map[FileID]*FileIntegrityState),
+		parityFileBlocks: make(map[string]int),
 	}
 
 	err = d.loadIndexFile(ctx, indexFilename)
@@ -288,6 +291,7 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 				d.logger.WarnContext(ctx, "duplicate recovery packet exponent, skipping", "exponent", p.Exponent)
 			} else {
 				d.parityShards[p.Exponent] = p.Data
+				d.parityFileBlocks[indexFilename]++
 			}
 		}
 	}
@@ -323,12 +327,19 @@ func (d *Decoder) ShardCounts() ShardCounts {
 		}
 	}
 
-	usableParity := len(d.parityShards)
+	renamesNeeded := 0
+	for _, state := range d.fileIntegrity {
+		if state.RenameSource != "" {
+			renamesNeeded++
+		}
+	}
+
 	return ShardCounts{
 		UsableDataShardCount:     usableData,
 		UnusableDataShardCount:   unusableData,
-		UsableParityShardCount:   usableParity,
+		UsableParityShardCount:   len(d.parityShards),
 		UnusableParityShardCount: 0,
+		RenamesNeeded:            renamesNeeded,
 	}
 }
 
@@ -364,18 +375,70 @@ func (d *Decoder) initFileIntegrity() error {
 	return nil
 }
 
-// VerifyScans parallelizes file scanning to check integrity of all protected files.
+// VerifyScans checks the integrity of all protected files against the PAR2 set.
 func (d *Decoder) VerifyScans(ctx context.Context) error {
 	if err := d.initFileIntegrity(); err != nil {
 		return err
 	}
 
+	// ── Phase 1: list protected files sorted alphabetically ──────────────────
+	sorted := make([]FileDescPacket, len(d.protectedFiles))
+	copy(sorted, d.protectedFiles)
+	slices.SortFunc(sorted, func(a, b FileDescPacket) int { return strings.Compare(a.Filename, b.Filename) })
+	d.logger.InfoContext(ctx, fmt.Sprintf("PAR2 set protects %d file(s):", len(sorted)))
+	for _, fd := range sorted {
+		d.logger.InfoContext(ctx, fmt.Sprintf("  %s (%d bytes)", fd.Filename, fd.ByteCount))
+	}
+
+	// ── Phase 2: list PAR2 archives with recovery block counts ───────────────
+	parityFiles := make([]string, 0, len(d.parityFileBlocks))
+	for name := range d.parityFileBlocks {
+		parityFiles = append(parityFiles, name)
+	}
+	slices.Sort(parityFiles)
+	d.logger.InfoContext(ctx, fmt.Sprintf("Found %d recovery archive(s):", len(parityFiles)))
+	for _, name := range parityFiles {
+		d.logger.InfoContext(ctx, fmt.Sprintf("  %s (%d recovery blocks)", name, d.parityFileBlocks[name]))
+	}
+
+	// ── Phase 3: list candidate files ────────────────────────────────────────
+	if len(d.candidateFiles) > 0 {
+		d.logger.InfoContext(ctx, fmt.Sprintf("Candidate file(s) to consider (%d):", len(d.candidateFiles)))
+		for path := range d.candidateFiles {
+			d.logger.InfoContext(ctx, fmt.Sprintf("  %s", path))
+		}
+	}
+
+	// ── Phase 4: quick existence check — log missing files up front ──────────
+	for _, fd := range d.protectedFiles {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		f, err := d.root.Open(fd.Filename)
+		if errors.Is(err, fs.ErrNotExist) {
+			d.mu.Lock()
+			d.fileIntegrity[fd.FileID].Missing = true
+			d.mu.Unlock()
+			d.logger.InfoContext(ctx, "File not found on disk", "file", fd.Filename)
+			continue
+		} else if err != nil {
+			return err
+		}
+		f.Close()
+	}
+
+	// ── Phase 5: pre-scan candidates for full content matches ────────────────
+	// For each candidate, compute a quick 16 KB hash then the full MD5. If it
+	// matches a missing protected file, populate ShardLocations directly and
+	// skip the expensive sliding-window block scan for that candidate.
+	resolvedCandidates := d.prescanCandidateMatches(ctx)
+
+	// ── Phase 6: build checksum map and run the block-level scan ─────────────
 	window, err := newCRC32Window(d.sliceByteCount)
 	if err != nil {
 		return err
 	}
 
-	// Build expected checksum map
 	checksumMap := make(map[uint32][]checksumLocation)
 	for fID, ifsc := range d.fileChecksums {
 		for shardIdx, pair := range ifsc.ChecksumPairs {
@@ -387,7 +450,6 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 			})
 		}
 	}
-
 	lookupTable := newCRCLookupTable(checksumMap)
 
 	matchChan := make(chan matchEvent, 100)
@@ -403,7 +465,6 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 		}
 	}
 
-	// 1. Sequential Match Collector
 	var collectorWg sync.WaitGroup
 	collectorWg.Go(func() {
 		for match := range matchChan {
@@ -424,34 +485,40 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 		}
 	})
 
-	// 2. Scan protected files in parallel using a shared program-wide semaphore
 	sem := make(chan struct{}, d.numGoroutines)
+
+	// Scan protected files that exist on disk (missing ones have nothing to scan).
 	for _, fDesc := range d.protectedFiles {
 		if ctx.Err() != nil {
 			break
 		}
-
+		d.mu.Lock()
+		missing := d.fileIntegrity[fDesc.FileID].Missing
+		d.mu.Unlock()
+		if missing {
+			continue
+		}
 		scanWg.Add(1)
 		go func(fd FileDescPacket) {
 			defer scanWg.Done()
-
-			d.logger.InfoContext(ctx, "Scanning file for checksum matches", "file", fd.Filename)
-			err := d.scanFile(ctx, fd, window, sem, lookupTable, matchChan)
-			if err != nil {
+			if err := d.scanFile(ctx, fd, window, sem, lookupTable, matchChan); err != nil {
 				d.logger.ErrorContext(ctx, "failed to scan file", "file", fd.Filename, "err", err)
 				setScanErr(err)
 			}
 		}(fDesc)
 	}
 
+	// Scan candidate files not already resolved by the pre-scan phase.
 	for path, fileID := range d.candidateFiles {
 		if ctx.Err() != nil {
 			break
 		}
+		if resolvedCandidates[path] {
+			continue
+		}
 		scanWg.Add(1)
 		go func(path string, fileID FileID) {
 			defer scanWg.Done()
-			d.logger.InfoContext(ctx, "Scanning candidate file for checksum matches", "path", path)
 			if err := d.scanCandidateFile(ctx, path, fileID, window, sem, lookupTable, matchChan); err != nil {
 				d.logger.ErrorContext(ctx, "failed to scan candidate file", "path", path, "err", err)
 				setScanErr(err)
@@ -547,7 +614,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 
 	// Compute counts while still holding the lock — calling d.ShardCounts() here
 	// would deadlock because it also acquires d.mu.
-	usableData, unusableData := 0, 0
+	usableData, unusableData, renamesNeeded := 0, 0, 0
 	for _, state := range d.fileIntegrity {
 		for _, loc := range state.ShardLocations {
 			if loc.Offset == -1 {
@@ -556,11 +623,15 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 				usableData++
 			}
 		}
+		if state.RenameSource != "" {
+			renamesNeeded++
+		}
 	}
 	finalCounts := ShardCounts{
 		UsableDataShardCount:   usableData,
 		UnusableDataShardCount: unusableData,
 		UsableParityShardCount: len(d.parityShards),
+		RenamesNeeded:          renamesNeeded,
 	}
 	// Per-file status report (logged before releasing the lock so state is consistent).
 	okCount, missingCount, damagedCount, renameCount := 0, 0, 0, 0
@@ -627,6 +698,104 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 	}
 
 	return ctx.Err()
+}
+
+// prescanCandidateMatches runs a full-file MD5 check on each candidate before
+// the block-level scan. If a candidate is a perfect content match for a missing
+// protected file it populates ShardLocations directly (skipping the sliding-window
+// scan) and sets RenameSource. Returns the set of candidate paths that were resolved.
+func (d *Decoder) prescanCandidateMatches(ctx context.Context) map[string]bool {
+	resolved := make(map[string]bool)
+	if len(d.candidateFiles) == 0 {
+		return resolved
+	}
+
+	// Index missing protected files by (size, SixteenKHash) for fast lookup.
+	type quickKey struct {
+		size         int64
+		sixteenKHash [16]byte
+	}
+	missingByQuickKey := make(map[quickKey]*FileDescPacket)
+	d.mu.Lock()
+	for i := range d.protectedFiles {
+		fd := &d.protectedFiles[i]
+		if d.fileIntegrity[fd.FileID].Missing {
+			missingByQuickKey[quickKey{int64(fd.ByteCount), fd.SixteenKHash}] = fd
+		}
+	}
+	d.mu.Unlock()
+
+	if len(missingByQuickKey) == 0 {
+		return resolved
+	}
+
+	const quickHashSize = 16 * 1024
+
+	for candidatePath, candidateID := range d.candidateFiles {
+		if ctx.Err() != nil {
+			break
+		}
+
+		f, err := d.root.Open(candidatePath)
+		if err != nil {
+			// File not accessible — mark resolved so the block scan also skips it.
+			resolved[candidatePath] = true
+			continue
+		}
+
+		stat, err := f.Stat()
+		if err != nil {
+			f.Close()
+			continue
+		}
+		fileSize := stat.Size()
+
+		// Quick filter: read first 16 KB and hash it.
+		quick := make([]byte, min(quickHashSize, int(fileSize)))
+		n, _ := f.ReadAt(quick, 0)
+		quickHash := md5.Sum(quick[:n])
+
+		fd, ok := missingByQuickKey[quickKey{fileSize, quickHash}]
+		if !ok {
+			f.Close()
+			continue
+		}
+
+		// 16 KB matched — compute full-file MD5 to confirm.
+		hasher := md5.New()
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			f.Close()
+			continue
+		}
+		_, copyErr := io.Copy(hasher, f)
+		f.Close()
+		if copyErr != nil {
+			continue
+		}
+		var fullHash [16]byte
+		copy(fullHash[:], hasher.Sum(nil))
+		if fullHash != fd.Hash {
+			continue
+		}
+
+		// Perfect match: populate ShardLocations and mark for rename.
+		d.mu.Lock()
+		state := d.fileIntegrity[fd.FileID]
+		state.RenameSource = candidatePath
+		for i := range state.ShardLocations {
+			state.ShardLocations[i] = ShardLocation{
+				FileID: candidateID,
+				Offset: int64(i * d.sliceByteCount),
+			}
+		}
+		d.mu.Unlock()
+
+		d.logger.InfoContext(ctx, "Candidate is a full content match — rename required",
+			"candidate", candidatePath, "target", fd.Filename)
+		resolved[candidatePath] = true
+	}
+
+	return resolved
 }
 
 // detectRenameCandidate checks whether all shards of a protected file were
@@ -761,7 +930,7 @@ func (d *Decoder) renameMisnamedFiles(ctx context.Context) int {
 func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32Window, sem chan struct{}, lookupTable *crcLookupTable, matchChan chan<- matchEvent) error {
 	f, err := d.root.Open(fd.Filename)
 	if errors.Is(err, fs.ErrNotExist) {
-		d.logger.InfoContext(ctx, "File not found on disk", "file", fd.Filename)
+		// Phase 4 of VerifyScans already logged and set Missing — nothing to do here.
 		d.mu.Lock()
 		d.fileIntegrity[fd.FileID].Missing = true
 		d.mu.Unlock()
@@ -1413,6 +1582,7 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 				d.logger.WarnContext(ctx, "duplicate recovery packet exponent, skipping", "exponent", p.Exponent, "file", filename)
 			} else {
 				d.parityShards[p.Exponent] = p.Data
+				d.parityFileBlocks[filename]++
 			}
 			d.mu.Unlock()
 		}
