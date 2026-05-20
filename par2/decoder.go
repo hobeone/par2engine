@@ -908,7 +908,7 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 			return ctx.Err()
 		}
 
-		h, err := ReadHeaderFromFile(f)
+		h, err := ReadHeader(f)
 		if err == io.EOF {
 			break
 		}

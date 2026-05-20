@@ -99,11 +99,6 @@ func ReadHeader(r io.Reader) (Header, error) {
 	return h, nil
 }
 
-// ReadHeaderFromFile is a convenience wrapper for ReadHeader that handles EOF.
-func ReadHeaderFromFile(r io.Reader) (Header, error) {
-	return ReadHeader(r)
-}
-
 // ComputePacketHash computes the MD5 hash of a packet body using streaming writes
 // to avoid copying potentially multi-megabyte recovery packet bodies.
 func ComputePacketHash(setID [16]byte, pType PacketType, body []byte) [16]byte {
