@@ -261,7 +261,7 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 				return err
 			}
 			d.sliceByteCount = p.SliceByteCount
-			d.logger.InfoContext(ctx, "Parsed SliceByteCount", "size", p.SliceByteCount)
+			d.logger.DebugContext(ctx, "Parsed SliceByteCount", "size", p.SliceByteCount)
 
 		case FileDescPacketType:
 			p, err := ParseFileDescPacket(body)
@@ -269,7 +269,7 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 				return err
 			}
 			d.protectedFiles = append(d.protectedFiles, *p)
-			d.logger.InfoContext(ctx, "Parsed expected recovery file", "name", p.Filename, "size", p.ByteCount)
+			d.logger.InfoContext(ctx, "PAR2 set contains protected file", "file", p.Filename, "size", p.ByteCount)
 
 		case IFSCPacketType:
 			p, err := ParseIFSCPacket(body)
@@ -513,9 +513,14 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 			}
 			var fileHash [16]byte
 			copy(fileHash[:], hasher.Sum(nil))
-			d.logger.InfoContext(ctx, "MD5 verification", "file", fd.Filename, "got", fmt.Sprintf("%x", fileHash), "want", fmt.Sprintf("%x", fd.Hash))
 			if fileHash != fd.Hash {
+				d.logger.WarnContext(ctx, "File hash verification FAILED",
+					"file", fd.Filename,
+					"expected", fmt.Sprintf("%x", fd.Hash),
+					"actual", fmt.Sprintf("%x", fileHash))
 				state.HashMismatch = true
+			} else {
+				d.logger.InfoContext(ctx, "File hash verified OK", "file", fd.Filename)
 			}
 		} else {
 			state.HashMismatch = true
@@ -539,6 +544,41 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 		UnusableDataShardCount: unusableData,
 		UsableParityShardCount: len(d.parityShards),
 	}
+	// Per-file status report (logged before releasing the lock so state is consistent).
+	okCount, missingCount, damagedCount := 0, 0, 0
+	for _, fd := range d.protectedFiles {
+		state := d.fileIntegrity[fd.FileID]
+		switch {
+		case state.Missing:
+			d.logger.WarnContext(ctx, "File status: MISSING", "file", fd.Filename)
+			missingCount++
+		case state.SizeMismatch:
+			d.logger.WarnContext(ctx, "File status: SIZE MISMATCH",
+				"file", fd.Filename,
+				"expected", fd.ByteCount)
+			damagedCount++
+		case state.HashMismatch:
+			missing := 0
+			for _, loc := range state.ShardLocations {
+				if loc.Offset == -1 {
+					missing++
+				}
+			}
+			if missing > 0 {
+				d.logger.WarnContext(ctx, "File status: DAMAGED",
+					"file", fd.Filename,
+					"missingBlocks", missing,
+					"totalBlocks", len(state.ShardLocations))
+			} else {
+				d.logger.WarnContext(ctx, "File status: CORRUPT (hash mismatch, all blocks present)",
+					"file", fd.Filename)
+			}
+			damagedCount++
+		default:
+			d.logger.InfoContext(ctx, "File status: OK", "file", fd.Filename)
+			okCount++
+		}
+	}
 	d.mu.Unlock()
 
 	d.logger.DebugContext(ctx, "Post-scan complete",
@@ -546,12 +586,20 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 		"unusableDataShards", finalCounts.UnusableDataShardCount,
 		"usableParityShards", finalCounts.UsableParityShardCount)
 
+	// Verification summary.
+	d.logger.InfoContext(ctx, "Verification summary",
+		"totalFiles", len(d.protectedFiles),
+		"ok", okCount,
+		"missing", missingCount,
+		"damaged", damagedCount,
+		"recoveryBlocks", len(d.parityShards))
+
 	if finalCounts.RepairNeeded() {
 		d.logger.Warn("Verification found missing or corrupt blocks",
 			"missingBlocks", finalCounts.UnusableDataShardCount,
 			"availableParity", finalCounts.UsableParityShardCount)
 	} else {
-		d.logger.Info("Verification successful: all blocks found and verified")
+		d.logger.Info("No repair needed. All files are healthy.")
 	}
 
 	return ctx.Err()
@@ -560,6 +608,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32Window, sem chan struct{}, lookupTable *crcLookupTable, matchChan chan<- matchEvent) error {
 	f, err := d.root.Open(fd.Filename)
 	if errors.Is(err, fs.ErrNotExist) {
+		d.logger.InfoContext(ctx, "File not found on disk", "file", fd.Filename)
 		d.mu.Lock()
 		d.fileIntegrity[fd.FileID].Missing = true
 		d.mu.Unlock()
@@ -880,7 +929,7 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 		chunkSize = 16
 	}
 
-	d.logger.InfoContext(ctx, "Configured memory-limited streaming", "chunkSize", chunkSize, "sliceByteCount", d.sliceByteCount)
+	d.logger.DebugContext(ctx, "Configured memory-limited streaming", "chunkSize", chunkSize, "sliceByteCount", d.sliceByteCount)
 
 	// Allocate streaming buffers
 	for i := range dataBuffers {
@@ -944,6 +993,24 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 				needsWrite[f.Filename] = true
 				break
 			}
+		}
+	}
+
+	// Log each file that will be repaired and why.
+	for _, f := range d.protectedFiles {
+		if !needsWrite[f.Filename] {
+			continue
+		}
+		state := d.fileIntegrity[f.FileID]
+		switch {
+		case state.Missing:
+			d.logger.InfoContext(ctx, "Repairing file: recreating from scratch", "file", f.Filename)
+		case state.SizeMismatch:
+			d.logger.InfoContext(ctx, "Repairing file: size mismatch, rewriting", "file", f.Filename)
+		case state.HashMismatch:
+			d.logger.InfoContext(ctx, "Repairing file: corrupt blocks, reconstructing", "file", f.Filename)
+		default:
+			d.logger.InfoContext(ctx, "Repairing file: blocks found in wrong location, rewriting", "file", f.Filename)
 		}
 	}
 
@@ -1091,6 +1158,9 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 	}
 
 	d.logger.InfoContext(ctx, "Repair completed successfully!")
+	d.logger.InfoContext(ctx, "Repair summary",
+		"filesRepaired", len(needsWrite),
+		"blocksReconstructed", counts.UnusableDataShardCount)
 	return nil
 }
 
