@@ -16,6 +16,15 @@ import (
 	"runtime/debug"
 )
 
+// stringSliceFlag is a flag.Value that accumulates repeated -flag values.
+type stringSliceFlag []string
+
+func (s *stringSliceFlag) String() string  { return strings.Join(*s, ", ") }
+func (s *stringSliceFlag) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
 // Exit codes matching par2cmdline standard specifications
 const (
 	ExitSuccess                      = 0
@@ -35,13 +44,14 @@ func runCLI() int {
 	flagSet := flag.NewFlagSet(name, flag.ContinueOnError)
 	
 	var (
-		numThreads int
-		memMB      int64
-		cpuProfile string
-		memProfile string
+		numThreads    int
+		memMB         int64
+		cpuProfile    string
+		memProfile    string
 		maxFileSizeMB int64
 		verbose       bool
 		versionFlag   bool
+		candidates    stringSliceFlag
 	)
 
 	flagSet.IntVar(&numThreads, "t", runtime.NumCPU(), "number of concurrent processing threads")
@@ -51,6 +61,7 @@ func runCLI() int {
 	flagSet.Int64Var(&maxFileSizeMB, "max-file-size", 100, "maximum PAR2 index file size in megabytes")
 	flagSet.BoolVar(&verbose, "v", false, "enable verbose structured slog logging")
 	flagSet.BoolVar(&versionFlag, "version", false, "print version information")
+	flagSet.Var(&candidates, "candidate", "extra file to scan as a shard source even if its name does not match\n\t(repeat for multiple files; path is relative to the PAR2 directory)")
 
 	// Parse flags
 	err := flagSet.Parse(os.Args[1:])
@@ -146,6 +157,13 @@ func runCLI() int {
 		return ExitInvalidCommandLineArguments
 	}
 	defer d.Close()
+
+	for _, c := range candidates {
+		if err := d.AddCandidateFile(c); err != nil {
+			fmt.Fprintf(os.Stderr, "Error adding candidate file %q: %v\n", c, err)
+			return ExitInvalidCommandLineArguments
+		}
+	}
 
 	// 1. Perform file integrity scans
 	err = d.VerifyScans(ctx)
