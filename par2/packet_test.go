@@ -1,7 +1,10 @@
 package par2
 
 import (
+	"bytes"
+	"crypto/md5"
 	"encoding/binary"
+	"strings"
 	"testing"
 )
 
@@ -156,4 +159,86 @@ func TestParseRecoveryPacket(t *testing.T) {
 		t.Fatalf("got err = %v, want 'recovery exponent exceeds safe engine limit (32767)'", err)
 	}
 }
+func TestReadHeader(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		h := Header{
+			Magic:  expectedMagic,
+			Length: 64,
+		}
+		var buf [64]byte
+		copy(buf[0:8], expectedMagic[:])
+		binary.LittleEndian.PutUint64(buf[8:16], 64)
 
+		got, err := ReadHeader(bytes.NewReader(buf[:]))
+		if err != nil {
+			t.Fatalf("ReadHeader failed: %v", err)
+		}
+		if got.Magic != h.Magic {
+			t.Errorf("got magic %v, want %v", got.Magic, h.Magic)
+		}
+	})
+
+	t.Run("invalid_magic", func(t *testing.T) {
+		var buf [64]byte
+		copy(buf[0:8], "BADMAGIC")
+		_, err := ReadHeader(bytes.NewReader(buf[:]))
+		if err == nil || !strings.Contains(err.Error(), "invalid magic") {
+			t.Fatalf("got err = %v, want invalid magic error", err)
+		}
+	})
+
+	t.Run("invalid_length", func(t *testing.T) {
+		var buf [64]byte
+		copy(buf[0:8], expectedMagic[:])
+		binary.LittleEndian.PutUint64(buf[8:16], 63) // too short
+		_, err := ReadHeader(bytes.NewReader(buf[:]))
+		if err == nil || !strings.Contains(err.Error(), "invalid PAR2 packet length") {
+			t.Fatalf("got err = %v, want invalid length error", err)
+		}
+	})
+}
+
+func TestComputePacketHash(t *testing.T) {
+	data := []byte("hello world")
+	setID := [16]byte{1, 2, 3}
+	pType := PacketType{1}
+
+	hash := ComputePacketHash(setID, pType, data)
+
+	// Manually compute MD5 of body
+	h := md5.New()
+	h.Write(setID[:])
+	h.Write(pType[:])
+	h.Write(data)
+	expected := h.Sum(nil)
+	if !bytes.Equal(hash[:], expected) {
+		t.Errorf("got hash %x, want %x", hash, expected)
+	}
+}
+
+func TestShardCounts_BlocksNeeded(t *testing.T) {
+	testCases := []struct {
+		name     string
+		unusable int
+		usable   int
+		want     int
+	}{
+		{"no_repair", 0, 10, 0},
+		{"possible_repair", 5, 5, 0},
+		{"possible_repair_surplus", 5, 10, 0},
+		{"needed_repair", 10, 5, 5},
+		{"needed_repair_none", 10, 0, 10},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			sc := ShardCounts{
+				UnusableDataShardCount: tc.unusable,
+				UsableParityShardCount: tc.usable,
+			}
+			if got := sc.BlocksNeeded(); got != tc.want {
+				t.Errorf("BlocksNeeded() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

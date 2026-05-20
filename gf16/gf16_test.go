@@ -3,6 +3,7 @@ package gf16
 import (
 	"encoding/binary"
 	"math/rand/v2" // Target Go 1.26, modern rand/v2
+	"slices"
 	"testing"
 )
 
@@ -152,4 +153,56 @@ func runMulAndAddBenchmark(b *testing.B, size int) {
 func BenchmarkMulAndAddByteSliceLE_1K(b *testing.B)  { runMulAndAddBenchmark(b, 1024) }
 func BenchmarkMulAndAddByteSliceLE_64K(b *testing.B) { runMulAndAddBenchmark(b, 64*1024) }
 func BenchmarkMulAndAddByteSliceLE_1M(b *testing.B)  { runMulAndAddBenchmark(b, 1024*1024) }
-func BenchmarkMulAndAddByteSliceLE_16M(b *testing.B) { runMulAndAddBenchmark(b, 16*1024*1024) }
+func TestMulByteSliceLE_EdgeCases(t *testing.T) {
+	in := []byte{0x01, 0x02, 0x03, 0x04}
+	out := make([]byte, 4)
+
+	t.Run("zero_coeff", func(t *testing.T) {
+		MulByteSliceLE(0, in, out)
+		for _, b := range out {
+			if b != 0 {
+				t.Errorf("expected 0, got %02x", b)
+			}
+		}
+	})
+
+	t.Run("unit_coeff", func(t *testing.T) {
+		MulByteSliceLE(1, in, out)
+		if !slices.Equal(in, out) {
+			t.Errorf("expected %v, got %v", in, out)
+		}
+	})
+
+	t.Run("empty_slice", func(t *testing.T) {
+		MulByteSliceLE(0x1234, nil, nil) // Should not panic
+		MulByteSliceLE(0x1234, []byte{}, []byte{}) // Should not panic
+	})
+}
+
+func TestMulAndAddByteSliceLE_EdgeCases(t *testing.T) {
+	in := []byte{0x01, 0x02, 0x03, 0x04}
+	out := []byte{0x10, 0x20, 0x30, 0x40}
+	outOrig := slices.Clone(out)
+
+	t.Run("zero_coeff", func(t *testing.T) {
+		MulAndAddByteSliceLE(0, in, out)
+		if !slices.Equal(out, outOrig) {
+			t.Errorf("expected %v, got %v", outOrig, out)
+		}
+	})
+
+	t.Run("unit_coeff", func(t *testing.T) {
+		copy(out, outOrig)
+		MulAndAddByteSliceLE(1, in, out)
+		for i := range out {
+			if out[i] != (outOrig[i] ^ in[i]) {
+				t.Errorf("idx %d: expected %02x, got %02x", i, outOrig[i]^in[i], out[i])
+			}
+		}
+	})
+
+	t.Run("empty_slice", func(t *testing.T) {
+		MulAndAddByteSliceLE(0x1234, nil, nil) // Should not panic
+		MulAndAddByteSliceLE(0x1234, []byte{}, []byte{}) // Should not panic
+	})
+}
