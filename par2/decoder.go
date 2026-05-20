@@ -12,7 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 
@@ -82,7 +82,7 @@ type Decoder struct {
 
 	sliceByteCount int
 	recoverySetID  [16]byte
-	recoveryFiles  []FileDescPacket
+	protectedFiles  []FileDescPacket
 	fileChecksums  map[FileID]*IFSCPacket
 	parityShards   map[uint16][]byte // exponent -> parity bytes loaded from par2 files
 
@@ -203,7 +203,7 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 		}
 
 		bodyLen := int64(h.Length - 64)
-		if bodyLen < 0 || bodyLen > d.maxPacketSize { // 128MB max packet body safety limit
+		if bodyLen < 0 || bodyLen > d.maxPacketSize {
 			return errors.New("packet body exceeds safe engine limits")
 		}
 		body := make([]byte, bodyLen)
@@ -237,7 +237,7 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 			if err != nil {
 				return err
 			}
-			d.recoveryFiles = append(d.recoveryFiles, *p)
+			d.protectedFiles = append(d.protectedFiles, *p)
 			d.logger.InfoContext(ctx, "Parsed expected recovery file", "name", p.Filename, "size", p.ByteCount)
 
 		case IFSCPacketType:
@@ -260,9 +260,15 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 		}
 	}
 
-	// PAR2 spec strictly requires recovery files to be sorted alphabetically by FileID
-	sort.Slice(d.recoveryFiles, func(i, j int) bool {
-		return FileIDLess(d.recoveryFiles[i].FileID, d.recoveryFiles[j].FileID)
+	// PAR2 spec strictly requires protected files to be sorted alphabetically by FileID
+	slices.SortFunc(d.protectedFiles, func(a, b FileDescPacket) int {
+		if FileIDLess(a.FileID, b.FileID) {
+			return -1
+		}
+		if FileIDLess(b.FileID, a.FileID) {
+			return 1
+		}
+		return 0
 	})
 
 	return nil
@@ -299,7 +305,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 	d.mu.Lock()
 	d.fileIntegrity = make(map[FileID]*FileIntegrityState)
 	totalShards := 0
-	for _, f := range d.recoveryFiles {
+	for _, f := range d.protectedFiles {
 		if d.sliceByteCount == 0 {
 			d.mu.Unlock()
 			return errors.New("invalid PAR2 set: sliceByteCount is zero")
@@ -380,7 +386,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 
 	// 2. Scan protected files in parallel using a shared program-wide semaphore
 	sem := make(chan struct{}, d.numGoroutines)
-	for _, fDesc := range d.recoveryFiles {
+	for _, fDesc := range d.protectedFiles {
 		if ctx.Err() != nil {
 			break
 		}
@@ -408,7 +414,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 	// Post-scan global hash check
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for _, fd := range d.recoveryFiles {
+	for _, fd := range d.protectedFiles {
 		state := d.fileIntegrity[fd.FileID]
 		if state.Missing || state.SizeMismatch {
 			continue
@@ -644,7 +650,7 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 
 	// Total data shards in PAR2 set
 	totalDataShards := 0
-	for _, f := range d.recoveryFiles {
+	for _, f := range d.protectedFiles {
 		totalDataShards += len(d.fileIntegrity[f.FileID].ShardLocations)
 	}
 
@@ -698,13 +704,13 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 	}
 	
 	fileIDToFilename := make(map[FileID]string)
-	for _, f := range d.recoveryFiles {
+	for _, f := range d.protectedFiles {
 		fileIDToFilename[f.FileID] = f.Filename
 	}
 
 	flatLocs := make([]flattenedLocation, totalDataShards)
 	k := 0
-	for _, f := range d.recoveryFiles {
+	for _, f := range d.protectedFiles {
 		state := d.fileIntegrity[f.FileID]
 		for shardIdx, loc := range state.ShardLocations {
 			var srcFilename string
@@ -726,7 +732,7 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 
 	// Pre-determine which files need write access for repair
 	needsWrite := make(map[string]bool)
-	for _, f := range d.recoveryFiles {
+	for _, f := range d.protectedFiles {
 		state := d.fileIntegrity[f.FileID]
 		if state.Missing || state.SizeMismatch || state.HashMismatch {
 			needsWrite[f.Filename] = true
@@ -860,7 +866,7 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 	}
 
 	// Ensure repaired files are truncated to their exact expected byte counts
-	for _, fd := range d.recoveryFiles {
+	for _, fd := range d.protectedFiles {
 		if needsWrite[fd.Filename] { // only truncate if we actually wrote to it!
 			state := d.fileIntegrity[fd.FileID]
 			if state.Missing || state.SizeMismatch || state.HashMismatch {
@@ -950,7 +956,7 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 		}
 
 		bodyLen := int64(h.Length - 64)
-		if bodyLen < 0 || bodyLen > d.maxPacketSize { // 128MB max packet body safety limit
+		if bodyLen < 0 || bodyLen > d.maxPacketSize {
 			return errors.New("packet body exceeds safe engine limits")
 		}
 		body := make([]byte, bodyLen)
