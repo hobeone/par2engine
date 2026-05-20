@@ -104,13 +104,16 @@ func ReadHeaderFromFile(r io.Reader) (Header, error) {
 	return ReadHeader(r)
 }
 
-// ComputePacketHash computes the MD5 hash of a packet body.
+// ComputePacketHash computes the MD5 hash of a packet body using streaming writes
+// to avoid copying potentially multi-megabyte recovery packet bodies.
 func ComputePacketHash(setID [16]byte, pType PacketType, body []byte) [16]byte {
-	var hashInput []byte
-	hashInput = append(hashInput, setID[:]...)
-	hashInput = append(hashInput, pType[:]...)
-	hashInput = append(hashInput, body...)
-	return md5.Sum(hashInput)
+	h := md5.New()
+	h.Write(setID[:])
+	h.Write(pType[:])
+	h.Write(body)
+	var result [16]byte
+	copy(result[:], h.Sum(nil))
+	return result
 }
 
 // NullTerminate slices the byte array at the first NULL byte.
