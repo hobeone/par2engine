@@ -40,6 +40,7 @@ type FileIntegrityState struct {
 	Missing        bool
 	SizeMismatch   bool
 	HashMismatch   bool
+	RenameSource   string          // non-empty when a candidate file is a perfect content match under a different name
 	ShardLocations []ShardLocation // maps expected shardIndex -> where it is actually located
 }
 
@@ -77,12 +78,12 @@ type Decoder struct {
 	maxPacketSize int64
 	logger        *slog.Logger
 
-	root *os.Root // sandboxed target folder directory root (Go 1.24+)
-	absRootDir string // absolute resolved target folder directory path
+	root       *os.Root // sandboxed target folder directory root (Go 1.24+)
+	absRootDir string   // absolute resolved target folder directory path
 
 	sliceByteCount int
 	recoverySetID  [16]byte
-	protectedFiles  []FileDescPacket
+	protectedFiles []FileDescPacket
 	fileChecksums  map[FileID]*IFSCPacket
 	parityShards   map[uint16][]byte // exponent -> parity bytes loaded from par2 files
 
@@ -404,9 +405,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 
 	// 1. Sequential Match Collector
 	var collectorWg sync.WaitGroup
-	collectorWg.Add(1)
-	go func() {
-		defer collectorWg.Done()
+	collectorWg.Go(func() {
 		for match := range matchChan {
 			d.mu.Lock()
 			state := d.fileIntegrity[match.targetFileID]
@@ -423,7 +422,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 			}
 			d.mu.Unlock()
 		}
-	}()
+	})
 
 	// 2. Scan protected files in parallel using a shared program-wide semaphore
 	sem := make(chan struct{}, d.numGoroutines)
@@ -473,7 +472,19 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 	d.mu.Lock()
 	for _, fd := range d.protectedFiles {
 		state := d.fileIntegrity[fd.FileID]
-		if state.Missing || state.SizeMismatch {
+		if state.SizeMismatch {
+			continue
+		}
+		if state.Missing {
+			// The file doesn't exist under its expected name, but a candidate
+			// may have all the blocks. Check for a rename match before giving up.
+			if rename := d.detectRenameCandidate(ctx, fd, state); rename != "" {
+				state.Missing = false
+				state.RenameSource = rename
+				d.logger.InfoContext(ctx, "File found under different name",
+					"expected", fd.Filename,
+					"found", rename)
+			}
 			continue
 		}
 		// Verify overall file hash if all shards are matched at expected consecutive offsets
@@ -522,6 +533,13 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 			} else {
 				d.logger.InfoContext(ctx, "File hash verified OK", "file", fd.Filename)
 			}
+		} else if rename := d.detectRenameCandidate(ctx, fd, state); rename != "" {
+			// All shards found in a single candidate file at consecutive offsets
+			// with a matching MD5 — this is just a misnamed file, not corruption.
+			state.RenameSource = rename
+			d.logger.InfoContext(ctx, "File found under different name",
+				"expected", fd.Filename,
+				"found", rename)
 		} else {
 			state.HashMismatch = true
 		}
@@ -545,7 +563,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 		UsableParityShardCount: len(d.parityShards),
 	}
 	// Per-file status report (logged before releasing the lock so state is consistent).
-	okCount, missingCount, damagedCount := 0, 0, 0
+	okCount, missingCount, damagedCount, renameCount := 0, 0, 0, 0
 	for _, fd := range d.protectedFiles {
 		state := d.fileIntegrity[fd.FileID]
 		switch {
@@ -574,6 +592,11 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 					"file", fd.Filename)
 			}
 			damagedCount++
+		case state.RenameSource != "":
+			d.logger.InfoContext(ctx, "File status: MISNAMED (will rename)",
+				"expected", fd.Filename,
+				"found", state.RenameSource)
+			renameCount++
 		default:
 			d.logger.InfoContext(ctx, "File status: OK", "file", fd.Filename)
 			okCount++
@@ -592,6 +615,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 		"ok", okCount,
 		"missing", missingCount,
 		"damaged", damagedCount,
+		"misnamed", renameCount,
 		"recoveryBlocks", len(d.parityShards))
 
 	if finalCounts.RepairNeeded() {
@@ -603,6 +627,135 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 	}
 
 	return ctx.Err()
+}
+
+// detectRenameCandidate checks whether all shards of a protected file were
+// found in a single candidate file at consecutive offsets. If so, it verifies
+// the candidate's full-file MD5 against the expected hash. Returns the
+// candidate path if it's a perfect match, or "" otherwise.
+//
+// Must be called while d.mu is held. Temporarily releases the lock for I/O.
+func (d *Decoder) detectRenameCandidate(ctx context.Context, fd FileDescPacket, state *FileIntegrityState) string {
+	if len(state.ShardLocations) == 0 {
+		return ""
+	}
+
+	// Check: all shards from the same single candidate file at consecutive offsets.
+	firstLoc := state.ShardLocations[0]
+	if firstLoc.Offset == -1 {
+		return "" // first shard missing
+	}
+
+	// Must be a candidate file, not the target itself.
+	candidateID := firstLoc.FileID
+	if candidateID == fd.FileID {
+		return "" // shard is from the target file itself, not a candidate
+	}
+
+	// Look up the candidate path.
+	var candidatePath string
+	for path, id := range d.candidateFiles {
+		if id == candidateID {
+			candidatePath = path
+			break
+		}
+	}
+	if candidatePath == "" {
+		return "" // source isn't a registered candidate
+	}
+
+	// Verify all shards come from this same candidate at consecutive offsets.
+	for idx, loc := range state.ShardLocations {
+		expected := int64(idx * d.sliceByteCount)
+		if loc.FileID != candidateID || loc.Offset != expected {
+			return "" // mixed sources or non-consecutive
+		}
+	}
+
+	// All shards match structurally. Run full-file MD5 to confirm content integrity.
+	// Release the lock during I/O.
+	d.mu.Unlock()
+	d.logger.DebugContext(ctx, "Running MD5 hash check on rename candidate",
+		"expected", fd.Filename, "candidate", candidatePath)
+	f, err := d.root.Open(candidatePath)
+	if err != nil {
+		d.mu.Lock()
+		return ""
+	}
+	hasher := md5.New()
+	_, copyErr := io.Copy(hasher, f)
+	f.Close()
+	d.mu.Lock()
+	if copyErr != nil {
+		d.logger.WarnContext(ctx, "I/O error during rename candidate MD5 check",
+			"candidate", candidatePath, "err", copyErr)
+		return ""
+	}
+	var fileHash [16]byte
+	copy(fileHash[:], hasher.Sum(nil))
+	if fileHash != fd.Hash {
+		d.logger.DebugContext(ctx, "Rename candidate MD5 mismatch",
+			"candidate", candidatePath,
+			"expected", fmt.Sprintf("%x", fd.Hash),
+			"actual", fmt.Sprintf("%x", fileHash))
+		return ""
+	}
+	return candidatePath
+}
+
+// renameMisnamedFiles renames candidate files to their expected names for any
+// protected file where RenameSource is set. Returns the number of files
+// successfully renamed.
+func (d *Decoder) renameMisnamedFiles(ctx context.Context) int {
+	renamed := 0
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	for _, fd := range d.protectedFiles {
+		state := d.fileIntegrity[fd.FileID]
+		if state.RenameSource == "" {
+			continue
+		}
+
+		srcAbs := filepath.Join(d.absRootDir, state.RenameSource)
+		dstAbs := filepath.Join(d.absRootDir, fd.Filename)
+
+		// Ensure the target directory exists.
+		if dir := filepath.Dir(dstAbs); dir != "." {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				d.logger.WarnContext(ctx, "Failed to create directory for rename, falling back to repair",
+					"dir", dir, "err", err)
+				state.RenameSource = ""
+				state.HashMismatch = true
+				continue
+			}
+		}
+
+		if err := os.Rename(srcAbs, dstAbs); err != nil {
+			d.logger.WarnContext(ctx, "Rename failed, falling back to repair",
+				"from", state.RenameSource, "to", fd.Filename, "err", err)
+			// Clear rename state and mark as needing reconstruction.
+			state.RenameSource = ""
+			state.HashMismatch = true
+			continue
+		}
+
+		d.logger.InfoContext(ctx, "Renamed misnamed file",
+			"from", state.RenameSource, "to", fd.Filename)
+
+		// Update integrity state: file is now healthy under its correct name.
+		state.RenameSource = ""
+		state.Missing = false
+		state.HashMismatch = false
+		for idx := range state.ShardLocations {
+			state.ShardLocations[idx] = ShardLocation{
+				FileID: fd.FileID,
+				Offset: int64(idx * d.sliceByteCount),
+			}
+		}
+		renamed++
+	}
+	return renamed
 }
 
 func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32Window, sem chan struct{}, lookupTable *crcLookupTable, matchChan chan<- matchEvent) error {
@@ -643,7 +796,7 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 	var chunkErrMu sync.Mutex
 
 	numChunks := (fileSize + scanChunkSize - 1) / scanChunkSize
-	for i := int64(0); i < numChunks; i++ {
+	for i := range numChunks {
 		if ctx.Err() != nil {
 			break
 		}
@@ -661,10 +814,7 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 			defer func() { <-sem }()
 
 			start := chunkIdx * scanChunkSize
-			end := start + scanChunkSize + int64(d.sliceByteCount) - 1
-			if end > fileSize {
-				end = fileSize
-			}
+			end := min(start+scanChunkSize+int64(d.sliceByteCount)-1, fileSize)
 
 			if err := d.scanChunk(ctx, f, fd.FileID, window, start, end, lookupTable, matchChan); err != nil {
 				d.logger.ErrorContext(ctx, "I/O error during chunk scan", "file", fd.Filename, "offset", start, "err", err)
@@ -746,7 +896,7 @@ func (d *Decoder) scanCandidateFile(ctx context.Context, path string, fileID Fil
 	var chunkErrMu sync.Mutex
 
 	numChunks := (fileSize + scanChunkSize - 1) / scanChunkSize
-	for i := int64(0); i < numChunks; i++ {
+	for i := range numChunks {
 		if ctx.Err() != nil {
 			break
 		}
@@ -761,10 +911,7 @@ func (d *Decoder) scanCandidateFile(ctx context.Context, path string, fileID Fil
 			defer func() { <-sem }()
 
 			start := chunkIdx * scanChunkSize
-			end := start + scanChunkSize + int64(d.sliceByteCount) - 1
-			if end > fileSize {
-				end = fileSize
-			}
+			end := min(start+scanChunkSize+int64(d.sliceByteCount)-1, fileSize)
 			if err := d.scanChunk(ctx, f, fileID, window, start, end, lookupTable, matchChan); err != nil {
 				d.logger.ErrorContext(ctx, "I/O error during candidate file chunk scan", "path", path, "offset", start, "err", err)
 				chunkErrMu.Lock()
@@ -871,9 +1018,18 @@ func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID
 
 // Repair performs pipelined, strict memory-limited reconstruction of missing shards.
 func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) error {
+	// Phase 0: Rename misnamed files before doing any reconstruction.
+	// This is much cheaper than running the RS pipeline for files that are
+	// simply named differently but have identical content.
+	filesRenamed := d.renameMisnamedFiles(ctx)
+
 	counts := d.ShardCounts()
 	if !counts.RepairNeeded() {
-		d.logger.InfoContext(ctx, "No repair needed. All files are healthy.")
+		if filesRenamed > 0 {
+			d.logger.InfoContext(ctx, "All files resolved by renaming", "filesRenamed", filesRenamed)
+		} else {
+			d.logger.InfoContext(ctx, "No repair needed. All files are healthy.")
+		}
 		return nil
 	}
 	if !counts.RepairPossible() {
@@ -920,14 +1076,8 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 	if denom <= 0 {
 		return errors.New("invalid shard configuration for repair")
 	}
-	chunkSize := d.memoryLimit / denom
-	if chunkSize > int64(d.sliceByteCount) {
-		chunkSize = int64(d.sliceByteCount)
-	}
-	chunkSize = (chunkSize / 16) * 16
-	if chunkSize < 16 {
-		chunkSize = 16
-	}
+	chunkSize := min(d.memoryLimit/denom, int64(d.sliceByteCount))
+	chunkSize = max((chunkSize/16)*16, 16)
 
 	d.logger.DebugContext(ctx, "Configured memory-limited streaming", "chunkSize", chunkSize, "sliceByteCount", d.sliceByteCount)
 
@@ -948,7 +1098,7 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 		sourceFilename string
 		diskOffset     int64 // -1 if missing
 	}
-	
+
 	fileIDToFilename := make(map[FileID]string)
 	for _, f := range d.protectedFiles {
 		fileIDToFilename[f.FileID] = f.Filename
@@ -977,7 +1127,6 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 			k++
 		}
 	}
-
 
 	// Pre-determine which files need write access for repair
 	needsWrite := make(map[string]bool)
@@ -1054,7 +1203,7 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 
 	// Stream data chunk by chunk
 	numChunks := (int64(d.sliceByteCount) + chunkSize - 1) / chunkSize
-	for chunkIdx := int64(0); chunkIdx < numChunks; chunkIdx++ {
+	for chunkIdx := range numChunks {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -1160,6 +1309,7 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 	d.logger.InfoContext(ctx, "Repair completed successfully!")
 	d.logger.InfoContext(ctx, "Repair summary",
 		"filesRepaired", len(needsWrite),
+		"filesRenamed", filesRenamed,
 		"blocksReconstructed", counts.UnusableDataShardCount)
 	return nil
 }
