@@ -69,19 +69,9 @@ func CalcTable(c T, table *MulTable) {
 	}
 }
 
-// MulByteSliceLE treats in and out as arrays of T (stored little-endian),
-// and sets each out[i] to c * in[i].
-func MulByteSliceLE(c T, in, out []byte) {
-	if len(out) != len(in) {
-		panic("size mismatch")
-	}
-	if len(in)%2 != 0 {
-		panic("odd slice length")
-	}
-	if len(in) == 0 {
-		return
-	}
-
+// mulScalarByteSliceLE sets each out[i] to c * in[i] using the 1KB stack-allocated
+// MulTable. This is the portable scalar path — zero heap allocation guaranteed.
+func mulScalarByteSliceLE(c T, in, out []byte) {
 	var table MulTable
 	CalcTable(c, &table)
 
@@ -110,26 +100,15 @@ func MulByteSliceLE(c T, in, out []byte) {
 		binary.LittleEndian.PutUint16(out[i+6:], uint16(r3))
 	}
 
-	// Handle remaining elements
 	for ; i < n; i += 2 {
 		cx := table.s0[in[i]] ^ table.s8[in[i+1]]
 		binary.LittleEndian.PutUint16(out[i:], uint16(cx))
 	}
 }
 
-// MulAndAddByteSliceLE treats in and out as arrays of T (stored little-endian),
-// and adds (XORs) c * in[i] to out[i].
-func MulAndAddByteSliceLE(c T, in, out []byte) {
-	if len(out) != len(in) {
-		panic("size mismatch")
-	}
-	if len(in)%2 != 0 {
-		panic("odd slice length")
-	}
-	if len(in) == 0 {
-		return
-	}
-
+// mulAndAddScalarByteSliceLE adds (XORs) c * in[i] to each out[i] using the 1KB
+// stack-allocated MulTable. Zero heap allocation guaranteed.
+func mulAndAddScalarByteSliceLE(c T, in, out []byte) {
 	var table MulTable
 	CalcTable(c, &table)
 
@@ -163,10 +142,19 @@ func MulAndAddByteSliceLE(c T, in, out []byte) {
 		binary.LittleEndian.PutUint16(out[i+6:], d3)
 	}
 
-	// Handle remaining elements
 	for ; i < n; i += 2 {
 		d := binary.LittleEndian.Uint16(out[i:]) ^ uint16(table.s0[in[i]]^table.s8[in[i+1]])
 		binary.LittleEndian.PutUint16(out[i:], d)
+	}
+}
+
+// validateSlicePair panics if in and out have mismatched or odd lengths.
+func validateSlicePair(in, out []byte) {
+	if len(out) != len(in) {
+		panic("size mismatch")
+	}
+	if len(in)%2 != 0 {
+		panic("odd slice length")
 	}
 }
 

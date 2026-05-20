@@ -119,6 +119,60 @@ func TestMulAndAddByteSliceLE(t *testing.T) {
 	}
 }
 
+// TestMulByteSliceLE_DispatchBoundaries exercises sizes straddling the 32-byte SSSE3
+// chunk boundary: pure-scalar (< 32), exact chunk, chunk + scalar remainder.
+func TestMulByteSliceLE_DispatchBoundaries(t *testing.T) {
+	r := rand.New(rand.NewPCG(99, 99))
+	c := T(0x4321)
+
+	for _, size := range []int{2, 4, 30, 32, 34, 62, 64, 66, 96, 128, 130} {
+		in := make([]byte, size)
+		for i := range in {
+			in[i] = byte(r.Uint32())
+		}
+		out := make([]byte, size)
+
+		MulByteSliceLE(c, in, out)
+
+		for i := 0; i < size; i += 2 {
+			inVal := T(binary.LittleEndian.Uint16(in[i:]))
+			want := c.Times(inVal)
+			got := T(binary.LittleEndian.Uint16(out[i:]))
+			if want != got {
+				t.Fatalf("size=%d index %d: want %#x, got %#x", size, i, want, got)
+			}
+		}
+	}
+}
+
+// TestMulAndAddByteSliceLE_DispatchBoundaries mirrors the above for MulAndAdd.
+func TestMulAndAddByteSliceLE_DispatchBoundaries(t *testing.T) {
+	r := rand.New(rand.NewPCG(99, 99))
+	c := T(0x4321)
+
+	for _, size := range []int{2, 4, 30, 32, 34, 62, 64, 66, 96, 128, 130} {
+		in := make([]byte, size)
+		out := make([]byte, size)
+		for i := range in {
+			in[i] = byte(r.Uint32())
+			out[i] = byte(r.Uint32())
+		}
+		outOrig := slices.Clone(out)
+
+		MulAndAddByteSliceLE(c, in, out)
+
+		for i := 0; i < size; i += 2 {
+			inVal := T(binary.LittleEndian.Uint16(in[i:]))
+			origVal := T(binary.LittleEndian.Uint16(outOrig[i:]))
+			want := origVal ^ c.Times(inVal)
+			got := T(binary.LittleEndian.Uint16(out[i:]))
+			if want != got {
+				t.Fatalf("size=%d index %d: want %#x, got %#x", size, i, want, got)
+			}
+		}
+	}
+}
+
 // ---------- CPU Benchmarks ----------
 
 func runMulBenchmark(b *testing.B, size int) {
@@ -205,4 +259,45 @@ func TestMulAndAddByteSliceLE_EdgeCases(t *testing.T) {
 		MulAndAddByteSliceLE(0x1234, nil, nil)           // Should not panic
 		MulAndAddByteSliceLE(0x1234, []byte{}, []byte{}) // Should not panic
 	})
+}
+
+// ---------- Scalar-path Benchmarks (for side-by-side comparison with SSSE3) ----------
+// These call the scalar implementation directly, giving an apples-to-apples comparison
+// against the dispatched BenchmarkMulByteSliceLE_* benchmarks above (which use SSSE3
+// on amd64).
+
+func runMulScalarBenchmark(b *testing.B, size int) {
+	in := make([]byte, size)
+	out := make([]byte, size)
+	c := T(0x1234)
+
+	b.ResetTimer()
+	b.SetBytes(int64(size))
+	for i := 0; i < b.N; i++ {
+		mulScalarByteSliceLE(c, in, out)
+	}
+}
+
+func BenchmarkMulByteSliceLEScalar_1K(b *testing.B)  { runMulScalarBenchmark(b, 1024) }
+func BenchmarkMulByteSliceLEScalar_64K(b *testing.B) { runMulScalarBenchmark(b, 64*1024) }
+func BenchmarkMulByteSliceLEScalar_1M(b *testing.B)  { runMulScalarBenchmark(b, 1024*1024) }
+func BenchmarkMulByteSliceLEScalar_16M(b *testing.B) { runMulScalarBenchmark(b, 16*1024*1024) }
+
+func runMulAndAddScalarBenchmark(b *testing.B, size int) {
+	in := make([]byte, size)
+	out := make([]byte, size)
+	c := T(0x1234)
+
+	b.ResetTimer()
+	b.SetBytes(int64(size))
+	for i := 0; i < b.N; i++ {
+		mulAndAddScalarByteSliceLE(c, in, out)
+	}
+}
+
+func BenchmarkMulAndAddByteSliceLEScalar_1K(b *testing.B)  { runMulAndAddScalarBenchmark(b, 1024) }
+func BenchmarkMulAndAddByteSliceLEScalar_64K(b *testing.B) { runMulAndAddScalarBenchmark(b, 64*1024) }
+func BenchmarkMulAndAddByteSliceLEScalar_1M(b *testing.B)  { runMulAndAddScalarBenchmark(b, 1024*1024) }
+func BenchmarkMulAndAddByteSliceLEScalar_16M(b *testing.B) {
+	runMulAndAddScalarBenchmark(b, 16*1024*1024)
 }
