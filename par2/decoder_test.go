@@ -67,7 +67,7 @@ func TestDecoderEndToEnd(t *testing.T) {
 		}
 		defer d.Close()
 
-		err = d.VerifyScans(ctx, nil)
+		err = d.VerifyScans(ctx)
 		if err != nil {
 			t.Fatalf("VerifyScans failed: %v", err)
 		}
@@ -106,7 +106,7 @@ func TestDecoderEndToEnd(t *testing.T) {
 		defer d.Close()
 
 		// Scan
-		err = d.VerifyScans(ctx, nil)
+		err = d.VerifyScans(ctx)
 		if err != nil {
 			t.Fatalf("VerifyScans failed: %v", err)
 		}
@@ -129,7 +129,7 @@ func TestDecoderEndToEnd(t *testing.T) {
 		}
 
 		// Scan again
-		err = d.VerifyScans(ctx, nil)
+		err = d.VerifyScans(ctx)
 		if err != nil {
 			t.Fatalf("VerifyScans 2 failed: %v", err)
 		}
