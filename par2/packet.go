@@ -8,7 +8,7 @@ import (
 	"io"
 	"path"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -205,8 +205,14 @@ func ParseMainPacket(body []byte) (*MainPacket, error) {
 	nonRecoverySet := fileIDs[setCount:]
 
 	// Verify PAR2 spec sorted requirements
-	if !sort.SliceIsSorted(recoverySet, func(i, j int) bool {
-		return FileIDLess(recoverySet[i], recoverySet[j])
+	if !slices.IsSortedFunc(recoverySet, func(a, b FileID) int {
+		if FileIDLess(a, b) {
+			return -1
+		}
+		if FileIDLess(b, a) {
+			return 1
+		}
+		return 0
 	}) {
 		return nil, errors.New("recovery set file IDs are not sorted alphabetically")
 	}
