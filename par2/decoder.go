@@ -103,23 +103,32 @@ type matchEvent struct {
 	offset       int64
 }
 
+// DecoderOptions contains configuration for the PAR2 decoder.
+type DecoderOptions struct {
+	NumGoroutines int
+	MemoryLimit   int64
+	MaxFileSize   int64
+	MaxPacketSize int64
+	Logger        *slog.Logger
+}
+
 // NewDecoder opens a sandboxed target directory relative to the index par2 file,
 // parses the index par2 manifest, and returns a Decoder.
-func NewDecoder(ctx context.Context, par2Path string, numGoroutines int, memLimit int64, maxFileSize int64, maxPacketSize int64, logger *slog.Logger) (*Decoder, error) {
-	if numGoroutines <= 0 {
-		numGoroutines = rs.DefaultNumGoroutines()
+func NewDecoder(ctx context.Context, par2Path string, opts DecoderOptions) (*Decoder, error) {
+	if opts.NumGoroutines <= 0 {
+		opts.NumGoroutines = rs.DefaultNumGoroutines()
 	}
-	if memLimit <= 0 {
-		memLimit = 16 * 1024 * 1024 // 16MB default memory limit
+	if opts.MemoryLimit <= 0 {
+		opts.MemoryLimit = 16 * 1024 * 1024 // 16MB default memory limit
 	}
-	if maxFileSize <= 0 {
-		maxFileSize = 100 * 1024 * 1024 // 100MB default index file size limit
+	if opts.MaxFileSize <= 0 {
+		opts.MaxFileSize = 100 * 1024 * 1024 // 100MB default index file size limit
 	}
-	if maxPacketSize <= 0 {
-		maxPacketSize = 128 * 1024 * 1024 // 128MB default packet body limit
+	if opts.MaxPacketSize <= 0 {
+		opts.MaxPacketSize = 128 * 1024 * 1024 // 128MB default packet body limit
 	}
-	if logger == nil {
-		logger = slog.Default()
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
 	}
 
 	dir := filepath.Dir(par2Path)
@@ -135,11 +144,11 @@ func NewDecoder(ctx context.Context, par2Path string, numGoroutines int, memLimi
 	}
 
 	d := &Decoder{
-		numGoroutines: numGoroutines,
-		memoryLimit:   memLimit,
-		maxFileSize:   maxFileSize,
-		maxPacketSize: maxPacketSize,
-		logger:        logger,
+		numGoroutines: opts.NumGoroutines,
+		memoryLimit:   opts.MemoryLimit,
+		maxFileSize:   opts.MaxFileSize,
+		maxPacketSize: opts.MaxPacketSize,
+		logger:        opts.Logger,
 		root:          root,
 		absRootDir:    absDir,
 		fileChecksums: make(map[FileID]*IFSCPacket),
