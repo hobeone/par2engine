@@ -1,7 +1,7 @@
 package rs
 
 import (
-	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/hobeone/par2engine/gf16"
@@ -17,7 +17,7 @@ func TestNewIdentityMatrix(t *testing.T) {
 		0, 1, 0,
 		0, 0, 1,
 	}
-	if !reflect.DeepEqual(m.elements, expected) {
+	if !slices.Equal(m.elements, expected) {
 		t.Fatalf("identity matrix mismatch: got %v", m.elements)
 	}
 }
@@ -37,7 +37,7 @@ func TestNewVandermondeMatrix(t *testing.T) {
 		2, 3,
 		4, 5,
 	}
-	if !reflect.DeepEqual(m.elements, expected) {
+	if !slices.Equal(m.elements, expected) {
 		t.Fatalf("Vandermonde matrix mismatch: got %v", m.elements)
 	}
 }

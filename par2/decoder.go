@@ -300,24 +300,22 @@ func (d *Decoder) ShardCounts() ShardCounts {
 	}
 }
 
-// VerifyScans parallelizes file scanning to check integrity of all protected files.
-func (d *Decoder) VerifyScans(ctx context.Context) error {
+func (d *Decoder) initFileIntegrity() error {
 	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	d.fileIntegrity = make(map[FileID]*FileIntegrityState)
 	totalShards := 0
 	for _, f := range d.protectedFiles {
 		if d.sliceByteCount == 0 {
-			d.mu.Unlock()
 			return errors.New("invalid PAR2 set: sliceByteCount is zero")
 		}
 		shards := (uint64(f.ByteCount) + uint64(d.sliceByteCount) - 1) / uint64(d.sliceByteCount)
 		if shards > 32768 {
-			d.mu.Unlock()
 			return fmt.Errorf("invalid PAR2 set: file %s block count (%d) exceeds specification limit (32768)", f.Filename, shards)
 		}
 		totalShards += int(shards)
 		if totalShards > 32768 {
-			d.mu.Unlock()
 			return fmt.Errorf("invalid PAR2 set: total recovery block count (%d) exceeds specification limit (32768)", totalShards)
 		}
 
@@ -331,7 +329,14 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 			ShardLocations: locs,
 		}
 	}
-	d.mu.Unlock()
+	return nil
+}
+
+// VerifyScans parallelizes file scanning to check integrity of all protected files.
+func (d *Decoder) VerifyScans(ctx context.Context) error {
+	if err := d.initFileIntegrity(); err != nil {
+		return err
+	}
 
 	window, err := newCRC32Window(d.sliceByteCount)
 	if err != nil {
@@ -540,15 +545,12 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 		lastBlockStart := int64((shards - 1) * uint64(d.sliceByteCount))
 		lastBlockLen := int64(fd.ByteCount) - lastBlockStart
 
-		partialData := make([]byte, lastBlockLen)
-		_, err = f.ReadAt(partialData, lastBlockStart)
+		// Zero-padded to full block size
+		paddedBlock := make([]byte, d.sliceByteCount)
+		_, err = f.ReadAt(paddedBlock[:lastBlockLen], lastBlockStart)
 		if err != nil && err != io.EOF {
 			return err
 		}
-
-		// Zero-padded to full block size
-		paddedBlock := make([]byte, d.sliceByteCount)
-		copy(paddedBlock, partialData)
 
 		crcVal := crc32.ChecksumIEEE(paddedBlock)
 		if locations, found := lookupTable.Lookup(crcVal); found {
@@ -777,6 +779,9 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 		return err
 	}
 
+	activeDataShards := make([][]byte, totalDataShards)
+	activeParityShards := make([][]byte, totalParityShards)
+
 	// Stream data chunk by chunk
 	numChunks := (int64(d.sliceByteCount) + chunkSize - 1) / chunkSize
 	for chunkIdx := int64(0); chunkIdx < numChunks; chunkIdx++ {
@@ -790,7 +795,7 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 		}
 
 		// 1. READER PIPELINE: Read input buffers from disk
-		var activeDataShards [][]byte
+		clear(activeDataShards)
 
 		// Read present data shards relative to their offset on disk
 		for i, fl := range flatLocs {
@@ -808,14 +813,14 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 				if n < int(currChunkSize) {
 					clear(dataBuffers[i][n:currChunkSize])
 				}
-				activeDataShards = append(activeDataShards, dataBuffers[i][:currChunkSize])
+				activeDataShards[i] = dataBuffers[i][:currChunkSize]
 			} else {
-				activeDataShards = append(activeDataShards, nil) // nil marks missing
+				activeDataShards[i] = nil // nil marks missing
 			}
 		}
 
 		// Read parity shards strictly aligned to their exponent matrix row slots
-		activeParityShards := make([][]byte, totalParityShards)
+		clear(activeParityShards)
 		for exp, parityBytes := range d.parityShards {
 			offset := chunkIdx * chunkSize
 			copy(parityBuffers[exp][:currChunkSize], parityBytes[offset:offset+currChunkSize])
