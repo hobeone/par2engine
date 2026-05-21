@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"hash/crc32"
 	"io"
 	"io/fs"
@@ -17,7 +18,12 @@ import (
 	"sync"
 
 	"github.com/hobeone/par2engine/rs"
+	"github.com/minio/md5-simd"
 )
+
+type md5Closer interface {
+	Close()
+}
 
 // Progress represents a progress update sent during verification or repair.
 type Progress struct {
@@ -92,6 +98,7 @@ type Decoder struct {
 	candidateFiles   map[string]FileID // extra files to scan; path → synthetic FileID
 	parityFileBlocks map[string]int    // par2 filename → number of recovery blocks it contributes
 	mu               sync.Mutex        // protects shared state updates
+	md5Server        md5simd.Server   // multiplexed parallel SIMD MD5 engine
 }
 
 type checksumLocation struct {
@@ -114,6 +121,7 @@ type DecoderOptions struct {
 	MaxFileSize   int64
 	MaxPacketSize int64
 	Logger        *slog.Logger
+	UseSIMDHash   bool // set true to enable parallel SIMD-accelerated MD5 hashing (useful to save CPU cycles)
 }
 
 // NewDecoder opens a sandboxed target directory relative to the index par2 file,
@@ -159,16 +167,19 @@ func NewDecoder(ctx context.Context, par2Path string, opts DecoderOptions) (*Dec
 		fileIntegrity:    make(map[FileID]*FileIntegrityState),
 		parityFileBlocks: make(map[string]int),
 	}
+	if opts.UseSIMDHash {
+		d.md5Server = md5simd.NewServer()
+	}
 
 	err = d.loadIndexFile(ctx, indexFilename)
 	if err != nil {
-		_ = root.Close()
+		_ = d.Close()
 		return nil, err
 	}
 
 	err = d.loadVolumeFiles(ctx, indexFilename)
 	if err != nil {
-		_ = root.Close()
+		_ = d.Close()
 		return nil, err
 	}
 
@@ -176,6 +187,9 @@ func NewDecoder(ctx context.Context, par2Path string, opts DecoderOptions) (*Dec
 }
 
 func (d *Decoder) Close() error {
+	if d.md5Server != nil {
+		d.md5Server.Close()
+	}
 	if d.root != nil {
 		return d.root.Close()
 	}
@@ -1227,6 +1241,18 @@ func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID
 		return fmt.Errorf("ReadAt offset %d: %w", start, err)
 	}
 
+	var h hash.Hash
+	if d.md5Server != nil {
+		h = d.md5Server.NewHash()
+	} else {
+		h = md5.New()
+	}
+	defer func() {
+		if closer, ok := h.(md5Closer); ok {
+			closer.Close()
+		}
+	}()
+
 	var crcSlice uint32
 	justMissed := false
 
@@ -1263,7 +1289,10 @@ func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID
 			continue
 		}
 
-		blockHash := md5.Sum(slice)
+		h.Reset()
+		_, _ = h.Write(slice)
+		var blockHash [16]byte
+		copy(blockHash[:], h.Sum(nil))
 		md5Matched := false
 		for _, loc := range locations {
 			if loc.md5Hash == blockHash {
