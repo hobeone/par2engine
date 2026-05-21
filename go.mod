@@ -10,6 +10,7 @@ require (
 )
 
 require (
+	github.com/minio/md5-simd v1.1.2 // indirect
 	golang.org/x/mod v0.27.0 // indirect
 	golang.org/x/sync v0.16.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect
