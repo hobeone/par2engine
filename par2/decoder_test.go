@@ -101,7 +101,7 @@ func TestDecoderEndToEnd(t *testing.T) {
 		}
 
 		// Open decoder
-		d, err := NewDecoder(ctx, par2Path, DecoderOptions{NumGoroutines: 2, MemoryLimit: 64 * 1024, UseSIMDHash: true}) // 2 threads, tiny memory limit (64KB buffer) to test streaming!
+		d, err := NewDecoder(ctx, par2Path, DecoderOptions{NumGoroutines: 2, MemoryLimit: 64 * 1024}) // 2 threads, tiny memory limit (64KB buffer) to test streaming!
 		if err != nil {
 			t.Fatalf("NewDecoder failed: %v", err)
 		}
