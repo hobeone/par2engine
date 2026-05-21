@@ -15,9 +15,34 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/hobeone/par2engine/rs"
 )
+
+type md5Closer interface {
+	Close()
+}
+
+type scanProgress struct {
+	scannedBytes int64
+	totalBytes   int64
+	progressChan chan<- Progress
+}
+
+func (p *scanProgress) add(bytes int64) {
+	if p == nil || p.progressChan == nil {
+		return
+	}
+	scanned := atomic.AddInt64(&p.scannedBytes, bytes)
+	pct := min(float64(scanned)/float64(p.totalBytes)*100, 100.0)
+	p.progressChan <- Progress{
+		Phase:   "verifying",
+		Current: scanned,
+		Total:   p.totalBytes,
+		Percent: pct,
+	}
+}
 
 // Progress represents a progress update sent during verification or repair.
 type Progress struct {
@@ -375,7 +400,7 @@ func (d *Decoder) initFileIntegrity() error {
 }
 
 // VerifyScans checks the integrity of all protected files against the PAR2 set.
-func (d *Decoder) VerifyScans(ctx context.Context) error {
+func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress) error {
 	if err := d.initFileIntegrity(); err != nil {
 		return err
 	}
@@ -438,6 +463,34 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 	d.prescanProtectedMatches(ctx)
 
 	// ── Phase 6: build checksum map and run the block-level scan ─────────────
+	// Calculate total bytes to scan (only files not missing and not pre-verified)
+	var totalBytesToScan int64
+	for _, fd := range d.protectedFiles {
+		d.mu.Lock()
+		state := d.fileIntegrity[fd.FileID]
+		missing := state.Missing
+		verified := state.Verified
+		d.mu.Unlock()
+		if !missing && !verified {
+			totalBytesToScan += int64(fd.ByteCount)
+		}
+	}
+
+	var progress *scanProgress
+	if progressChan != nil && totalBytesToScan > 0 {
+		progress = &scanProgress{
+			totalBytes:   totalBytesToScan,
+			progressChan: progressChan,
+		}
+		// Initial 0% progress update
+		progressChan <- Progress{
+			Phase:   "verifying",
+			Current: 0,
+			Total:   totalBytesToScan,
+			Percent: 0.0,
+		}
+	}
+
 	window, err := newCRC32Window(d.sliceByteCount)
 	if err != nil {
 		return err
@@ -513,7 +566,7 @@ func (d *Decoder) VerifyScans(ctx context.Context) error {
 		scanWg.Add(1)
 		go func(fd FileDescPacket) {
 			defer scanWg.Done()
-			if err := d.scanFile(ctx, fd, window, sem, lookupTable, matchChan); err != nil {
+			if err := d.scanFile(ctx, fd, window, sem, lookupTable, matchChan, progress); err != nil {
 				d.logger.ErrorContext(ctx, "failed to scan file", "file", fd.Filename, "err", err)
 				setScanErr(err)
 			}
@@ -1042,7 +1095,7 @@ func (d *Decoder) renameMisnamedFiles(ctx context.Context) int {
 	return renamed
 }
 
-func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32Window, sem chan struct{}, lookupTable *crcLookupTable, matchChan chan<- matchEvent) error {
+func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32Window, sem chan struct{}, lookupTable *crcLookupTable, matchChan chan<- matchEvent, progress *scanProgress) error {
 	f, err := d.root.Open(fd.Filename)
 	if errors.Is(err, fs.ErrNotExist) {
 		// Phase 4 of VerifyScans already logged and set Missing — nothing to do here.
@@ -1107,6 +1160,8 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 					chunkErr = err
 				}
 				chunkErrMu.Unlock()
+			} else {
+				progress.add(min(scanChunkSize, fileSize-start))
 			}
 		}(i)
 	}

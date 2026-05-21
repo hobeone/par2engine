@@ -69,7 +69,7 @@ func TestDecoderEndToEnd(t *testing.T) {
 		}
 		defer func() { _ = d.Close() }()
 
-		err = d.VerifyScans(ctx)
+		err = d.VerifyScans(ctx, nil)
 		if err != nil {
 			t.Fatalf("VerifyScans failed: %v", err)
 		}
@@ -108,7 +108,7 @@ func TestDecoderEndToEnd(t *testing.T) {
 		defer func() { _ = d.Close() }()
 
 		// Scan
-		err = d.VerifyScans(ctx)
+		err = d.VerifyScans(ctx, nil)
 		if err != nil {
 			t.Fatalf("VerifyScans failed: %v", err)
 		}
@@ -131,7 +131,7 @@ func TestDecoderEndToEnd(t *testing.T) {
 		}
 
 		// Scan again
-		err = d.VerifyScans(ctx)
+		err = d.VerifyScans(ctx, nil)
 		if err != nil {
 			t.Fatalf("VerifyScans 2 failed: %v", err)
 		}
@@ -342,7 +342,7 @@ func TestDecoderEndToEndMultiChunk(t *testing.T) {
 	}
 	defer func() { _ = d.Close() }()
 
-	if err := d.VerifyScans(context.Background()); err != nil {
+	if err := d.VerifyScans(context.Background(), nil); err != nil {
 		t.Fatalf("VerifyScans: %v", err)
 	}
 
@@ -397,7 +397,7 @@ func TestAddCandidateFile(t *testing.T) {
 	defer func() { _ = d.Close() }()
 
 	// Without AddCandidateFile the correct file is reported missing.
-	if err := d.VerifyScans(ctx); err != nil {
+	if err := d.VerifyScans(ctx, nil); err != nil {
 		t.Fatalf("VerifyScans: %v", err)
 	}
 	if counts := d.ShardCounts(); counts.UnusableDataShardCount == 0 {
@@ -408,7 +408,7 @@ func TestAddCandidateFile(t *testing.T) {
 	if err := d.AddCandidateFile("wrong_name.dat"); err != nil {
 		t.Fatalf("AddCandidateFile: %v", err)
 	}
-	if err := d.VerifyScans(ctx); err != nil {
+	if err := d.VerifyScans(ctx, nil); err != nil {
 		t.Fatalf("VerifyScans with candidate: %v", err)
 	}
 	counts := d.ShardCounts()
@@ -463,7 +463,7 @@ func TestRenameMisnamedFile(t *testing.T) {
 	}
 
 	// Verify: should detect the rename candidate, NOT report as damaged.
-	if err := d.VerifyScans(ctx); err != nil {
+	if err := d.VerifyScans(ctx, nil); err != nil {
 		t.Fatalf("VerifyScans: %v", err)
 	}
 
@@ -521,7 +521,7 @@ func TestRenameMisnamedFile(t *testing.T) {
 		t.Fatalf("NewDecoder re-verify: %v", err)
 	}
 	defer func() { _ = d2.Close() }()
-	if err := d2.VerifyScans(ctx); err != nil {
+	if err := d2.VerifyScans(ctx, nil); err != nil {
 		t.Fatalf("VerifyScans re-verify: %v", err)
 	}
 	counts2 := d2.ShardCounts()
@@ -583,7 +583,7 @@ func TestDecoderMaliciousIFSCPacket(t *testing.T) {
 	d.sliceByteCount = 11
 
 	ctx := context.Background()
-	err = d.VerifyScans(ctx)
+	err = d.VerifyScans(ctx, nil)
 	if err != nil {
 		t.Fatalf("VerifyScans failed: %v", err)
 	}
