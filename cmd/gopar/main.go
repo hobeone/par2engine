@@ -187,7 +187,23 @@ func runCLI() int {
 	}
 
 	// 1. Perform file integrity scans
-	err = d.VerifyScans(ctx)
+	verifyProgressChan := make(chan par2.Progress, 100)
+	go func() {
+		for p := range verifyProgressChan {
+			if verbose {
+				logger.Debug("Verification progress", "percent", fmt.Sprintf("%.2f%%", p.Percent))
+			} else {
+				fmt.Printf("\rVerifying... %.1f%%", p.Percent)
+				_ = os.Stdout.Sync()
+			}
+		}
+		if !verbose {
+			fmt.Println()
+		}
+	}()
+
+	err = d.VerifyScans(ctx, verifyProgressChan)
+	close(verifyProgressChan)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\nError during verification scanning: %v\n", err)
 		return ExitLogicError
