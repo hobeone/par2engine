@@ -843,6 +843,7 @@ func (d *Decoder) prescanCandidateMatches(ctx context.Context) map[string]bool {
 		}
 
 		// 16 KB matched — compute full-file MD5 to confirm.
+		d.logger.InfoContext(ctx, "Pre-verifying candidate file...", "candidate", candidatePath, "matchedFile", fd.Filename, "size", fileSize)
 		hasher := md5.New()
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
 			_ = f.Close()
@@ -931,6 +932,7 @@ func (d *Decoder) prescanProtectedMatches(ctx context.Context) {
 		}
 
 		// 16 KB matched — compute full-file MD5 to confirm.
+		d.logger.InfoContext(ctx, "Pre-verifying file...", "file", fd.Filename, "size", fileSize)
 		hasher := md5.New()
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
 			_ = f.Close()
