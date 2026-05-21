@@ -1227,6 +1227,8 @@ func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID
 		return fmt.Errorf("ReadAt offset %d: %w", start, err)
 	}
 
+	h := md5.New()
+
 	var crcSlice uint32
 	justMissed := false
 
@@ -1263,7 +1265,10 @@ func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID
 			continue
 		}
 
-		blockHash := md5.Sum(slice)
+		h.Reset()
+		_, _ = h.Write(slice)
+		var blockHash [16]byte
+		copy(blockHash[:], h.Sum(nil))
 		md5Matched := false
 		for _, loc := range locations {
 			if loc.md5Hash == blockHash {
