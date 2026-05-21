@@ -443,7 +443,6 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 			d.mu.Lock()
 			d.fileIntegrity[fd.FileID].Missing = true
 			d.mu.Unlock()
-			d.logger.InfoContext(ctx, "File not found on disk", "file", fd.Filename)
 			continue
 		} else if err != nil {
 			return err
