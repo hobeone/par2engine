@@ -188,6 +188,7 @@ func runCLI() int {
 
 	// 1. Perform file integrity scans
 	verifyProgressChan := make(chan par2.Progress, 100)
+	verifyDoneChan := make(chan struct{})
 	go func() {
 		for p := range verifyProgressChan {
 			if verbose {
@@ -200,10 +201,12 @@ func runCLI() int {
 		if !verbose {
 			fmt.Println()
 		}
+		close(verifyDoneChan)
 	}()
 
 	err = d.VerifyScans(ctx, verifyProgressChan)
 	close(verifyProgressChan)
+	<-verifyDoneChan
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\nError during verification scanning: %v\n", err)
 		return ExitLogicError
@@ -243,6 +246,7 @@ func runCLI() int {
 
 		// Perform Repair
 		repairProgressChan := make(chan par2.Progress, 100)
+		repairDoneChan := make(chan struct{})
 		go func() {
 			for p := range repairProgressChan {
 				if verbose {
@@ -255,10 +259,12 @@ func runCLI() int {
 			if !verbose {
 				fmt.Println()
 			}
+			close(repairDoneChan)
 		}()
 
 		err = d.Repair(ctx, repairProgressChan)
 		close(repairProgressChan)
+		<-repairDoneChan
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "\nError during repair operation: %v\n", err)
 			return ExitRepairNotPossible
