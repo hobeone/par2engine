@@ -2,7 +2,11 @@
 
 package gf16
 
-import "github.com/klauspost/cpuid/v2"
+import (
+	"unsafe"
+
+	"github.com/klauspost/cpuid/v2"
+)
 
 // mulTable64Entry holds the SSSE3 lookup tables for a single GF(2^16) coefficient.
 // Each GF(2^16) multiply is decomposed into four 4-bit nibble lookups (s0, s4, s8, s12),
@@ -29,6 +33,9 @@ var mulTable64 [1 << 16]mulTable64Entry
 
 // hasSSSE3 is true when the CPU supports SSSE3 (required for PSHUFB).
 var hasSSSE3 = cpuid.CPU.Supports(cpuid.SSSE3)
+
+// hasAVX2 is true when the CPU supports AVX2 (required for VBROADCASTI128/planar repack).
+var hasAVX2 = cpuid.CPU.Supports(cpuid.AVX2)
 
 func init() {
 	// Relies on logTable/expTable already populated by gf16.go's init (runs first by
@@ -78,6 +85,17 @@ func MulByteSliceLE(c T, in, out []byte) {
 		return
 	}
 
+	if hasAVX2 {
+		avx2Len := n - (n % 64)
+		if avx2Len > 0 {
+			MulByteSliceLE_AVX2((*[128]byte)(unsafe.Pointer(&mulTable64[c])), in[:avx2Len], out[:avx2Len])
+			if avx2Len < n {
+				MulByteSliceLE(c, in[avx2Len:], out[avx2Len:])
+			}
+			return
+		}
+	}
+
 	if hasSSSE3 {
 		ssse3Len := n - (n % 32)
 		if ssse3Len > 0 {
@@ -102,6 +120,17 @@ func MulAndAddByteSliceLE(c T, in, out []byte) {
 	n := len(in)
 	if n == 0 {
 		return
+	}
+
+	if hasAVX2 {
+		avx2Len := n - (n % 64)
+		if avx2Len > 0 {
+			MulAndAddByteSliceLE_AVX2((*[128]byte)(unsafe.Pointer(&mulTable64[c])), in[:avx2Len], out[:avx2Len])
+			if avx2Len < n {
+				MulAndAddByteSliceLE(c, in[avx2Len:], out[avx2Len:])
+			}
+			return
+		}
 	}
 
 	if hasSSSE3 {
