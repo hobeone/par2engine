@@ -414,16 +414,7 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 		d.logger.InfoContext(ctx, fmt.Sprintf("  %s (%d bytes)", fd.Filename, fd.ByteCount))
 	}
 
-	// ── Phase 2: list PAR2 archives with recovery block counts ───────────────
-	parityFiles := make([]string, 0, len(d.parityFileBlocks))
-	for name := range d.parityFileBlocks {
-		parityFiles = append(parityFiles, name)
-	}
-	slices.Sort(parityFiles)
-	d.logger.InfoContext(ctx, fmt.Sprintf("Found %d recovery archive(s):", len(parityFiles)))
-	for _, name := range parityFiles {
-		d.logger.InfoContext(ctx, fmt.Sprintf("  %s (%d recovery blocks)", name, d.parityFileBlocks[name]))
-	}
+
 
 	// ── Phase 3: list candidate files ────────────────────────────────────────
 	if len(d.candidateFiles) > 0 {
@@ -1700,7 +1691,6 @@ func (d *Decoder) loadVolumeFiles(ctx context.Context, indexFilename string) err
 }
 
 func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) error {
-	d.logger.InfoContext(ctx, "Loading recovery volume file", "file", filename)
 	f, err := d.root.Open(filename)
 	if err != nil {
 		return err
@@ -1766,6 +1756,11 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 			d.mu.Unlock()
 		}
 	}
+
+	d.mu.Lock()
+	blocks := d.parityFileBlocks[filename]
+	d.mu.Unlock()
+	d.logger.InfoContext(ctx, "Loaded recovery volume file", "file", filename, "recoveryBlocks", blocks)
 
 	return nil
 }
