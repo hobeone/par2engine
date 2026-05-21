@@ -105,7 +105,7 @@ type Decoder struct {
 	maxPacketSize int64
 	logger        *slog.Logger
 
-	root       *os.Root // sandboxed target folder directory root (Go 1.24+)
+	root *os.Root // sandboxed target folder directory root (Go 1.24+)
 
 	sliceByteCount int
 	recoverySetID  [16]byte
@@ -414,13 +414,11 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 		d.logger.InfoContext(ctx, fmt.Sprintf("  %s (%d bytes)", fd.Filename, fd.ByteCount))
 	}
 
-
-
 	// ── Phase 3: list candidate files ────────────────────────────────────────
 	if len(d.candidateFiles) > 0 {
 		d.logger.InfoContext(ctx, fmt.Sprintf("Candidate file(s) to consider (%d):", len(d.candidateFiles)))
 		for path := range d.candidateFiles {
-			d.logger.InfoContext(ctx, fmt.Sprintf("  %s", path))
+			d.logger.InfoContext(ctx, fmt.Sprintf("-  %s", path))
 		}
 	}
 
