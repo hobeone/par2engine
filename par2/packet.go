@@ -250,7 +250,7 @@ func ParseFileDescPacket(body []byte) (*FileDescPacket, error) {
 	}
 
 	if byteCount == 0 {
-		return nil, errors.New("empty files are skipped under PAR2 spec")
+		return nil, nil // 0-byte files have no blocks; skip per PAR2 spec
 	}
 
 	filename := DecodeNullPaddedASCIIString(filenameBytes)

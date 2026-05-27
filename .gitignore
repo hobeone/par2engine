@@ -3,6 +3,7 @@
 /gopar
 
 # Testing & Coverage
+tests/testdata/
 *.test
 *.out
 *.prof

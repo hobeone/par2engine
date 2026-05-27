@@ -296,6 +296,14 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 			if err != nil {
 				return err
 			}
+			if p == nil {
+				// 0-byte file: no blocks to verify or repair; skip per PAR2 spec.
+				if len(body) >= 56 {
+					d.logger.DebugContext(ctx, "skipping 0-byte file in PAR2 index",
+						"file", DecodeNullPaddedASCIIString(body[56:]))
+				}
+				break
+			}
 			d.protectedFiles = append(d.protectedFiles, *p)
 			d.logger.DebugContext(ctx, "PAR2 set contains protected file", "file", p.Filename, "size", p.ByteCount)
 
