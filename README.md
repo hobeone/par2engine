@@ -60,9 +60,50 @@ go build -o par2engine-cli ./cmd/gopar
 ```bash
 # Run all unit tests
 go test -v ./...
+```
 
-# Run GF(2^16) benchmarks
-go test -v -bench=. ./gf16/...
+### Benchmarking and Profiling
+
+We have comprehensive benchmark suites covering every layer of the engine (Galois field math, Reed-Solomon coding, rolling window CRC32, and end-to-end verification scanning) using modern Go 1.24+ `b.Loop()` to ensure compiler optimizations do not skew results.
+
+```bash
+# Run all benchmarks across all packages
+go test -bench=. -benchmem ./...
+
+# Run benchmarks with statistical rigor (runs each benchmark 10 times)
+go test -bench=. -benchmem -count=10 ./... | tee bench_results.txt
+
+# Filter and run benchmarks for a specific package
+go test -bench=. -benchmem ./gf16/...
+go test -bench=. -benchmem ./rs/...
+go test -bench=. -benchmem ./par2/...
+```
+
+To statistically compare performance changes (e.g., old baseline vs. new optimization), use the standard Go tool `benchstat`:
+
+```bash
+# Install benchstat if not present
+go install golang.org/x/perf/cmd/benchstat@latest
+
+# Compare baseline and optimized results
+benchstat baseline_results.txt optimized_results.txt
+```
+
+You can generate CPU and memory profiles directly from benchmark runs to inspect bottlenecks or hot spots:
+
+```bash
+# 1. Generate CPU profile during Verification Scan benchmark
+go test -bench=BenchmarkVerifyScans -cpuprofile=cpu.prof ./par2
+
+# 2. Analyze CPU hot spots using pprof CLI
+go tool pprof cpu.prof
+# (pprof) top 20
+# (pprof) web
+
+# 3. Generate and analyze heap memory allocations
+go test -bench=BenchmarkVerifyScans -memprofile=mem.prof ./par2
+go tool pprof -alloc_objects mem.prof
+# (pprof) top 15
 ```
 
 ### Integration tests
