@@ -91,3 +91,73 @@ Matches `par2cmdline` standard:
 - `2`: Repair not possible / failed
 - `3`: Invalid arguments
 - `4`: Logic / runtime error
+
+---
+
+## Development Standards
+
+Any AI agent or developer working on this codebase **must** follow these mandates.
+
+### Tooling Setup
+
+```bash
+# Install goimports if not present
+go install golang.org/x/tools/cmd/goimports@latest
+
+# Install golangci-lint if not present (see https://golangci-lint.run/welcome/install/)
+```
+
+### Per-File Workflow (after every .go file edit)
+
+```bash
+goimports -w <file>   # format + resolve imports
+go fix ./...          # adopt new language features automatically
+go build ./...        # verify it compiles
+```
+
+### Quality Gate (before every commit)
+
+```bash
+goimports -w .
+go fix ./...
+go vet ./...
+go test -race ./...
+golangci-lint run ./...
+```
+
+All five must pass. Do not commit with failing tests, vet errors, or lint warnings.
+
+### Coding Standards
+
+- **Idioms:** "Accept interfaces, return structs." Define interfaces at the consumer side.
+- **Context:** Every blocking or cancellable operation **must** accept `context.Context` as the first parameter.
+- **Errors:** Wrap with `fmt.Errorf("component: ...: %w", err)`. Never use `%v` for errors that will be inspected.
+- **No hacks:** No `init()` for setup. No `panic` for control flow. No `time.Sleep` in tests — use channels or `sync.WaitGroup`.
+- **Standard library first:** Prefer `slices`, `maps`, `errors.Is/As`, `min`/`max` builtins over custom helpers or reflection.
+
+### Concurrency & Locking
+
+- **Never hold a mutex during I/O.** Snapshot under the lock, release, then do I/O.
+- **Always `defer mu.Unlock()`.** Only exception: intentional snapshot-then-release, marked with `// --- no lock held below this line ---`.
+- **Every `select` must watch `ctx.Done()`.** Goroutines blocked without a context escape route leak forever.
+- **Use `sync.Once` or `CompareAndSwap` for idempotent shutdown.** Prevents double-close panics.
+
+### Commit Convention
+
+All commits must follow [Conventional Commits 1.0.0](https://www.conventionalcommits.org/):
+
+```
+<type>[optional scope]: <description>
+```
+
+| Type | When to use |
+|------|-------------|
+| `feat` | New user-visible capability |
+| `fix` | Bug patch |
+| `perf` | Performance improvement with benchmark evidence |
+| `refactor` | Code restructuring, no behavior change |
+| `test` | Adding or improving tests |
+| `docs` | Documentation only |
+| `chore` | Build, CI, dependency updates |
+
+Append `!` or add `BREAKING CHANGE:` footer for any public API or wire-format change.
