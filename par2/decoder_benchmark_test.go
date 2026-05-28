@@ -54,7 +54,7 @@ func BenchmarkVerifyScans(b *testing.B) {
 			}
 
 			ctx := context.Background()
-			
+
 			b.ResetTimer()
 			b.ReportAllocs()
 			b.SetBytes(int64(size))

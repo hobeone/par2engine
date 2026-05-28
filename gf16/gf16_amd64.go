@@ -15,14 +15,15 @@ import (
 // per instruction.
 //
 // Layout (128 bytes total, 16 bytes per field):
-//   [  0: 16] s0Low   — low  bytes of c * j          for j = 0..15
-//   [ 16: 32] s4Low   — low  bytes of c * (j << 4)   for j = 0..15
-//   [ 32: 48] s8Low   — low  bytes of c * (j << 8)   for j = 0..15
-//   [ 48: 64] s12Low  — low  bytes of c * (j << 12)  for j = 0..15
-//   [ 64: 80] s0High  — high bytes of c * j          for j = 0..15
-//   [ 80: 96] s4High  — high bytes of c * (j << 4)   for j = 0..15
-//   [ 96:112] s8High  — high bytes of c * (j << 8)   for j = 0..15
-//   [112:128] s12High — high bytes of c * (j << 12)  for j = 0..15
+//
+//	[  0: 16] s0Low   — low  bytes of c * j          for j = 0..15
+//	[ 16: 32] s4Low   — low  bytes of c * (j << 4)   for j = 0..15
+//	[ 32: 48] s8Low   — low  bytes of c * (j << 8)   for j = 0..15
+//	[ 48: 64] s12Low  — low  bytes of c * (j << 12)  for j = 0..15
+//	[ 64: 80] s0High  — high bytes of c * j          for j = 0..15
+//	[ 80: 96] s4High  — high bytes of c * (j << 4)   for j = 0..15
+//	[ 96:112] s8High  — high bytes of c * (j << 8)   for j = 0..15
+//	[112:128] s12High — high bytes of c * (j << 12)  for j = 0..15
 type mulTable64Entry struct {
 	s0Low, s4Low, s8Low, s12Low     [16]byte
 	s0High, s4High, s8High, s12High [16]byte

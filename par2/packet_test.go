@@ -40,7 +40,7 @@ func TestParseMainPacket(t *testing.T) {
 	// Valid Main Packet: slice size 2048, setCount 2, two sorted FileIDs
 	id1 := FileID{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
 	id2 := FileID{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
-	
+
 	body := make([]byte, 12+32)
 	binary.LittleEndian.PutUint64(body[0:8], 2048)
 	binary.LittleEndian.PutUint32(body[8:12], 2)
@@ -74,7 +74,7 @@ func TestParseFileDescPacket(t *testing.T) {
 	filenameBytes := append([]byte(filename), 0, 0, 0, 0)[:12] // null padded to multiple of 4
 	byteCount := uint64(1024)
 	hash16k := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	
+
 	fID := computeFileID(hash16k, byteCount, NullTerminate(filenameBytes))
 
 	body := make([]byte, 56+len(filenameBytes))

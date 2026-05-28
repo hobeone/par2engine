@@ -24,7 +24,7 @@ func BenchmarkCRC32Rolling(b *testing.B) {
 
 	for b.Loop() {
 		crc := currentCRC
-		for i := 0; i < 500; i++ {
+		for i := range 500 {
 			oldByte := data[i]
 			newByte := data[i+windowSize]
 			crc = w.update(crc, oldByte, newByte)
@@ -43,7 +43,7 @@ func BenchmarkCRC32FullIEEE(b *testing.B) {
 	b.ReportAllocs()
 
 	for b.Loop() {
-		for i := 0; i < 500; i++ {
+		for i := range 500 {
 			_ = crc32.ChecksumIEEE(data[i : i+windowSize])
 		}
 	}

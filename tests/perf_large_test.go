@@ -28,7 +28,7 @@ HOWTO Run Full Repair Profiling:
 
    export PAR2_PERF_DIR=$HOME/par2_perf_data
    export PAR2_PERF_WORKSPACE=$HOME/par2_perf_scratch
-   
+
    go build -o par2engine-cli ./cmd/gopar
    go test -tags=perf -v ./tests/... -run=TestPerfLarge -args -perf.cpuprofile=cpu_repair.prof
 */

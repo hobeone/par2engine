@@ -66,7 +66,7 @@ var integrationCases = map[string]integrationCase{
 			if err != nil {
 				t.Fatalf("create zero-byte file: %v", err)
 			}
-			f.Close()
+			_ = f.Close()
 			return nil
 		},
 		subcmd:   "verify",

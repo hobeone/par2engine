@@ -207,4 +207,3 @@ func TestRSInputValidation(t *testing.T) {
 		}
 	})
 }
-

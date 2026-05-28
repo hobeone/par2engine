@@ -20,10 +20,6 @@ import (
 	"github.com/hobeone/par2engine/rs"
 )
 
-type md5Closer interface {
-	Close()
-}
-
 type scanProgress struct {
 	scannedBytes int64
 	totalBytes   int64

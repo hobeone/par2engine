@@ -1,17 +1,13 @@
 # .golangci.yml
+version: "2"
+
 linters:
   enable:
-    - goimports
     - govet
     - staticcheck
     - errcheck
-    - gosimple
     - ineffassign
     - unused
-
-linters-settings:
-  goimports:
-    local-prefixes: github.com/hobeone/par2engine
 
 issues:
   max-issues-per-linter: 0

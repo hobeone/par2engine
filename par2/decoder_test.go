@@ -588,4 +588,3 @@ func TestDecoderMaliciousIFSCPacket(t *testing.T) {
 		t.Fatalf("VerifyScans failed: %v", err)
 	}
 }
-

@@ -39,8 +39,8 @@ type Header struct {
 type FileID [16]byte
 
 // FileIDLess compares two FileIDs according to the PAR2 specification.
-// It performs a byte-by-byte comparison starting from the last byte (index 15) 
-// down to the first byte (index 0), as required by the spec's little-endian 
+// It performs a byte-by-byte comparison starting from the last byte (index 15)
+// down to the first byte (index 0), as required by the spec's little-endian
 // sorting requirement for FileIDs.
 func FileIDLess(id1, id2 FileID) bool {
 	for i := len(id1) - 1; i >= 0; i-- {

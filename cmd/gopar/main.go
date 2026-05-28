@@ -12,8 +12,9 @@ import (
 	"runtime/pprof"
 	"strings"
 
-	"github.com/hobeone/par2engine/par2"
 	"runtime/debug"
+
+	"github.com/hobeone/par2engine/par2"
 )
 
 // stringSliceFlag is a flag.Value that accumulates repeated -flag values.
