@@ -55,7 +55,10 @@ func TestMain(m *testing.M) {
 //  2. ../../par2cmdline/tests/ (sibling repo clone)
 //  3. Download from GitHub into tests/testdata/
 func resolveFixtures() (string, error) {
-	localDir := "testdata"
+	localDir, err := filepath.Abs("testdata")
+	if err != nil {
+		return "", err
+	}
 	if archivesExist(localDir) {
 		fmt.Printf("integration: using cached fixtures from %s\n", localDir)
 		return localDir, nil
