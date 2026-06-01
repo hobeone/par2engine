@@ -236,23 +236,45 @@ func (d *Decoder) AddCandidateFile(path string) error {
 func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error {
 	d.logger.InfoContext(ctx, "Loading index PAR2 file", "file", indexFilename)
 
-	// Read file relative to sandbox root
-	f, err := d.root.Open(indexFilename)
+	err := d.streamPAR2Packets(ctx, indexFilename, func(h Header, body []byte) error {
+		return d.handlePacket(ctx, h, body, indexFilename)
+	})
 	if err != nil {
-		return fmt.Errorf("failed to open index par2 file: %w", err)
+		return err
+	}
+
+	// PAR2 spec strictly requires protected files to be sorted alphabetically by FileID
+	slices.SortFunc(d.protectedFiles, func(a, b FileDescPacket) int {
+		if FileIDLess(a.FileID, b.FileID) {
+			return -1
+		}
+		if FileIDLess(b.FileID, a.FileID) {
+			return 1
+		}
+		return 0
+	})
+
+	return nil
+}
+
+// streamPAR2Packets streams PAR2 packets from a file relative to sandbox root,
+// performing standard boundary validation, security checks, hash verification,
+// and recovery set ID alignment checks before invoking the handler.
+func (d *Decoder) streamPAR2Packets(ctx context.Context, filename string, handle func(h Header, body []byte) error) error {
+	f, err := d.root.Open(filename)
+	if err != nil {
+		return err
 	}
 	defer func() { _ = f.Close() }()
 
-	// Reject PAR2 files exceeding maximum allowed size to prevent memory exhaustion DoS.
 	stat, err := f.Stat()
 	if err != nil {
-		return fmt.Errorf("failed to stat index file: %w", err)
+		return fmt.Errorf("failed to stat file: %w", err)
 	}
 	if stat.Size() > d.maxFileSize {
-		return fmt.Errorf("index PAR2 file %s exceeds maximum allowed size (%d bytes > %d byte limit)", indexFilename, stat.Size(), d.maxFileSize)
+		return fmt.Errorf("file %s exceeds maximum allowed size (%d bytes > %d byte limit)", filename, stat.Size(), d.maxFileSize)
 	}
 
-	// Use a loop to stream packet parsing without loading the whole file into memory.
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -277,31 +299,22 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 		}
 
 		if ComputePacketHash(h.RecoverySetID, h.Type, body) != h.Hash {
-			return errors.New("corrupt index packet hash mismatch")
+			return errors.New("corrupt packet hash mismatch")
 		}
 
+		// If this is the very first packet of the index file, initialize recoverySetID.
+		// Otherwise, enforce alignment across all packets in all files.
 		if d.recoverySetID == [16]byte{} {
 			d.recoverySetID = h.RecoverySetID
-		} else if d.recoverySetID != h.RecoverySetID {
+		} else if h.RecoverySetID != d.recoverySetID {
 			d.logger.Warn("skipping packet with mismatching set ID")
 			continue
 		}
 
-		if err = d.handlePacket(ctx, h, body, indexFilename); err != nil {
+		if err = handle(h, body); err != nil {
 			return err
 		}
 	}
-
-	// PAR2 spec strictly requires protected files to be sorted alphabetically by FileID
-	slices.SortFunc(d.protectedFiles, func(a, b FileDescPacket) int {
-		if FileIDLess(a.FileID, b.FileID) {
-			return -1
-		}
-		if FileIDLess(b.FileID, a.FileID) {
-			return 1
-		}
-		return 0
-	})
 
 	return nil
 }
@@ -1834,55 +1847,7 @@ func (d *Decoder) loadVolumeFiles(ctx context.Context, indexFilename string) err
 }
 
 func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) error {
-	f, err := d.root.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-
-	// Reject volume files exceeding maximum allowed size to prevent memory exhaustion.
-	stat, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("failed to stat volume file: %w", err)
-	}
-	if stat.Size() > d.maxFileSize {
-		return fmt.Errorf("volume file %s exceeds maximum allowed size (%d bytes > %d byte limit)", filename, stat.Size(), d.maxFileSize)
-	}
-
-	// Use a buffered reader to stream packet parsing without loading the whole file into memory.
-	// This prevents OOM attacks from massive recovery volume files.
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
-		h, err := ReadHeader(f)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-
-		bodyLen := int64(h.Length - 64)
-		if bodyLen < 0 || bodyLen > d.maxPacketSize {
-			return errors.New("packet body exceeds safe engine limits")
-		}
-		body := make([]byte, bodyLen)
-		_, err = io.ReadFull(f, body)
-		if err != nil {
-			return err
-		}
-
-		if ComputePacketHash(h.RecoverySetID, h.Type, body) != h.Hash {
-			return errors.New("corrupt volume packet hash mismatch")
-		}
-
-		if h.RecoverySetID != d.recoverySetID {
-			d.logger.Warn("skipping volume packet with mismatching set ID")
-			continue
-		}
-
+	err := d.streamPAR2Packets(ctx, filename, func(h Header, body []byte) error {
 		switch h.Type {
 		case RecoveryPacketType:
 			p, err := ParseRecoveryPacket(body)
@@ -1898,6 +1863,10 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 			}
 			d.mu.Unlock()
 		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	d.mu.Lock()
