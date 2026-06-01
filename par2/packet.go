@@ -179,6 +179,21 @@ func computeFileID(sixteenKHash [16]byte, byteCount uint64, filenameBytes []byte
 	return result
 }
 
+func validateFileIDSorted(fileIDs []FileID) error {
+	if !slices.IsSortedFunc(fileIDs, func(a, b FileID) int {
+		if FileIDLess(a, b) {
+			return -1
+		}
+		if FileIDLess(b, a) {
+			return 1
+		}
+		return 0
+	}) {
+		return errors.New("recovery set file IDs are not sorted alphabetically")
+	}
+	return nil
+}
+
 // ParseMainPacket parses a Main Packet body.
 func ParseMainPacket(body []byte) (*mainPacket, error) {
 	if len(body) < 12 {
@@ -211,16 +226,8 @@ func ParseMainPacket(body []byte) (*mainPacket, error) {
 	nonRecoverySet := fileIDs[setCount:]
 
 	// Verify PAR2 spec sorted requirements
-	if !slices.IsSortedFunc(recoverySet, func(a, b FileID) int {
-		if FileIDLess(a, b) {
-			return -1
-		}
-		if FileIDLess(b, a) {
-			return 1
-		}
-		return 0
-	}) {
-		return nil, errors.New("recovery set file IDs are not sorted alphabetically")
+	if err := validateFileIDSorted(recoverySet); err != nil {
+		return nil, err
 	}
 
 	return &mainPacket{
