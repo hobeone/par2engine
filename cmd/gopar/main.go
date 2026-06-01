@@ -39,9 +39,20 @@ func main() {
 	os.Exit(runCLI())
 }
 
-func runCLI() int {
-	name := filepath.Base(os.Args[0])
+type cliOptions struct {
+	numThreads    int
+	memMB         int64
+	cpuProfile    string
+	memProfile    string
+	maxFileSizeMB int64
+	verbose       bool
+	versionFlag   bool
+	candidates    []string
+	cmd           string
+	par2Path      string
+}
 
+func parseCLIFlags(name string, args []string) (*cliOptions, int) {
 	flagSet := flag.NewFlagSet(name, flag.ContinueOnError)
 
 	var (
@@ -64,10 +75,9 @@ func runCLI() int {
 	flagSet.BoolVar(&versionFlag, "version", false, "print version information")
 	flagSet.Var(&candidates, "candidate", "extra file to scan as a shard source even if its name does not match\n\t(repeat for multiple files; path is relative to the PAR2 directory)")
 
-	// Parse flags
-	err := flagSet.Parse(os.Args[1:])
+	err := flagSet.Parse(args)
 	if err != nil {
-		return ExitInvalidCommandLineArguments
+		return nil, ExitInvalidCommandLineArguments
 	}
 
 	if versionFlag {
@@ -76,27 +86,81 @@ func runCLI() int {
 			v = info.Main.Version
 		}
 		fmt.Printf("%s version %s\n", name, v)
-		return ExitSuccess
+		return &cliOptions{versionFlag: true}, ExitSuccess
 	}
 
-	args := flagSet.Args()
-	if len(args) < 2 {
+	parsedArgs := flagSet.Args()
+	if len(parsedArgs) < 2 {
 		printUsage(name, flagSet)
-		return ExitInvalidCommandLineArguments
+		return nil, ExitInvalidCommandLineArguments
 	}
 
-	cmd := strings.ToLower(args[0])
-	par2Path := args[1]
+	cmd := strings.ToLower(parsedArgs[0])
+	par2Path := parsedArgs[1]
 
-	// Validate subcommand
 	if cmd != "v" && cmd != "verify" && cmd != "r" && cmd != "repair" {
 		fmt.Fprintf(os.Stderr, "Error: unknown command %q (choose 'verify' or 'repair')\n", cmd)
 		printUsage(name, flagSet)
-		return ExitInvalidCommandLineArguments
+		return nil, ExitInvalidCommandLineArguments
+	}
+
+	return &cliOptions{
+		numThreads:    numThreads,
+		memMB:         memMB,
+		cpuProfile:    cpuProfile,
+		memProfile:    memProfile,
+		maxFileSizeMB: maxFileSizeMB,
+		verbose:       verbose,
+		candidates:    candidates,
+		cmd:           cmd,
+		par2Path:      par2Path,
+	}, ExitSuccess
+}
+
+func setupLoggerAndContext(verbose bool) (*slog.Logger, context.Context, context.CancelFunc) {
+	logLevel := slog.LevelInfo
+	if verbose {
+		logLevel = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	return logger, ctx, stop
+}
+
+func runVerificationAndReport(ctx context.Context, d *par2.Decoder, verbose bool, logger *slog.Logger) (par2.ShardCounts, int) {
+	verifyProgressChan := make(chan par2.Progress, 100)
+	done := newProgressReporter("Verifying", verbose, logger, verifyProgressChan)
+
+	err := d.VerifyScans(ctx, verifyProgressChan)
+	close(verifyProgressChan)
+	<-done
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nError during verification scanning: %v\n", err)
+		return par2.ShardCounts{}, ExitLogicError
+	}
+
+	counts := d.ShardCounts()
+	logger.Info("Verification scanning complete",
+		"usableDataBlocks", counts.UsableDataShardCount,
+		"unusableDataBlocks", counts.UnusableDataShardCount,
+		"usableParityBlocks", counts.UsableParityShardCount)
+
+	return counts, ExitSuccess
+}
+
+func runCLI() int {
+	name := filepath.Base(os.Args[0])
+
+	opts, exitCode := parseCLIFlags(name, os.Args[1:])
+	if opts == nil {
+		return exitCode
+	}
+	if opts.versionFlag {
+		return ExitSuccess
 	}
 
 	// Profile setup
-	cleanup, err := setupProfiling(cpuProfile, memProfile)
+	cleanup, err := setupProfiling(opts.cpuProfile, opts.memProfile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return ExitLogicError
@@ -105,25 +169,16 @@ func runCLI() int {
 		defer cleanup()
 	}
 
-	// Setup Logger
-	logLevel := slog.LevelInfo
-	if verbose {
-		logLevel = slog.LevelDebug
-	}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
-
-	// Setup graceful cancellation on interrupt signal
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	logger, ctx, stop := setupLoggerAndContext(opts.verbose)
 	defer stop()
 
 	// Initialize Decoder
-	memLimitBytes := memMB * 1024 * 1024
-	maxFileLimitBytes := maxFileSizeMB * 1024 * 1024
-	// Allow packets to be up to 1.25x the file limit, or at least the default 128MB
+	memLimitBytes := opts.memMB * 1024 * 1024
+	maxFileLimitBytes := opts.maxFileSizeMB * 1024 * 1024
 	maxPacketLimitBytes := max(maxFileLimitBytes*5/4, 128*1024*1024)
 
-	d, err := par2.NewDecoder(ctx, par2Path, par2.DecoderOptions{
-		NumGoroutines: numThreads,
+	d, err := par2.NewDecoder(ctx, opts.par2Path, par2.DecoderOptions{
+		NumGoroutines: opts.numThreads,
 		MemoryLimit:   memLimitBytes,
 		MaxFileSize:   maxFileLimitBytes,
 		MaxPacketSize: maxPacketLimitBytes,
@@ -135,39 +190,24 @@ func runCLI() int {
 	}
 	defer func() { _ = d.Close() }()
 
-	if err := expandCandidates(d, par2Path, candidates, logger); err != nil {
+	if err := expandCandidates(d, opts.par2Path, opts.candidates, logger); err != nil {
 		fmt.Fprintf(os.Stderr, "Error processing candidate files: %v\n", err)
 		return ExitInvalidCommandLineArguments
 	}
 
-	// 1. Perform file integrity scans
-	verifyProgressChan := make(chan par2.Progress, 100)
-	done := newProgressReporter("Verifying", verbose, logger, verifyProgressChan)
-
-	err = d.VerifyScans(ctx, verifyProgressChan)
-	close(verifyProgressChan)
-	<-done
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "\nError during verification scanning: %v\n", err)
-		return ExitLogicError
+	counts, code := runVerificationAndReport(ctx, d, opts.verbose, logger)
+	if code != ExitSuccess {
+		return code
 	}
 
-	counts := d.ShardCounts()
-
-	logger.Info("Verification scanning complete",
-		"usableDataBlocks", counts.UsableDataShardCount,
-		"unusableDataBlocks", counts.UnusableDataShardCount,
-		"usableParityBlocks", counts.UsableParityShardCount)
-
 	// Dispatch subcommand
-	switch cmd {
+	switch opts.cmd {
 	case "v", "verify":
 		return handleVerifyCommand(logger, counts)
 	case "r", "repair":
-		return handleRepairCommand(ctx, d, logger, counts, verbose)
+		return handleRepairCommand(ctx, d, logger, counts, opts.verbose)
 	default:
-		logger.Error("Unknown command", "command", cmd)
-		printUsage(name, flagSet)
+		logger.Error("Unknown command", "command", opts.cmd)
 		return ExitInvalidCommandLineArguments
 	}
 }
