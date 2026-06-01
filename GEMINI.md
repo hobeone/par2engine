@@ -94,6 +94,27 @@ Matches `par2cmdline` standard:
 
 ---
 
+## 5. Codebase Intelligence & Repowise Tools
+
+This repository is optimized for codebase intelligence. When working inside this workspace with an agent equipped with a Repowise MCP server, leverage the following tools to assist in architecture discovery, search, risk analysis, and decision archaeology:
+
+- `get_answer(question)`: Synthesizes answers with verified citations from the codebase.
+- `get_context(targets)`: Triage cards for files, modules, or symbols (callers, callees, ownership).
+- `get_symbol(symbol_id)`: Retrieves the exact source code of a specific symbol.
+- `search_codebase(query)`: Performs semantic embedding/BM25 searches across the codebase.
+- `get_why(query, targets)`: Uncovers architectural decision records and archaeological rationale behind why code was written a certain way.
+- `get_risk(targets, changed_files)`: Conducts a historical risk assessment, identifying potential blast radius and missing co-changes.
+- `get_dead_code(...)`: Audits the codebase for unused exports or packages.
+
+### Codebase Hotspots
+
+Extra care, defensive design, and thorough E2E/integration testing are required when modifying high-churn codebase hotspots:
+- `par2/decoder.go`: Core decoding engine. Highest complexity and churn. Strictly adhere to sandboxing and path defanging requirements.
+- `cmd/gopar/main.go`: CLI parsing and orchestration.
+- `tests/integration_test.go` and `tests/perf_large_test.go`: End-to-end integration and scale suites.
+
+---
+
 ## Development Standards
 
 Any developer working on this codebase **must** follow these mandates.
