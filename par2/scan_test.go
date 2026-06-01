@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"errors"
 	"hash/crc32"
 	"log/slog"
 	"math/rand/v2"
@@ -12,6 +13,40 @@ import (
 	"path/filepath"
 	"testing"
 )
+
+// TestBlockScannerSetScanErr confirms first-write-wins: a second error must not
+// overwrite the original so the caller sees the root cause, not a later symptom.
+func TestBlockScannerSetScanErr(t *testing.T) {
+	s := &blockScanner{}
+	first := errors.New("root cause")
+	s.setScanErr(first)
+	s.setScanErr(errors.New("later symptom"))
+	if s.scanErr != first {
+		t.Errorf("expected first error to be preserved, got %v", s.scanErr)
+	}
+}
+
+// TestScanCandidateFileNotFound confirms that a missing candidate file is
+// silently skipped (ErrNotExist → log warning + return nil, not an error).
+func TestScanCandidateFileNotFound(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := &blockScanner{
+		d:           &Decoder{sliceByteCount: 8, logger: slog.Default(), root: root},
+		ctx:         context.Background(),
+		sem:         make(chan struct{}, 1),
+		lookupTable: newCRCLookupTable(nil),
+		matchChan:   make(chan matchEvent, 5),
+	}
+	defer func() { _ = root.Close() }()
+
+	if err := scanner.scanCandidateFile("no_such_file.dat", FileID{}); err != nil {
+		t.Errorf("expected nil for missing candidate, got %v", err)
+	}
+}
 
 func hasPar2Cmd() bool {
 	_, err := exec.LookPath("par2")
@@ -359,4 +394,266 @@ func TestDecoderMaliciousIFSCPacket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifyScans failed: %v", err)
 	}
+}
+
+// TestScanLastPartialBlock verifies that a file whose size is not a multiple of
+// sliceByteCount emits a match event for the zero-padded final block.
+func TestScanLastPartialBlock(t *testing.T) {
+	const sliceSize = 8
+	// 11 bytes: full shard at [0,8), partial shard at [8,11) padded to [8,16)
+	data := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+
+	tmp, err := os.CreateTemp(t.TempDir(), "partial")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tmp.Close() }()
+	if _, err := tmp.Write(data); err != nil {
+		t.Fatal(err)
+	}
+
+	paddedBlock := make([]byte, sliceSize)
+	copy(paddedBlock, data[8:]) // 3 real bytes + 5 zero bytes
+	crcVal := crc32.ChecksumIEEE(paddedBlock)
+	md5Val := md5.Sum(paddedBlock)
+
+	var fid FileID
+	scanner := &blockScanner{
+		d:           &Decoder{sliceByteCount: sliceSize, logger: slog.Default()},
+		lookupTable: newCRCLookupTable(map[uint32][]checksumLocation{
+			crcVal: {{fileID: fid, shardIndex: 1, md5Hash: md5Val}},
+		}),
+		matchChan: make(chan matchEvent, 5),
+	}
+
+	if err := scanner.scanLastPartialBlock(tmp, fid, int64(len(data))); err != nil {
+		t.Fatalf("scanLastPartialBlock: %v", err)
+	}
+	close(scanner.matchChan)
+
+	var got []matchEvent
+	for ev := range scanner.matchChan {
+		got = append(got, ev)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 match event, got %d", len(got))
+	}
+	if got[0].shardIndex != 1 || got[0].offset != 8 {
+		t.Errorf("match: shardIndex=%d offset=%d, want shardIndex=1 offset=8", got[0].shardIndex, got[0].offset)
+	}
+}
+
+// TestScanLastPartialBlockAligned confirms no I/O occurs when the file size is
+// exactly divisible by sliceByteCount (no partial block to check).
+func TestScanLastPartialBlockAligned(t *testing.T) {
+	scanner := &blockScanner{
+		d:           &Decoder{sliceByteCount: 8, logger: slog.Default()},
+		lookupTable: newCRCLookupTable(nil),
+		matchChan:   make(chan matchEvent, 5),
+	}
+	// Passing nil for f is safe: the early-return triggers before any read.
+	if err := scanner.scanLastPartialBlock(nil, FileID{}, 16); err != nil {
+		t.Fatalf("expected no-op for aligned file, got: %v", err)
+	}
+	close(scanner.matchChan)
+	if len(scanner.matchChan) != 0 {
+		t.Error("expected no match events for exactly aligned file size")
+	}
+}
+
+// TestScanCandidateFile confirms that scanCandidateFile emits a match event
+// for a shard found in a registered candidate file (no par2 binary required).
+func TestScanCandidateFile(t *testing.T) {
+	const sliceSize = 8
+	data := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "candidate.dat"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+
+	shard0 := data[:sliceSize]
+	crc0 := crc32.ChecksumIEEE(shard0)
+	md5of0 := md5.Sum(shard0)
+
+	var targetFileID, candidateID FileID
+	targetFileID[0] = 0x01
+	candidateID[0] = 0x02
+
+	window, err := newCRC32Window(sliceSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := &blockScanner{
+		d:   &Decoder{sliceByteCount: sliceSize, logger: slog.Default(), root: root},
+		ctx: context.Background(),
+		window:      window,
+		sem:         make(chan struct{}, 4),
+		lookupTable: newCRCLookupTable(map[uint32][]checksumLocation{
+			crc0: {{fileID: targetFileID, shardIndex: 0, md5Hash: md5of0}},
+		}),
+		matchChan: make(chan matchEvent, 10),
+	}
+
+	if err := scanner.scanCandidateFile("candidate.dat", candidateID); err != nil {
+		t.Fatalf("scanCandidateFile: %v", err)
+	}
+	close(scanner.matchChan)
+
+	var found bool
+	for ev := range scanner.matchChan {
+		if ev.shardIndex == 0 && ev.offset == 0 && ev.sourceFileID == candidateID {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected shard 0 at offset 0 from candidateID — not found")
+	}
+}
+
+// TestVerifySingleFileHash covers the three code paths in verifySingleFileHash:
+// correct hash → Verified=true, wrong hash → HashMismatch=true, file missing → Missing=true.
+//
+// Note: this path is defensive. In normal flow the prescan catches healthy files
+// and corrupt files fail isAllShardsConsecutive, so the integration suite rarely
+// exercises this function.
+func TestVerifySingleFileHash(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte("test content for hash verification")
+	const fname = "hashtest.dat"
+	if err := os.WriteFile(filepath.Join(dir, fname), content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &Decoder{root: root, logger: slog.Default()}
+	defer func() { _ = d.Close() }()
+
+	actualMD5 := md5.Sum(content)
+
+	t.Run("correct_hash_sets_verified", func(t *testing.T) {
+		state := &fileIntegrityState{}
+		d.verifySingleFileHash(context.Background(), FileDescPacket{Filename: fname, Hash: actualMD5}, state)
+		if !state.Verified {
+			t.Error("expected Verified=true for correct hash")
+		}
+		if state.HashMismatch {
+			t.Error("expected HashMismatch=false for correct hash")
+		}
+	})
+
+	t.Run("wrong_hash_sets_hash_mismatch", func(t *testing.T) {
+		state := &fileIntegrityState{}
+		d.verifySingleFileHash(context.Background(), FileDescPacket{Filename: fname, Hash: [16]byte{0xFF}}, state)
+		if !state.HashMismatch {
+			t.Error("expected HashMismatch=true for wrong hash")
+		}
+		if state.Verified {
+			t.Error("expected Verified=false for wrong hash")
+		}
+	})
+
+	t.Run("missing_file_sets_missing", func(t *testing.T) {
+		state := &fileIntegrityState{}
+		d.verifySingleFileHash(context.Background(), FileDescPacket{Filename: "no_such_file.dat", Hash: actualMD5}, state)
+		if !state.Missing {
+			t.Error("expected Missing=true for inaccessible file")
+		}
+	})
+}
+
+// TestDetectRenameCandidate covers the failure paths and happy path of
+// detectRenameCandidate. Must be called with d.mu held; the helper wrapper
+// below enforces this uniformly so the lock/unlock pairs balance on every path.
+func TestDetectRenameCandidate(t *testing.T) {
+	dir := t.TempDir()
+	content := []byte("rename candidate file content")
+	const candidateName = "candidate.dat"
+	if err := os.WriteFile(filepath.Join(dir, candidateName), content, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var targetFileID, candidateID FileID
+	targetFileID[0] = 0x01
+	candidateID[0] = 0x02
+
+	contentMD5 := md5.Sum(content)
+	const sliceSize = len("rename candidate file content") // single shard
+
+	newDecoder := func() *Decoder {
+		return &Decoder{
+			root:           root,
+			logger:         slog.Default(),
+			sliceByteCount: sliceSize,
+			candidateFiles: map[string]FileID{candidateName: candidateID},
+			candidateByID:  map[FileID]string{candidateID: candidateName},
+		}
+	}
+	// call holds d.mu for the duration, balancing the internal Unlock/Lock on
+	// paths that reach I/O and the no-op balance on early-exit paths.
+	call := func(d *Decoder, fd FileDescPacket, state *fileIntegrityState) string {
+		d.mu.Lock()
+		result := d.detectRenameCandidate(context.Background(), fd, state)
+		d.mu.Unlock()
+		return result
+	}
+
+	t.Run("first_shard_missing_returns_empty", func(t *testing.T) {
+		state := &fileIntegrityState{ShardLocations: []shardLocation{{Offset: -1}}}
+		if got := call(newDecoder(), FileDescPacket{FileID: targetFileID, Filename: "target.dat"}, state); got != "" {
+			t.Errorf("want empty, got %q", got)
+		}
+	})
+
+	t.Run("shard_from_target_itself_returns_empty", func(t *testing.T) {
+		state := &fileIntegrityState{ShardLocations: []shardLocation{{FileID: targetFileID, Offset: 0}}}
+		if got := call(newDecoder(), FileDescPacket{FileID: targetFileID, Filename: "target.dat"}, state); got != "" {
+			t.Errorf("want empty, got %q", got)
+		}
+	})
+
+	t.Run("unknown_candidate_id_returns_empty", func(t *testing.T) {
+		var unknownID FileID
+		unknownID[0] = 0x99
+		state := &fileIntegrityState{ShardLocations: []shardLocation{{FileID: unknownID, Offset: 0}}}
+		if got := call(newDecoder(), FileDescPacket{FileID: targetFileID, Filename: "target.dat"}, state); got != "" {
+			t.Errorf("want empty, got %q", got)
+		}
+	})
+
+	t.Run("same_filename_as_candidate_returns_empty", func(t *testing.T) {
+		state := &fileIntegrityState{ShardLocations: []shardLocation{{FileID: candidateID, Offset: 0}}}
+		// fd.Filename == candidateName — same file, not a rename.
+		if got := call(newDecoder(), FileDescPacket{FileID: targetFileID, Filename: candidateName, Hash: contentMD5}, state); got != "" {
+			t.Errorf("want empty, got %q", got)
+		}
+	})
+
+	t.Run("md5_mismatch_returns_empty", func(t *testing.T) {
+		state := &fileIntegrityState{ShardLocations: []shardLocation{{FileID: candidateID, Offset: 0}}}
+		if got := call(newDecoder(), FileDescPacket{FileID: targetFileID, Filename: "target.dat", Hash: [16]byte{0xFF}}, state); got != "" {
+			t.Errorf("want empty, got %q", got)
+		}
+	})
+
+	t.Run("happy_path_returns_candidate_path", func(t *testing.T) {
+		state := &fileIntegrityState{ShardLocations: []shardLocation{{FileID: candidateID, Offset: 0}}}
+		if got := call(newDecoder(), FileDescPacket{FileID: targetFileID, Filename: "target.dat", Hash: contentMD5}, state); got != candidateName {
+			t.Errorf("want %q, got %q", candidateName, got)
+		}
+	})
 }

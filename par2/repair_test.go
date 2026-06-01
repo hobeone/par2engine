@@ -10,6 +10,69 @@ import (
 	"testing"
 )
 
+func TestValidateParityShards(t *testing.T) {
+	t.Run("valid_shards_no_error", func(t *testing.T) {
+		d := &Decoder{
+			sliceByteCount: 8,
+			parityShards:   map[uint16][]byte{0: make([]byte, 8), 1: make([]byte, 8)},
+		}
+		if err := d.validateParityShards(); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("short_shard_returns_error", func(t *testing.T) {
+		d := &Decoder{
+			sliceByteCount: 8,
+			parityShards:   map[uint16][]byte{0: make([]byte, 8), 1: make([]byte, 4)},
+		}
+		if err := d.validateParityShards(); err == nil {
+			t.Error("expected error for parity shard with wrong length, got nil")
+		}
+	})
+
+	t.Run("empty_map_no_error", func(t *testing.T) {
+		d := &Decoder{sliceByteCount: 8, parityShards: map[uint16][]byte{}}
+		if err := d.validateParityShards(); err != nil {
+			t.Errorf("unexpected error for empty shard map: %v", err)
+		}
+	})
+}
+
+func TestComputeChunkSize(t *testing.T) {
+	d := &Decoder{memoryLimit: 16 * 1024 * 1024, sliceByteCount: 4096}
+
+	t.Run("zero_denominator_returns_error", func(t *testing.T) {
+		if _, err := d.computeChunkSize(0, 0); err == nil {
+			t.Error("expected error for zero denominator, got nil")
+		}
+	})
+
+	t.Run("result_is_16_byte_aligned", func(t *testing.T) {
+		size, err := d.computeChunkSize(10, 2)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if size%16 != 0 {
+			t.Errorf("chunk size %d is not 16-byte aligned", size)
+		}
+		if size <= 0 {
+			t.Errorf("chunk size must be positive, got %d", size)
+		}
+	})
+
+	t.Run("result_capped_at_slice_byte_count", func(t *testing.T) {
+		huge := &Decoder{memoryLimit: 1 << 30, sliceByteCount: 4096}
+		size, err := huge.computeChunkSize(1, 0)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if size > int64(huge.sliceByteCount) {
+			t.Errorf("chunk size %d exceeds sliceByteCount %d", size, huge.sliceByteCount)
+		}
+	})
+}
+
 func hasPar2() (string, bool) {
 	path, err := exec.LookPath("par2")
 	if err != nil {
