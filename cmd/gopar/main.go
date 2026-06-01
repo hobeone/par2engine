@@ -95,35 +95,14 @@ func runCLI() int {
 		return ExitInvalidCommandLineArguments
 	}
 
-	// CPU Profiling setup
-	if cpuProfile != "" {
-		f, err := os.Create(cpuProfile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to create CPU profile file: %v\n", err)
-			return ExitLogicError
-		}
-		defer func() { _ = f.Close() }()
-		if err := pprof.StartCPUProfile(f); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to start CPU profiling: %v\n", err)
-			return ExitLogicError
-		}
-		defer pprof.StopCPUProfile()
+	// Profile setup
+	cleanup, err := setupProfiling(cpuProfile, memProfile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return ExitLogicError
 	}
-
-	// Memory Profiling setup
-	if memProfile != "" {
-		defer func() {
-			f, err := os.Create(memProfile)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: failed to create memory profile file: %v\n", err)
-				return
-			}
-			defer func() { _ = f.Close() }()
-			runtime.GC() // get up-to-date statistics
-			if err := pprof.WriteHeapProfile(f); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: failed to write memory profile: %v\n", err)
-			}
-		}()
+	if cleanup != nil {
+		defer cleanup()
 	}
 
 	// Setup Logger
@@ -156,58 +135,18 @@ func runCLI() int {
 	}
 	defer func() { _ = d.Close() }()
 
-	par2Dir := filepath.Dir(par2Path)
-	for _, c := range candidates {
-		if !strings.ContainsAny(c, "*?[") {
-			if err := d.AddCandidateFile(c); err != nil {
-				fmt.Fprintf(os.Stderr, "Error adding candidate file %q: %v\n", c, err)
-				return ExitInvalidCommandLineArguments
-			}
-			continue
-		}
-		matches, err := filepath.Glob(filepath.Join(par2Dir, c))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Invalid glob pattern %q: %v\n", c, err)
-			return ExitInvalidCommandLineArguments
-		}
-		if len(matches) == 0 {
-			logger.Warn("No files matched glob pattern", "pattern", c)
-			continue
-		}
-		for _, match := range matches {
-			rel, err := filepath.Rel(par2Dir, match)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error resolving path %q: %v\n", match, err)
-				return ExitInvalidCommandLineArguments
-			}
-			if err := d.AddCandidateFile(rel); err != nil {
-				fmt.Fprintf(os.Stderr, "Error adding candidate file %q: %v\n", rel, err)
-				return ExitInvalidCommandLineArguments
-			}
-		}
+	if err := expandCandidates(d, par2Path, candidates, logger); err != nil {
+		fmt.Fprintf(os.Stderr, "Error processing candidate files: %v\n", err)
+		return ExitInvalidCommandLineArguments
 	}
 
 	// 1. Perform file integrity scans
 	verifyProgressChan := make(chan par2.Progress, 100)
-	verifyDoneChan := make(chan struct{})
-	go func() {
-		for p := range verifyProgressChan {
-			if verbose {
-				logger.Debug("Verification progress", "percent", fmt.Sprintf("%.2f%%", p.Percent))
-			} else {
-				fmt.Printf("\rVerifying... %.1f%%", p.Percent)
-				_ = os.Stdout.Sync()
-			}
-		}
-		if !verbose {
-			fmt.Println()
-		}
-		close(verifyDoneChan)
-	}()
+	done := newProgressReporter("Verifying", verbose, logger, verifyProgressChan)
 
 	err = d.VerifyScans(ctx, verifyProgressChan)
 	close(verifyProgressChan)
-	<-verifyDoneChan
+	<-done
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\nError during verification scanning: %v\n", err)
 		return ExitLogicError
@@ -223,62 +162,150 @@ func runCLI() int {
 	// Dispatch subcommand
 	switch cmd {
 	case "v", "verify":
-		if !counts.RepairNeeded() {
-			logger.Info("All protected files are healthy and verified.")
-			return ExitSuccess
-		}
-		if counts.RepairPossible() {
-			logger.Warn("Repair is REQUIRED and POSSIBLE.", "missingBlocks", counts.UnusableDataShardCount, "availableParity", counts.UsableParityShardCount, "filesToRename", counts.RenamesNeeded)
-			return ExitRepairPossible
-		}
-		logger.Error("Repair is REQUIRED but NOT possible.", "missingBlocks", counts.UnusableDataShardCount, "availableParity", counts.UsableParityShardCount)
-		return ExitRepairNotPossible
-
+		return handleVerifyCommand(logger, counts)
 	case "r", "repair":
-		if !counts.RepairNeeded() {
-			logger.Info("No repair needed. All files are healthy.")
-			return ExitSuccess
-		}
-
-		if !counts.RepairPossible() {
-			logger.Error("Repair not possible.", "missingBlocks", counts.UnusableDataShardCount, "availableParity", counts.UsableParityShardCount)
-			return ExitRepairNotPossible
-		}
-
-		// Perform Repair
-		repairProgressChan := make(chan par2.Progress, 100)
-		repairDoneChan := make(chan struct{})
-		go func() {
-			for p := range repairProgressChan {
-				if verbose {
-					logger.Debug("Repair progress", "percent", fmt.Sprintf("%.2f%%", p.Percent))
-				} else {
-					fmt.Printf("\rRepairing... %.1f%%", p.Percent)
-					_ = os.Stdout.Sync()
-				}
-			}
-			if !verbose {
-				fmt.Println()
-			}
-			close(repairDoneChan)
-		}()
-
-		err = d.Repair(ctx, repairProgressChan)
-		close(repairProgressChan)
-		<-repairDoneChan
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "\nError during repair operation: %v\n", err)
-			return ExitRepairNotPossible
-		}
-
-		logger.Info("Repair operation completed successfully! All files verified.")
-		return ExitSuccess
-
+		return handleRepairCommand(ctx, d, logger, counts, verbose)
 	default:
 		logger.Error("Unknown command", "command", cmd)
 		printUsage(name, flagSet)
 		return ExitInvalidCommandLineArguments
 	}
+}
+
+// setupProfiling configures CPU and Memory profiling if requested, returning a cleanup closure.
+func setupProfiling(cpuProfile, memProfile string) (cleanup func(), err error) {
+	var cpuFile *os.File
+	if cpuProfile != "" {
+		cpuFile, err = os.Create(cpuProfile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create CPU profile file: %w", err)
+		}
+		if err = pprof.StartCPUProfile(cpuFile); err != nil {
+			_ = cpuFile.Close()
+			return nil, fmt.Errorf("failed to start CPU profiling: %w", err)
+		}
+	}
+
+	cleanup = func() {
+		if cpuFile != nil {
+			pprof.StopCPUProfile()
+			_ = cpuFile.Close()
+		}
+		if memProfile != "" {
+			f, err := os.Create(memProfile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: failed to create memory profile file: %v\n", err)
+				return
+			}
+			defer func() { _ = f.Close() }()
+			runtime.GC() // get up-to-date statistics
+			if err := pprof.WriteHeapProfile(f); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: failed to write memory profile: %v\n", err)
+			}
+		}
+	}
+
+	return cleanup, nil
+}
+
+// newProgressReporter starts a background reporter goroutine printing throttled label percentages.
+func newProgressReporter(label string, verbose bool, logger *slog.Logger, ch <-chan par2.Progress) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		for p := range ch {
+			if verbose {
+				logger.Debug(label+" progress", "percent", fmt.Sprintf("%.2f%%", p.Percent))
+			} else {
+				fmt.Printf("\r%s... %.1f%%", label, p.Percent)
+				_ = os.Stdout.Sync()
+			}
+		}
+		if !verbose {
+			fmt.Println()
+		}
+		close(done)
+	}()
+	return done
+}
+
+// expandCandidates resolves candidate glob strings and registers the files as engine input source candidates.
+func expandCandidates(d *par2.Decoder, par2Path string, candidates []string, logger *slog.Logger) error {
+	par2Dir := filepath.Dir(par2Path)
+	for _, c := range candidates {
+		if !strings.ContainsAny(c, "*?[") {
+			if err := d.AddCandidateFile(c); err != nil {
+				return fmt.Errorf("error adding candidate file %q: %w", c, err)
+			}
+			continue
+		}
+		matches, err := filepath.Glob(filepath.Join(par2Dir, c))
+		if err != nil {
+			return fmt.Errorf("invalid glob pattern %q: %w", c, err)
+		}
+		if len(matches) == 0 {
+			logger.Warn("No files matched glob pattern", "pattern", c)
+			continue
+		}
+		for _, match := range matches {
+			rel, err := filepath.Rel(par2Dir, match)
+			if err != nil {
+				return fmt.Errorf("error resolving path %q: %w", match, err)
+			}
+			if err := d.AddCandidateFile(rel); err != nil {
+				return fmt.Errorf("error adding candidate file %q: %w", rel, err)
+			}
+		}
+	}
+	return nil
+}
+
+// handleVerifyCommand evaluates shard integrity counts and returns the correct verify CLI exit code.
+func handleVerifyCommand(logger *slog.Logger, counts par2.ShardCounts) int {
+	if !counts.RepairNeeded() {
+		logger.Info("All protected files are healthy and verified.")
+		return ExitSuccess
+	}
+	if counts.RepairPossible() {
+		logger.Warn("Repair is REQUIRED and POSSIBLE.",
+			"missingBlocks", counts.UnusableDataShardCount,
+			"availableParity", counts.UsableParityShardCount,
+			"filesToRename", counts.RenamesNeeded)
+		return ExitRepairPossible
+	}
+	logger.Error("Repair is REQUIRED but NOT possible.",
+		"missingBlocks", counts.UnusableDataShardCount,
+		"availableParity", counts.UsableParityShardCount)
+	return ExitRepairNotPossible
+}
+
+// handleRepairCommand triggers decoder repair and returns the correct repair CLI exit code.
+func handleRepairCommand(ctx context.Context, d *par2.Decoder, logger *slog.Logger, counts par2.ShardCounts, verbose bool) int {
+	if !counts.RepairNeeded() {
+		logger.Info("No repair needed. All files are healthy.")
+		return ExitSuccess
+	}
+
+	if !counts.RepairPossible() {
+		logger.Error("Repair not possible.",
+			"missingBlocks", counts.UnusableDataShardCount,
+			"availableParity", counts.UsableParityShardCount)
+		return ExitRepairNotPossible
+	}
+
+	repairProgressChan := make(chan par2.Progress, 100)
+	done := newProgressReporter("Repairing", verbose, logger, repairProgressChan)
+
+	err := d.Repair(ctx, repairProgressChan)
+	close(repairProgressChan)
+	<-done
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nError during repair operation: %v\n", err)
+		return ExitRepairNotPossible
+	}
+
+	logger.Info("Repair operation completed successfully! All files verified.")
+	return ExitSuccess
 }
 
 func printUsage(name string, fs *flag.FlagSet) {
