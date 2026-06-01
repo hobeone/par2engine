@@ -68,9 +68,10 @@ type Decoder struct {
 	parityShards   map[uint16][]byte // exponent -> parity bytes loaded from par2 files
 
 	fileIntegrity    map[FileID]*fileIntegrityState
-	candidateFiles   map[string]FileID // extra files to scan; path → synthetic FileID
-	parityFileBlocks map[string]int    // par2 filename → number of recovery blocks it contributes
-	mu               sync.Mutex        // protects shared state updates
+	candidateFiles   map[string]FileID  // extra files to scan; path → synthetic FileID
+	candidateByID    map[FileID]string  // reverse of candidateFiles: FileID → path
+	parityFileBlocks map[string]int     // par2 filename → number of recovery blocks it contributes
+	mu               sync.Mutex         // protects shared state updates
 }
 
 // DecoderOptions contains configuration for the PAR2 decoder.
@@ -171,11 +172,14 @@ func (d *Decoder) AddCandidateFile(path string) error {
 	defer d.mu.Unlock()
 	if d.candidateFiles == nil {
 		d.candidateFiles = make(map[string]FileID)
+		d.candidateByID = make(map[FileID]string)
 	}
 	if _, exists := d.candidateFiles[defanged]; !exists {
 		// Synthetic FileID: deterministic hash that won't collide with real PAR2
 		// FileIDs (which are MD5 of 16KHash ‖ byteCount ‖ filename).
-		d.candidateFiles[defanged] = FileID(md5.Sum([]byte("candidate:" + defanged)))
+		id := FileID(md5.Sum([]byte("candidate:" + defanged)))
+		d.candidateFiles[defanged] = id
+		d.candidateByID[id] = defanged
 	}
 	return nil
 }

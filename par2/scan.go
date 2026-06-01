@@ -301,7 +301,7 @@ func (s *blockScanner) scan() error {
 			continue
 		}
 		s.scanWg.Go(func() {
-			if err := s.d.scanFile(s.ctx, fDesc, s.window, s.sem, s.lookupTable, s.matchChan, s.progress); err != nil {
+			if err := s.scanFile(fDesc); err != nil {
 				s.d.logger.ErrorContext(s.ctx, "failed to scan file", "file", fDesc.Filename, "err", err)
 				s.setScanErr(err)
 			}
@@ -321,7 +321,7 @@ func (s *blockScanner) scan() error {
 			continue
 		}
 		s.scanWg.Go(func() {
-			if err := s.d.scanCandidateFile(s.ctx, path, fileID, s.window, s.sem, s.lookupTable, s.matchChan); err != nil {
+			if err := s.scanCandidateFile(path, fileID); err != nil {
 				s.d.logger.ErrorContext(s.ctx, "failed to scan candidate file", "path", path, "err", err)
 				s.setScanErr(err)
 			}
@@ -761,14 +761,8 @@ func (d *Decoder) detectRenameCandidate(ctx context.Context, fd FileDescPacket, 
 		return "" // shard is from the target file itself, not a candidate
 	}
 
-	// Look up the candidate path.
-	var candidatePath string
-	for path, id := range d.candidateFiles {
-		if id == candidateID {
-			candidatePath = path
-			break
-		}
-	}
+	// Look up the candidate path via the reverse index — O(1) instead of O(n).
+	candidatePath := d.candidateByID[candidateID]
 	if candidatePath == "" {
 		return "" // source isn't a registered candidate
 	}
@@ -870,13 +864,13 @@ func (d *Decoder) renameMisnamedFiles(ctx context.Context) int {
 // scanChunkSize is the unit of parallel I/O during the sliding-window scan.
 const scanChunkSize = 32 * 1024 * 1024
 
-func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32Window, sem chan struct{}, lookupTable *crcLookupTable, matchChan chan<- matchEvent, progress *scanProgress) error {
-	f, err := d.root.Open(fd.Filename)
+func (s *blockScanner) scanFile(fd FileDescPacket) error {
+	f, err := s.d.root.Open(fd.Filename)
 	if errors.Is(err, fs.ErrNotExist) {
 		// Phase 4 of VerifyScans already logged and set Missing — nothing to do here.
-		d.mu.Lock()
-		d.fileIntegrity[fd.FileID].Missing = true
-		d.mu.Unlock()
+		s.d.mu.Lock()
+		s.d.fileIntegrity[fd.FileID].Missing = true
+		s.d.mu.Unlock()
 		return nil
 	} else if err != nil {
 		return err
@@ -888,36 +882,35 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 		return err
 	}
 
-	d.mu.Lock()
-	state := d.fileIntegrity[fd.FileID]
+	s.d.mu.Lock()
+	state := s.d.fileIntegrity[fd.FileID]
 	if stat.Size() != int64(fd.ByteCount) {
-		d.logger.Warn("File size mismatch", "file", fd.Filename, "expected", fd.ByteCount, "actual", stat.Size())
+		s.d.logger.Warn("File size mismatch", "file", fd.Filename, "expected", fd.ByteCount, "actual", stat.Size())
 		state.SizeMismatch = true
 	}
-	d.mu.Unlock()
+	s.d.mu.Unlock()
 
 	fileSize := stat.Size()
 	if fileSize == 0 {
 		return nil
 	}
 
-	if err := d.scanFileChunks(ctx, f, fd.FileID, fd.Filename, window, sem, lookupTable, matchChan, fileSize, progress); err != nil {
+	if err := s.scanFileChunks(f, fd.FileID, fd.Filename, fileSize); err != nil {
 		return err
 	}
-	return d.scanLastPartialBlock(f, fd.FileID, int64(fd.ByteCount), lookupTable, matchChan)
+	return s.scanLastPartialBlock(f, fd.FileID, int64(fd.ByteCount))
 }
 
 // scanFileChunks divides f into scanChunkSize-aligned parallel chunks and runs
 // the sliding-window CRC scan on each. name is used only for error log messages.
-// progress may be nil (progress.add is nil-safe).
-func (d *Decoder) scanFileChunks(ctx context.Context, f *os.File, sourceFileID FileID, name string, window *crc32Window, sem chan struct{}, lookupTable *crcLookupTable, matchChan chan<- matchEvent, fileSize int64, progress *scanProgress) error {
+func (s *blockScanner) scanFileChunks(f *os.File, sourceFileID FileID, name string, fileSize int64) error {
 	var wg sync.WaitGroup
 	var chunkErr error
 	var chunkErrMu sync.Mutex
 
 	numChunks := (fileSize + scanChunkSize - 1) / scanChunkSize
 	for i := range numChunks {
-		if ctx.Err() != nil {
+		if s.ctx.Err() != nil {
 			break
 		}
 		wg.Add(1)
@@ -926,24 +919,24 @@ func (d *Decoder) scanFileChunks(ctx context.Context, f *os.File, sourceFileID F
 
 			// Throttle concurrency at the chunk level to respect memory limits.
 			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
+			case s.sem <- struct{}{}:
+			case <-s.ctx.Done():
 				return
 			}
-			defer func() { <-sem }()
+			defer func() { <-s.sem }()
 
 			start := chunkIdx * scanChunkSize
-			end := min(start+scanChunkSize+int64(d.sliceByteCount)-1, fileSize)
+			end := min(start+scanChunkSize+int64(s.d.sliceByteCount)-1, fileSize)
 
-			if err := d.scanChunk(ctx, f, sourceFileID, window, start, end, lookupTable, matchChan); err != nil {
-				d.logger.ErrorContext(ctx, "I/O error during chunk scan", "name", name, "offset", start, "err", err)
+			if err := s.scanChunk(f, sourceFileID, start, end); err != nil {
+				s.d.logger.ErrorContext(s.ctx, "I/O error during chunk scan", "name", name, "offset", start, "err", err)
 				chunkErrMu.Lock()
 				if chunkErr == nil {
 					chunkErr = err
 				}
 				chunkErrMu.Unlock()
 			} else {
-				progress.add(min(scanChunkSize, fileSize-start))
+				s.progress.add(min(scanChunkSize, fileSize-start))
 			}
 		}(i)
 	}
@@ -955,25 +948,25 @@ func (d *Decoder) scanFileChunks(ctx context.Context, f *os.File, sourceFileID F
 // scanLastPartialBlock checks the final block of a file when its size is not a
 // multiple of sliceByteCount. The block is zero-padded to sliceByteCount before
 // hashing, matching the PAR2 specification.
-func (d *Decoder) scanLastPartialBlock(f *os.File, sourceFileID FileID, byteCount int64, lookupTable *crcLookupTable, matchChan chan<- matchEvent) error {
-	if uint64(byteCount)%uint64(d.sliceByteCount) == 0 {
+func (s *blockScanner) scanLastPartialBlock(f *os.File, sourceFileID FileID, byteCount int64) error {
+	if uint64(byteCount)%uint64(s.d.sliceByteCount) == 0 {
 		return nil
 	}
-	shards := (uint64(byteCount) + uint64(d.sliceByteCount) - 1) / uint64(d.sliceByteCount)
-	lastBlockStart := int64((shards - 1) * uint64(d.sliceByteCount))
+	shards := (uint64(byteCount) + uint64(s.d.sliceByteCount) - 1) / uint64(s.d.sliceByteCount)
+	lastBlockStart := int64((shards - 1) * uint64(s.d.sliceByteCount))
 	lastBlockLen := byteCount - lastBlockStart
 
-	paddedBlock := make([]byte, d.sliceByteCount)
+	paddedBlock := make([]byte, s.d.sliceByteCount)
 	if _, err := f.ReadAt(paddedBlock[:lastBlockLen], lastBlockStart); err != nil && err != io.EOF {
 		return err
 	}
 
 	crcVal := crc32.ChecksumIEEE(paddedBlock)
-	if locations, found := lookupTable.Lookup(crcVal); found {
+	if locations, found := s.lookupTable.Lookup(crcVal); found {
 		blockHash := md5.Sum(paddedBlock)
 		for _, loc := range locations {
 			if loc.md5Hash == blockHash {
-				matchChan <- matchEvent{
+				s.matchChan <- matchEvent{
 					targetFileID: loc.fileID,
 					shardIndex:   loc.shardIndex,
 					sourceFileID: sourceFileID,
@@ -987,10 +980,10 @@ func (d *Decoder) scanLastPartialBlock(f *os.File, sourceFileID FileID, byteCoun
 
 // scanCandidateFile scans an extra file (registered via AddCandidateFile) for
 // shard matches against any protected file in the PAR2 set.
-func (d *Decoder) scanCandidateFile(ctx context.Context, path string, fileID FileID, window *crc32Window, sem chan struct{}, lookupTable *crcLookupTable, matchChan chan<- matchEvent) error {
-	f, err := d.root.Open(path)
+func (s *blockScanner) scanCandidateFile(path string, fileID FileID) error {
+	f, err := s.d.root.Open(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		d.logger.WarnContext(ctx, "candidate file not found, skipping", "path", path)
+		s.d.logger.WarnContext(s.ctx, "candidate file not found, skipping", "path", path)
 		return nil
 	} else if err != nil {
 		return err
@@ -1006,17 +999,17 @@ func (d *Decoder) scanCandidateFile(ctx context.Context, path string, fileID Fil
 		return nil
 	}
 
-	if err := d.scanFileChunks(ctx, f, fileID, path, window, sem, lookupTable, matchChan, fileSize, nil); err != nil {
+	if err := s.scanFileChunks(f, fileID, path, fileSize); err != nil {
 		return err
 	}
 	// Use the candidate file's actual size for partial-block detection, since we
 	// don't know a priori which protected file it corresponds to.
-	return d.scanLastPartialBlock(f, fileID, fileSize, lookupTable, matchChan)
+	return s.scanLastPartialBlock(f, fileID, fileSize)
 }
 
-func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID, window *crc32Window, start, end int64, lookupTable *crcLookupTable, matchChan chan<- matchEvent) error {
+func (s *blockScanner) scanChunk(f *os.File, sourceFileID FileID, start, end int64) error {
 	bufferSize := end - start
-	if bufferSize < int64(d.sliceByteCount) {
+	if bufferSize < int64(s.d.sliceByteCount) {
 		return nil
 	}
 	data := make([]byte, bufferSize)
@@ -1031,31 +1024,31 @@ func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID
 	var crcSlice uint32
 	justMissed := false
 
-	for j := 0; j <= len(data)-d.sliceByteCount; {
+	for j := 0; j <= len(data)-s.d.sliceByteCount; {
 		// Only check context cancellation once every 65,536 bytes to eliminate atomic lock overheads in tight loops
 		if j&0xFFFF == 0 {
-			if ctx.Err() != nil {
+			if s.ctx.Err() != nil {
 				return nil
 			}
 		}
 
-		slice := data[j : j+d.sliceByteCount]
+		slice := data[j : j+s.d.sliceByteCount]
 		if justMissed {
-			crcSlice = window.update(crcSlice, data[j-1], slice[len(slice)-1])
+			crcSlice = s.window.update(crcSlice, data[j-1], slice[len(slice)-1])
 		} else {
 			crcSlice = crc32.ChecksumIEEE(slice)
 		}
 
 		absPos := start + int64(j)
-		atShardBoundary := absPos%int64(d.sliceByteCount) == 0
+		atShardBoundary := absPos%int64(s.d.sliceByteCount) == 0
 
-		locations, found := lookupTable.Lookup(crcSlice)
+		locations, found := s.lookupTable.Lookup(crcSlice)
 		if !found {
 			if atShardBoundary {
-				d.logger.DebugContext(ctx, "Shard boundary CRC miss",
+				s.d.logger.DebugContext(s.ctx, "Shard boundary CRC miss",
 					"file", sourceFileID,
 					"absOffset", absPos,
-					"shardIdx", absPos/int64(d.sliceByteCount),
+					"shardIdx", absPos/int64(s.d.sliceByteCount),
 					"viaRolling", justMissed,
 					"crc", fmt.Sprintf("%08x", crcSlice))
 			}
@@ -1073,7 +1066,7 @@ func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID
 		for _, loc := range locations {
 			if loc.md5Hash == blockHash {
 				md5Matched = true
-				matchChan <- matchEvent{
+				s.matchChan <- matchEvent{
 					targetFileID: loc.fileID,
 					shardIndex:   loc.shardIndex,
 					sourceFileID: sourceFileID,
@@ -1084,17 +1077,17 @@ func (d *Decoder) scanChunk(ctx context.Context, f *os.File, sourceFileID FileID
 
 		if md5Matched {
 			// True shard match: advance past this block.
-			j += d.sliceByteCount
+			j += s.d.sliceByteCount
 			justMissed = false
 		} else {
 			// CRC collision with no MD5 confirmation — treat as a miss and slide
 			// one byte forward. Jumping by sliceByteCount here would skip past real
 			// shard boundaries that fall in the next sliceByteCount bytes.
 			if atShardBoundary {
-				d.logger.DebugContext(ctx, "Shard boundary CRC hit but MD5 mismatch",
+				s.d.logger.DebugContext(s.ctx, "Shard boundary CRC hit but MD5 mismatch",
 					"file", sourceFileID,
 					"absOffset", absPos,
-					"shardIdx", absPos/int64(d.sliceByteCount),
+					"shardIdx", absPos/int64(s.d.sliceByteCount),
 					"viaRolling", justMissed,
 					"crc", fmt.Sprintf("%08x", crcSlice))
 			}

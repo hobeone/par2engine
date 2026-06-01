@@ -79,16 +79,20 @@ func TestScanChunkCRCCollisionDoesNotSkipShard(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	d := &Decoder{sliceByteCount: sliceSize, logger: slog.Default()}
-
-	matchChan := make(chan matchEvent, 10)
-	if err := d.scanChunk(context.Background(), tmp, targetFileID, window, chunkStart, chunkEnd, lookupTable, matchChan); err != nil {
+	scanner := &blockScanner{
+		d:           &Decoder{sliceByteCount: sliceSize, logger: slog.Default()},
+		ctx:         context.Background(),
+		window:      window,
+		lookupTable: lookupTable,
+		matchChan:   make(chan matchEvent, 10),
+	}
+	if err := scanner.scanChunk(tmp, targetFileID, chunkStart, chunkEnd); err != nil {
 		t.Fatalf("scanChunk: %v", err)
 	}
-	close(matchChan)
+	close(scanner.matchChan)
 
 	var found bool
-	for ev := range matchChan {
+	for ev := range scanner.matchChan {
 		if ev.shardIndex == 1 && ev.offset == chunkStart+realJ {
 			found = true
 		}

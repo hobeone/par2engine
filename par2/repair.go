@@ -120,54 +120,86 @@ type repairPlan struct {
 
 // planRepair verifies state, computes alignments, maps files to sequential buffers, and determines chunk bounds.
 func (d *Decoder) planRepair(ctx context.Context, filesRenamed int) (*repairPlan, error) {
-	counts := d.ShardCounts()
-
-	// Validate that all parity shards have the correct length. A malicious PAR2
-	// file could contain a recovery packet whose data is shorter than sliceByteCount
-	// (while still passing the per-packet MD5 integrity check). Without this guard,
-	// the slice expression parityBytes[offset:offset+currChunkSize] would panic.
-	for exp, parityBytes := range d.parityShards {
-		if len(parityBytes) != d.sliceByteCount {
-			return nil, fmt.Errorf("recovery packet exponent %d has data length %d, expected sliceByteCount %d",
-				exp, len(parityBytes), d.sliceByteCount)
-		}
+	if err := d.validateParityShards(); err != nil {
+		return nil, err
 	}
 
-	// Total data shards in PAR2 set
+	counts := d.ShardCounts()
+
 	totalDataShards := 0
 	for _, f := range d.protectedFiles {
 		totalDataShards += len(d.fileIntegrity[f.FileID].ShardLocations)
 	}
 
-	// Calculate the maximum exponent to determine the Vandermonde row dimensions
 	maxExp := 0
 	for exp := range d.parityShards {
 		if int(exp) > maxExp {
 			maxExp = int(exp)
 		}
 	}
-	totalParityShards := maxExp + 1
 
-	// Establish safe streaming chunksize based on memory limit (default 16MB).
-	// memoryLimit = chunksize * (totalDataShards + usableParityUsed)
-	// chunksize must be a multiple of 16 bytes for Galois aligned performance.
-	denom := int64(totalDataShards + counts.UnusableDataShardCount)
-	if denom <= 0 {
-		return nil, errors.New("invalid shard configuration for repair")
+	chunkSize, err := d.computeChunkSize(totalDataShards, counts.UnusableDataShardCount)
+	if err != nil {
+		return nil, err
 	}
-	chunkSize := min(d.memoryLimit/denom, int64(d.sliceByteCount))
-	chunkSize = max((chunkSize/16)*16, 16)
-
 	d.logger.DebugContext(ctx, "Configured memory-limited streaming", "chunkSize", chunkSize, "sliceByteCount", d.sliceByteCount)
 
-	fileIDToFilename := make(map[FileID]string)
+	fileIDToFilename := d.buildFileIDToFilenameMap()
+
+	return &repairPlan{
+		counts:            counts,
+		totalDataShards:   totalDataShards,
+		totalParityShards: maxExp + 1,
+		chunkSize:         chunkSize,
+		numChunks:         (int64(d.sliceByteCount) + chunkSize - 1) / chunkSize,
+		flatLocs:          d.buildFlatLocs(fileIDToFilename, totalDataShards),
+		needsWrite:        d.buildNeedsWrite(),
+		filesRenamed:      filesRenamed,
+	}, nil
+}
+
+// validateParityShards guards against malicious PAR2 files whose recovery packets
+// have data shorter than sliceByteCount — which passes the per-packet MD5 check
+// but would panic in the chunk-offset slice expression during repair.
+func (d *Decoder) validateParityShards() error {
+	for exp, parityBytes := range d.parityShards {
+		if len(parityBytes) != d.sliceByteCount {
+			return fmt.Errorf("recovery packet exponent %d has data length %d, expected sliceByteCount %d",
+				exp, len(parityBytes), d.sliceByteCount)
+		}
+	}
+	return nil
+}
+
+// computeChunkSize returns a memory-bounded, 16-byte-aligned chunk size for streaming repair.
+// The formula caps chunk size so that total buffer usage stays within d.memoryLimit:
+//
+//	memoryLimit ≥ chunkSize × (totalDataShards + unusableDataShards)
+func (d *Decoder) computeChunkSize(totalDataShards, unusableDataShards int) (int64, error) {
+	denom := int64(totalDataShards + unusableDataShards)
+	if denom <= 0 {
+		return 0, errors.New("invalid shard configuration for repair")
+	}
+	chunkSize := min(d.memoryLimit/denom, int64(d.sliceByteCount))
+	return max((chunkSize/16)*16, 16), nil
+}
+
+// buildFileIDToFilenameMap returns a map from FileID to the on-disk filename,
+// covering both protected files and registered candidate files.
+func (d *Decoder) buildFileIDToFilenameMap() map[FileID]string {
+	m := make(map[FileID]string, len(d.protectedFiles)+len(d.candidateFiles))
 	for _, f := range d.protectedFiles {
-		fileIDToFilename[f.FileID] = f.Filename
+		m[f.FileID] = f.Filename
 	}
 	for path, id := range d.candidateFiles {
-		fileIDToFilename[id] = path
+		m[id] = path
 	}
+	return m
+}
 
+// buildFlatLocs flattens the per-file shard location map into a sequential slice
+// whose indices align with the Reed-Solomon data-shard matrix rows.
+func (d *Decoder) buildFlatLocs(fileIDToFilename map[FileID]string, totalDataShards int) []flattenedLocation {
 	flatLocs := make([]flattenedLocation, totalDataShards)
 	k := 0
 	for _, f := range d.protectedFiles {
@@ -188,8 +220,13 @@ func (d *Decoder) planRepair(ctx context.Context, filesRenamed int) (*repairPlan
 			k++
 		}
 	}
+	return flatLocs
+}
 
-	// Pre-determine which files need write access for repair
+// buildNeedsWrite returns the set of protected filenames that require write access
+// during repair — either because they are damaged, or because their shards were
+// found elsewhere (e.g., in a candidate file) and must be copied into place.
+func (d *Decoder) buildNeedsWrite() map[string]bool {
 	needsWrite := make(map[string]bool)
 	for _, f := range d.protectedFiles {
 		state := d.fileIntegrity[f.FileID]
@@ -205,19 +242,7 @@ func (d *Decoder) planRepair(ctx context.Context, filesRenamed int) (*repairPlan
 			}
 		}
 	}
-
-	numChunks := (int64(d.sliceByteCount) + chunkSize - 1) / chunkSize
-
-	return &repairPlan{
-		counts:            counts,
-		totalDataShards:   totalDataShards,
-		totalParityShards: totalParityShards,
-		chunkSize:         chunkSize,
-		numChunks:         numChunks,
-		flatLocs:          flatLocs,
-		needsWrite:        needsWrite,
-		filesRenamed:      filesRenamed,
-	}, nil
+	return needsWrite
 }
 
 // repairPipeline coordinates the reader, processor (Reed-Solomon), and writer loops for memory-bounded streaming.
