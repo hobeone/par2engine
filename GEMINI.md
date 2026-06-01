@@ -96,7 +96,7 @@ Matches `par2cmdline` standard:
 
 ## Development Standards
 
-Any AI agent or developer working on this codebase **must** follow these mandates.
+Any developer working on this codebase **must** follow these mandates.
 
 ### Tooling Setup
 
