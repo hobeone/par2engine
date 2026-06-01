@@ -148,10 +148,8 @@ func (m Matrix) addScaledRow(dest, src int, c gf16.T) {
 	gf16.MulAndAddByteSliceLE(c, castTToByteSlice(rowSrc), castTToByteSlice(rowDest))
 }
 
-// rowReduceForInverse performs Gaussian elimination on m (mutating it)
-// and performs the identical operations on n (mutating it).
-func (m Matrix) rowReduceForInverse(n Matrix) error {
-	// Convert to row echelon form
+// convertToRowEchelonForm converts m to row echelon form and performs the identical operations on n.
+func (m Matrix) convertToRowEchelonForm(n Matrix) error {
 	for i := 0; i < m.rows; i++ {
 		var pivot gf16.T
 		for j := i; j < m.rows; j++ {
@@ -179,8 +177,11 @@ func (m Matrix) rowReduceForInverse(n Matrix) error {
 			}
 		}
 	}
+	return nil
+}
 
-	// Convert to reduced row echelon form (zero out elements above pivot)
+// convertToReducedRowEchelonForm converts m to reduced row echelon form and performs the identical operations on n.
+func (m Matrix) convertToReducedRowEchelonForm(n Matrix) {
 	for i := 0; i < m.rows; i++ {
 		for j := 0; j < i; j++ {
 			t := m.At(j, i)
@@ -190,7 +191,15 @@ func (m Matrix) rowReduceForInverse(n Matrix) error {
 			}
 		}
 	}
+}
 
+// rowReduceForInverse performs Gaussian elimination on m (mutating it)
+// and performs the identical operations on n (mutating it).
+func (m Matrix) rowReduceForInverse(n Matrix) error {
+	if err := m.convertToRowEchelonForm(n); err != nil {
+		return err
+	}
+	m.convertToReducedRowEchelonForm(n)
 	return nil
 }
 
