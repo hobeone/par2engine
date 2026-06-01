@@ -22,3 +22,9 @@ go.work.sum
 *~
 *.swp
 .antigravitycli
+
+# repowise API keys (local)
+.repowise/
+.agents/
+.claude/
+.mcp.json

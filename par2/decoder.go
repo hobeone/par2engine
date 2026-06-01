@@ -48,14 +48,14 @@ type Progress struct {
 	Percent float64 // progress percentage
 }
 
-// ShardLocation describes the exact location of a matched shard block on disk.
-type ShardLocation struct {
+// shardLocation describes the exact location of a matched shard block on disk.
+type shardLocation struct {
 	FileID FileID // the FileID of the physical file on disk where the block was found
 	Offset int64  // byte offset in the file on disk. -1 if missing.
 }
 
-// FileIntegrityState tracks which blocks are healthy and where they are located on disk.
-type FileIntegrityState struct {
+// fileIntegrityState tracks which blocks are healthy and where they are located on disk.
+type fileIntegrityState struct {
 	FileID         FileID
 	Filename       string
 	Missing        bool
@@ -63,7 +63,7 @@ type FileIntegrityState struct {
 	HashMismatch   bool
 	Verified       bool            // true if full-file MD5 was already verified OK
 	RenameSource   string          // non-empty when a candidate file is a perfect content match under a different name
-	ShardLocations []ShardLocation // maps expected shardIndex -> where it is actually located
+	ShardLocations []shardLocation // maps expected shardIndex -> where it is actually located
 }
 
 // ShardCounts captures statistical shard availability status.
@@ -109,7 +109,7 @@ type Decoder struct {
 	fileChecksums  map[FileID]*IFSCPacket
 	parityShards   map[uint16][]byte // exponent -> parity bytes loaded from par2 files
 
-	fileIntegrity    map[FileID]*FileIntegrityState
+	fileIntegrity    map[FileID]*fileIntegrityState
 	candidateFiles   map[string]FileID // extra files to scan; path → synthetic FileID
 	parityFileBlocks map[string]int    // par2 filename → number of recovery blocks it contributes
 	mu               sync.Mutex        // protects shared state updates
@@ -177,7 +177,7 @@ func NewDecoder(ctx context.Context, par2Path string, opts DecoderOptions) (*Dec
 		root:             root,
 		fileChecksums:    make(map[FileID]*IFSCPacket),
 		parityShards:     make(map[uint16][]byte),
-		fileIntegrity:    make(map[FileID]*FileIntegrityState),
+		fileIntegrity:    make(map[FileID]*fileIntegrityState),
 		parityFileBlocks: make(map[string]int),
 	}
 
@@ -375,7 +375,7 @@ func (d *Decoder) initFileIntegrity() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.fileIntegrity = make(map[FileID]*FileIntegrityState)
+	d.fileIntegrity = make(map[FileID]*fileIntegrityState)
 	totalShards := 0
 	for _, f := range d.protectedFiles {
 		if d.sliceByteCount == 0 {
@@ -390,11 +390,11 @@ func (d *Decoder) initFileIntegrity() error {
 			return fmt.Errorf("invalid PAR2 set: total recovery block count (%d) exceeds specification limit (32768)", totalShards)
 		}
 
-		locs := make([]ShardLocation, shards)
+		locs := make([]shardLocation, shards)
 		for i := range locs {
-			locs[i] = ShardLocation{Offset: -1}
+			locs[i] = shardLocation{Offset: -1}
 		}
-		d.fileIntegrity[f.FileID] = &FileIntegrityState{
+		d.fileIntegrity[f.FileID] = &fileIntegrityState{
 			FileID:         f.FileID,
 			Filename:       f.Filename,
 			ShardLocations: locs,
@@ -531,7 +531,7 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 					"shardIdx", match.shardIndex,
 					"sourceFileID", fmt.Sprintf("%x", match.sourceFileID[:4]),
 					"offset", match.offset)
-				state.ShardLocations[match.shardIndex] = ShardLocation{
+				state.ShardLocations[match.shardIndex] = shardLocation{
 					FileID: match.sourceFileID,
 					Offset: match.offset,
 				}
@@ -887,7 +887,7 @@ func (d *Decoder) prescanCandidateMatches(ctx context.Context) map[string]bool {
 		state.RenameSource = candidatePath
 		state.Verified = true
 		for i := range state.ShardLocations {
-			state.ShardLocations[i] = ShardLocation{
+			state.ShardLocations[i] = shardLocation{
 				FileID: candidateID,
 				Offset: int64(i * d.sliceByteCount),
 			}
@@ -965,7 +965,7 @@ func (d *Decoder) prescanProtectedMatches(ctx context.Context) {
 		state.HashMismatch = false
 		state.Verified = true
 		for idx := range state.ShardLocations {
-			state.ShardLocations[idx] = ShardLocation{
+			state.ShardLocations[idx] = shardLocation{
 				FileID: fd.FileID,
 				Offset: int64(idx * d.sliceByteCount),
 			}
@@ -982,7 +982,7 @@ func (d *Decoder) prescanProtectedMatches(ctx context.Context) {
 // candidate path if it's a perfect match, or "" otherwise.
 //
 // Must be called while d.mu is held. Temporarily releases the lock for I/O.
-func (d *Decoder) detectRenameCandidate(ctx context.Context, fd FileDescPacket, state *FileIntegrityState) string {
+func (d *Decoder) detectRenameCandidate(ctx context.Context, fd FileDescPacket, state *fileIntegrityState) string {
 	if len(state.ShardLocations) == 0 {
 		return ""
 	}
@@ -1095,7 +1095,7 @@ func (d *Decoder) renameMisnamedFiles(ctx context.Context) int {
 		state.Missing = false
 		state.HashMismatch = false
 		for idx := range state.ShardLocations {
-			state.ShardLocations[idx] = ShardLocation{
+			state.ShardLocations[idx] = shardLocation{
 				FileID: fd.FileID,
 				Offset: int64(idx * d.sliceByteCount),
 			}
@@ -1755,4 +1755,3 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 
 	return nil
 }
-

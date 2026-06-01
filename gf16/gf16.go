@@ -12,9 +12,9 @@ const order = 1 << 16
 var logTable [order - 1]uint16
 var expTable [order - 1]T
 
-// MulTable is a 1KB lookup table for a specific coefficient,
+// mulTable is a 1KB lookup table for a specific coefficient,
 // allowing fast multiplication of 16-bit elements 8 bits at a time.
-type MulTable struct {
+type mulTable struct {
 	s0 [256]T
 	s8 [256]T
 }
@@ -50,8 +50,8 @@ func multByTwo(p uint16) uint16 {
 	return (p << 1) ^ (0x100b & uint16(-int16(p>>15)))
 }
 
-// CalcTable populates the 1KB MulTable for coefficient c on the fly.
-func CalcTable(c T, table *MulTable) {
+// calcTable populates the 1KB mulTable for coefficient c on the fly.
+func calcTable(c T, table *mulTable) {
 	coeff := uint16(c)
 	table.s0[0] = 0
 	for j := 1; j < 256; j <<= 1 {
@@ -70,10 +70,10 @@ func CalcTable(c T, table *MulTable) {
 }
 
 // mulScalarByteSliceLE sets each out[i] to c * in[i] using the 1KB stack-allocated
-// MulTable. This is the portable scalar path — zero heap allocation guaranteed.
+// mulTable. This is the portable scalar path — zero heap allocation guaranteed.
 func mulScalarByteSliceLE(c T, in, out []byte) {
-	var table MulTable
-	CalcTable(c, &table)
+	var table mulTable
+	calcTable(c, &table)
 
 	n := len(in)
 	i := 0
@@ -107,10 +107,10 @@ func mulScalarByteSliceLE(c T, in, out []byte) {
 }
 
 // mulAndAddScalarByteSliceLE adds (XORs) c * in[i] to each out[i] using the 1KB
-// stack-allocated MulTable. Zero heap allocation guaranteed.
+// stack-allocated mulTable. Zero heap allocation guaranteed.
 func mulAndAddScalarByteSliceLE(c T, in, out []byte) {
-	var table MulTable
-	CalcTable(c, &table)
+	var table mulTable
+	calcTable(c, &table)
 
 	n := len(in)
 	i := 0

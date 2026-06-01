@@ -53,8 +53,8 @@ func FileIDLess(id1, id2 FileID) bool {
 	return false
 }
 
-// MainPacket contains the recovery block size and lists of protected files.
-type MainPacket struct {
+// mainPacket contains the recovery block size and lists of protected files.
+type mainPacket struct {
 	SliceByteCount int
 	RecoverySet    []FileID
 	NonRecoverySet []FileID
@@ -81,8 +81,8 @@ type IFSCPacket struct {
 	ChecksumPairs []ChecksumPair
 }
 
-// RecoveryPacket contains a single Reed-Solomon parity block.
-type RecoveryPacket struct {
+// recoveryPacket contains a single Reed-Solomon parity block.
+type recoveryPacket struct {
 	Exponent uint16
 	Data     []byte
 }
@@ -180,7 +180,7 @@ func computeFileID(sixteenKHash [16]byte, byteCount uint64, filenameBytes []byte
 }
 
 // ParseMainPacket parses a Main Packet body.
-func ParseMainPacket(body []byte) (*MainPacket, error) {
+func ParseMainPacket(body []byte) (*mainPacket, error) {
 	if len(body) < 12 {
 		return nil, errors.New("main packet too short")
 	}
@@ -223,7 +223,7 @@ func ParseMainPacket(body []byte) (*MainPacket, error) {
 		return nil, errors.New("recovery set file IDs are not sorted alphabetically")
 	}
 
-	return &MainPacket{
+	return &mainPacket{
 		SliceByteCount: int(sliceSize),
 		RecoverySet:    recoverySet,
 		NonRecoverySet: nonRecoverySet,
@@ -300,7 +300,7 @@ func ParseIFSCPacket(body []byte) (*IFSCPacket, error) {
 }
 
 // ParseRecoveryPacket parses a Recovery Packet body.
-func ParseRecoveryPacket(body []byte) (*RecoveryPacket, error) {
+func ParseRecoveryPacket(body []byte) (*recoveryPacket, error) {
 	if len(body) < 4 || len(body)%4 != 0 {
 		return nil, errors.New("invalid recovery packet body alignment")
 	}
@@ -315,7 +315,7 @@ func ParseRecoveryPacket(body []byte) (*RecoveryPacket, error) {
 	dataCopy := make([]byte, len(body[4:]))
 	copy(dataCopy, body[4:])
 
-	return &RecoveryPacket{
+	return &recoveryPacket{
 		Exponent: uint16(exp),
 		Data:     dataCopy,
 	}, nil

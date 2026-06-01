@@ -72,27 +72,6 @@ func NewVandermondeMatrix(rows, cols int, generators []gf16.T) (Matrix, error) {
 	return Matrix{rows, cols, elements}, nil
 }
 
-// NewCauchyMatrix creates a Cauchy matrix where a[i, j] = 1 / (x[i] + y[j]).
-func NewCauchyMatrix(rows, cols int, x, y []gf16.T) (Matrix, error) {
-	if err := checkDims(rows, cols); err != nil {
-		return Matrix{}, err
-	}
-	if len(x) < rows || len(y) < cols {
-		return Matrix{}, errors.New("insufficient x or y elements for Cauchy matrix")
-	}
-	elements := make([]gf16.T, rows*cols)
-	for i := range rows {
-		for j := range cols {
-			sum := x[i] ^ y[j]
-			if sum == 0 {
-				return Matrix{}, errors.New("cauchy matrix division by zero")
-			}
-			elements[i*cols+j] = sum.Inverse()
-		}
-	}
-	return Matrix{rows, cols, elements}, nil
-}
-
 func (m Matrix) checkRow(i int) {
 	if i < 0 || i >= m.rows {
 		panic("row index out of bounds")

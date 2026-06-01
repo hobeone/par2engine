@@ -184,7 +184,7 @@ func TestDecoderSandboxing(t *testing.T) {
 		logger:        slog.Default(),
 		fileChecksums: make(map[FileID]*IFSCPacket),
 		parityShards:  make(map[uint16][]byte),
-		fileIntegrity: make(map[FileID]*FileIntegrityState),
+		fileIntegrity: make(map[FileID]*fileIntegrityState),
 	}
 
 	root, err := os.OpenRoot(dir)
@@ -543,7 +543,7 @@ func TestDecoderMaliciousIFSCPacket(t *testing.T) {
 		logger:        slog.Default(),
 		fileChecksums: make(map[FileID]*IFSCPacket),
 		parityShards:  make(map[uint16][]byte),
-		fileIntegrity: make(map[FileID]*FileIntegrityState),
+		fileIntegrity: make(map[FileID]*fileIntegrityState),
 	}
 
 	root, err := os.OpenRoot(dir)

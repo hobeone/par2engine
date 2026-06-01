@@ -55,8 +55,8 @@ func TestPow(t *testing.T) {
 
 func TestCalcTable(t *testing.T) {
 	for c := range order {
-		var table MulTable
-		CalcTable(T(c), &table)
+		var table mulTable
+		calcTable(T(c), &table)
 		for j := range 256 {
 			want0 := T(c).Times(T(j))
 			if table.s0[j] != want0 {
