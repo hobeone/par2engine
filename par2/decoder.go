@@ -649,86 +649,11 @@ func (s *blockScanner) scan() error {
 // Compute ShardCounts inline rather than calling d.ShardCounts() to avoid deadlock.
 func (d *Decoder) postScanVerify(ctx context.Context) {
 	d.logger.DebugContext(ctx, "Starting post-scan MD5 hash verification phase")
+
 	d.mu.Lock()
-	for _, fd := range d.protectedFiles {
-		state := d.fileIntegrity[fd.FileID]
-		if state.Verified {
-			continue
-		}
-		if state.SizeMismatch {
-			continue
-		}
-		if state.Missing {
-			// The file doesn't exist under its expected name, but a candidate
-			// may have all the blocks. Check for a rename match before giving up.
-			if rename := d.detectRenameCandidate(ctx, fd, state); rename != "" {
-				state.Missing = false
-				state.RenameSource = rename
-				d.logger.InfoContext(ctx, "File found under different name",
-					"expected", fd.Filename,
-					"found", rename)
-			}
-			continue
-		}
-		// Verify overall file hash if all shards are matched at expected consecutive offsets
-		allConsecutive := true
-		for idx, loc := range state.ShardLocations {
-			expected := int64(idx * d.sliceByteCount)
-			if loc.Offset != expected || loc.FileID != fd.FileID {
-				allConsecutive = false
-				d.logger.Debug("File requires partial reconstruction or reordering",
-					"file", fd.Filename,
-					"shardIdx", idx,
-					"expectedOffset", expected,
-					"actualOffset", loc.Offset)
-				break
-			}
-		}
+	d.verifyProtectedFilesHashes(ctx)
 
-		if allConsecutive {
-			// Standard full file MD5 check — unlock while doing I/O to avoid holding
-			// the mutex across potentially slow disk reads.
-			d.mu.Unlock()
-			d.logger.DebugContext(ctx, "Running MD5 hash check", "file", fd.Filename)
-			f, err := d.root.Open(fd.Filename)
-			if err != nil {
-				d.mu.Lock()
-				state.Missing = true
-				continue
-			}
-			hasher := md5.New()
-			_, copyErr := io.Copy(hasher, f)
-			_ = f.Close()
-			d.mu.Lock()
-			if copyErr != nil {
-				d.logger.WarnContext(ctx, "I/O error during MD5 verification", "file", fd.Filename, "err", copyErr)
-				state.HashMismatch = true
-				continue
-			}
-			var fileHash [16]byte
-			copy(fileHash[:], hasher.Sum(nil))
-			if fileHash != fd.Hash {
-				d.logger.WarnContext(ctx, "File hash verification FAILED",
-					"file", fd.Filename,
-					"expected", fmt.Sprintf("%x", fd.Hash),
-					"actual", fmt.Sprintf("%x", fileHash))
-				state.HashMismatch = true
-			} else {
-				d.logger.DebugContext(ctx, "File hash verified OK", "file", fd.Filename)
-			}
-		} else if rename := d.detectRenameCandidate(ctx, fd, state); rename != "" {
-			// All shards found in a single candidate file at consecutive offsets
-			// with a matching MD5 — this is just a misnamed file, not corruption.
-			state.RenameSource = rename
-			d.logger.InfoContext(ctx, "File found under different name",
-				"expected", fd.Filename,
-				"found", rename)
-		} else {
-			state.HashMismatch = true
-		}
-	}
-
-	// Compute counts while still holding the lock — calling d.ShardCounts() here
+	// Compute final shard tallies while still holding the lock — calling d.ShardCounts() here
 	// would deadlock because it also acquires d.mu.
 	usableData, unusableData, renamesNeeded := 0, 0, 0
 	for _, state := range d.fileIntegrity {
@@ -743,14 +668,119 @@ func (d *Decoder) postScanVerify(ctx context.Context) {
 			renamesNeeded++
 		}
 	}
+	d.mu.Unlock()
+
 	finalCounts := ShardCounts{
 		UsableDataShardCount:   usableData,
 		UnusableDataShardCount: unusableData,
 		UsableParityShardCount: len(d.parityShards),
 		RenamesNeeded:          renamesNeeded,
 	}
-	// Per-file status report (logged before releasing the lock so state is consistent).
+
+	d.logVerificationReport(ctx, finalCounts)
+}
+
+// verifyProtectedFilesHashes iterates over protected files and verifies their integrity.
+// Assumes d.mu is held.
+func (d *Decoder) verifyProtectedFilesHashes(ctx context.Context) {
+	for _, fd := range d.protectedFiles {
+		state := d.fileIntegrity[fd.FileID]
+		if state.Verified || state.SizeMismatch {
+			continue
+		}
+		if state.Missing {
+			// The file doesn't exist under its expected name, but a candidate
+			// may have all the blocks. Check for a rename match before giving up.
+			if rename := d.detectRenameCandidate(ctx, fd, state); rename != "" {
+				state.Missing = false
+				state.RenameSource = rename
+				d.logger.InfoContext(ctx, "File found under different name",
+					"expected", fd.Filename,
+					"found", rename)
+			}
+			continue
+		}
+
+		if d.isAllShardsConsecutive(fd, state) {
+			// Standard full file MD5 check — unlock while doing I/O to avoid holding
+			// the mutex across potentially slow disk reads.
+			d.mu.Unlock()
+			d.verifySingleFileHash(ctx, fd, state)
+			d.mu.Lock()
+		} else if rename := d.detectRenameCandidate(ctx, fd, state); rename != "" {
+			// All shards found in a single candidate file at consecutive offsets
+			// with a matching MD5 — this is just a misnamed file, not corruption.
+			state.RenameSource = rename
+			d.logger.InfoContext(ctx, "File found under different name",
+				"expected", fd.Filename,
+				"found", rename)
+		} else {
+			state.HashMismatch = true
+		}
+	}
+}
+
+// isAllShardsConsecutive checks if all shards of a protected file are located at their expected consecutive offsets.
+// Assumes d.mu is held.
+func (d *Decoder) isAllShardsConsecutive(fd FileDescPacket, state *fileIntegrityState) bool {
+	for idx, loc := range state.ShardLocations {
+		expected := int64(idx * d.sliceByteCount)
+		if loc.Offset != expected || loc.FileID != fd.FileID {
+			return false
+		}
+	}
+	return true
+}
+
+// verifySingleFileHash opens the file, computes its full MD5 checksum, and compares it against expected.
+// It assumes d.mu is NOT held when doing I/O.
+func (d *Decoder) verifySingleFileHash(ctx context.Context, fd FileDescPacket, state *fileIntegrityState) {
+	d.logger.DebugContext(ctx, "Running MD5 hash check", "file", fd.Filename)
+	f, err := d.root.Open(fd.Filename)
+	if err != nil {
+		d.mu.Lock()
+		state.Missing = true
+		d.mu.Unlock()
+		return
+	}
+	defer func() { _ = f.Close() }()
+
+	hasher := md5.New()
+	_, copyErr := io.Copy(hasher, f)
+	if copyErr != nil {
+		d.logger.WarnContext(ctx, "I/O error during MD5 verification", "file", fd.Filename, "err", copyErr)
+		d.mu.Lock()
+		state.HashMismatch = true
+		d.mu.Unlock()
+		return
+	}
+
+	var fileHash [16]byte
+	copy(fileHash[:], hasher.Sum(nil))
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if fileHash != fd.Hash {
+		d.logger.WarnContext(ctx, "File hash verification FAILED",
+			"file", fd.Filename,
+			"expected", fmt.Sprintf("%x", fd.Hash),
+			"actual", fmt.Sprintf("%x", fileHash))
+		state.HashMismatch = true
+	} else {
+		d.logger.DebugContext(ctx, "File hash verified OK", "file", fd.Filename)
+	}
+}
+
+// logVerificationReport logs the final per-file status and summary of verification.
+// Assumes d.mu is NOT held.
+func (d *Decoder) logVerificationReport(ctx context.Context, finalCounts ShardCounts) {
+	d.logger.DebugContext(ctx, "Post-scan complete",
+		"usableDataShards", finalCounts.UsableDataShardCount,
+		"unusableDataShards", finalCounts.UnusableDataShardCount,
+		"usableParityShards", finalCounts.UsableParityShardCount)
+
 	okCount, missingCount, damagedCount, renameCount := 0, 0, 0, 0
+	d.mu.Lock()
 	for _, fd := range d.protectedFiles {
 		state := d.fileIntegrity[fd.FileID]
 		switch {
@@ -790,11 +820,6 @@ func (d *Decoder) postScanVerify(ctx context.Context) {
 		}
 	}
 	d.mu.Unlock()
-
-	d.logger.DebugContext(ctx, "Post-scan complete",
-		"usableDataShards", finalCounts.UsableDataShardCount,
-		"unusableDataShards", finalCounts.UnusableDataShardCount,
-		"usableParityShards", finalCounts.UsableParityShardCount)
 
 	d.logger.InfoContext(ctx, "Verification summary",
 		"totalFiles", len(d.protectedFiles),
