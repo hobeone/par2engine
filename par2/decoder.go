@@ -159,13 +159,9 @@ func NewDecoder(ctx context.Context, par2Path string, opts DecoderOptions) (*Dec
 	dir := filepath.Dir(par2Path)
 	indexFilename := filepath.Base(par2Path)
 
-	absDir, err := filepath.EvalSymlinks(dir)
+	root, err := openSandbox(dir)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve canonical path: %w", err)
-	}
-	root, err := os.OpenRoot(absDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to sandbox target directory: %w", err)
+		return nil, err
 	}
 
 	d := &Decoder{
@@ -194,6 +190,19 @@ func NewDecoder(ctx context.Context, par2Path string, opts DecoderOptions) (*Dec
 	}
 
 	return d, nil
+}
+
+// openSandbox Canonicalizes and sandboxes a directory using os.OpenRoot.
+func openSandbox(dir string) (*os.Root, error) {
+	absDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve canonical path: %w", err)
+	}
+	root, err := os.OpenRoot(absDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sandbox target directory: %w", err)
+	}
+	return root, nil
 }
 
 func (d *Decoder) Close() error {
@@ -278,49 +287,8 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 			continue
 		}
 
-		switch h.Type {
-		case MainPacketType:
-			p, err := ParseMainPacket(body)
-			if err != nil {
-				return err
-			}
-			d.sliceByteCount = p.SliceByteCount
-			d.logger.DebugContext(ctx, "Parsed SliceByteCount", "size", p.SliceByteCount)
-
-		case FileDescPacketType:
-			p, err := ParseFileDescPacket(body)
-			if err != nil {
-				return err
-			}
-			if p == nil {
-				// 0-byte file: no blocks to verify or repair; skip per PAR2 spec.
-				if len(body) >= 56 {
-					d.logger.DebugContext(ctx, "skipping 0-byte file in PAR2 index",
-						"file", DecodeNullPaddedASCIIString(body[56:]))
-				}
-				break
-			}
-			d.protectedFiles = append(d.protectedFiles, *p)
-			d.logger.DebugContext(ctx, "PAR2 set contains protected file", "file", p.Filename, "size", p.ByteCount)
-
-		case IFSCPacketType:
-			p, err := ParseIFSCPacket(body)
-			if err != nil {
-				return err
-			}
-			d.fileChecksums[p.FileID] = p
-
-		case RecoveryPacketType:
-			p, err := ParseRecoveryPacket(body)
-			if err != nil {
-				return err
-			}
-			if _, exists := d.parityShards[p.Exponent]; exists {
-				d.logger.WarnContext(ctx, "duplicate recovery packet exponent, skipping", "exponent", p.Exponent)
-			} else {
-				d.parityShards[p.Exponent] = p.Data
-				d.parityFileBlocks[indexFilename]++
-			}
+		if err = d.handlePacket(ctx, h, body, indexFilename); err != nil {
+			return err
 		}
 	}
 
@@ -335,6 +303,55 @@ func (d *Decoder) loadIndexFile(ctx context.Context, indexFilename string) error
 		return 0
 	})
 
+	return nil
+}
+
+// handlePacket dispatches and decodes individual PAR2 packets of different types.
+func (d *Decoder) handlePacket(ctx context.Context, h Header, body []byte, filename string) error {
+	switch h.Type {
+	case MainPacketType:
+		p, err := ParseMainPacket(body)
+		if err != nil {
+			return err
+		}
+		d.sliceByteCount = p.SliceByteCount
+		d.logger.DebugContext(ctx, "Parsed SliceByteCount", "size", p.SliceByteCount)
+
+	case FileDescPacketType:
+		p, err := ParseFileDescPacket(body)
+		if err != nil {
+			return err
+		}
+		if p == nil {
+			// 0-byte file: no blocks to verify or repair; skip per PAR2 spec.
+			if len(body) >= 56 {
+				d.logger.DebugContext(ctx, "skipping 0-byte file in PAR2 index",
+					"file", DecodeNullPaddedASCIIString(body[56:]))
+			}
+			return nil
+		}
+		d.protectedFiles = append(d.protectedFiles, *p)
+		d.logger.DebugContext(ctx, "PAR2 set contains protected file", "file", p.Filename, "size", p.ByteCount)
+
+	case IFSCPacketType:
+		p, err := ParseIFSCPacket(body)
+		if err != nil {
+			return err
+		}
+		d.fileChecksums[p.FileID] = p
+
+	case RecoveryPacketType:
+		p, err := ParseRecoveryPacket(body)
+		if err != nil {
+			return err
+		}
+		if _, exists := d.parityShards[p.Exponent]; exists {
+			d.logger.WarnContext(ctx, "duplicate recovery packet exponent, skipping", "exponent", p.Exponent)
+		} else {
+			d.parityShards[p.Exponent] = p.Data
+			d.parityFileBlocks[filename]++
+		}
+	}
 	return nil
 }
 
