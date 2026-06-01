@@ -137,8 +137,8 @@ func makeReconstructionMatrix(dataShards int, availableRows, missingRows, usedPa
 		return Matrix{}, err
 	}
 	for i := range usedParityRows {
+		k := usedParityRows[i]
 		for j := range usedParityRows {
-			k := usedParityRows[i]
 			l := missingRows[j]
 			m.Set(i, j, parityMatrix.At(k, l))
 		}
@@ -149,16 +149,18 @@ func makeReconstructionMatrix(dataShards int, availableRows, missingRows, usedPa
 		return Matrix{}, err
 	}
 	for i := range usedParityRows {
-		for j := range dataShards {
-			if j < len(availableRows) {
-				k := usedParityRows[i]
-				l := availableRows[j]
-				n.Set(i, j, parityMatrix.At(k, l))
-			} else if i == j-len(availableRows) {
-				n.Set(i, j, 1)
-			} else {
-				n.Set(i, j, 0)
+		k := usedParityRows[i]
+		// Fill columns corresponding to available data shards
+		for j, l := range availableRows {
+			n.Set(i, j, parityMatrix.At(k, l))
+		}
+		// Fill columns corresponding to missing data shards with identity elements
+		for j := len(availableRows); j < dataShards; j++ {
+			var val gf16.T
+			if i == j-len(availableRows) {
+				val = 1
 			}
+			n.Set(i, j, val)
 		}
 	}
 
