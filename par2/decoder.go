@@ -598,7 +598,19 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 		return scanErr
 	}
 
-	// Post-scan global hash check
+	d.postScanVerify(ctx)
+	return ctx.Err()
+}
+
+// postScanVerify runs the post-scan MD5 hash verification phase: for each
+// protected file it checks whether the file hash is correct, detects rename
+// candidates, then logs per-file status and an overall verification summary.
+//
+// Lock discipline: acquires d.mu at entry, releases/re-acquires it for I/O,
+// and releases it on return. detectRenameCandidate must be called under the lock
+// (it drops/re-acquires internally for its own I/O).
+// Compute ShardCounts inline rather than calling d.ShardCounts() to avoid deadlock.
+func (d *Decoder) postScanVerify(ctx context.Context) {
 	d.logger.DebugContext(ctx, "Starting post-scan MD5 hash verification phase")
 	d.mu.Lock()
 	for _, fd := range d.protectedFiles {
@@ -747,7 +759,6 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 		"unusableDataShards", finalCounts.UnusableDataShardCount,
 		"usableParityShards", finalCounts.UsableParityShardCount)
 
-	// Verification summary.
 	d.logger.InfoContext(ctx, "Verification summary",
 		"totalFiles", len(d.protectedFiles),
 		"ok", okCount,
@@ -769,8 +780,34 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 	default:
 		d.logger.Info("All files verified OK.")
 	}
+}
 
-	return ctx.Err()
+// quickHashSize is the number of bytes hashed as the fast pre-filter in both prescan methods.
+const quickHashSize = 16 * 1024
+
+// quickHash16K reads up to the first 16 KB of f and returns the MD5 of those bytes.
+// Returns an error on I/O failures other than EOF.
+func quickHash16K(f *os.File, fileSize int64) ([16]byte, error) {
+	buf := make([]byte, min(quickHashSize, int(fileSize)))
+	n, err := f.ReadAt(buf, 0)
+	if err != nil && err != io.EOF {
+		return [16]byte{}, err
+	}
+	return md5.Sum(buf[:n]), nil
+}
+
+// computeFileMD5 seeks f to the beginning and returns the MD5 of the entire file.
+func computeFileMD5(f *os.File) ([16]byte, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return [16]byte{}, err
+	}
+	hasher := md5.New()
+	if _, err := io.Copy(hasher, f); err != nil {
+		return [16]byte{}, err
+	}
+	var h [16]byte
+	copy(h[:], hasher.Sum(nil))
+	return h, nil
 }
 
 // prescanCandidateMatches runs a full-file MD5 check on each candidate before
@@ -802,8 +839,6 @@ func (d *Decoder) prescanCandidateMatches(ctx context.Context) map[string]bool {
 		return resolved
 	}
 
-	const quickHashSize = 16 * 1024
-
 	for candidatePath, candidateID := range d.candidateFiles {
 		if ctx.Err() != nil {
 			break
@@ -823,10 +858,11 @@ func (d *Decoder) prescanCandidateMatches(ctx context.Context) map[string]bool {
 		}
 		fileSize := stat.Size()
 
-		// Quick filter: read first 16 KB and hash it.
-		quick := make([]byte, min(quickHashSize, int(fileSize)))
-		n, _ := f.ReadAt(quick, 0)
-		quickHash := md5.Sum(quick[:n])
+		quickHash, err := quickHash16K(f, fileSize)
+		if err != nil {
+			_ = f.Close()
+			continue
+		}
 
 		fd, ok := missingByQuickKey[quickKey{fileSize, quickHash}]
 		if !ok {
@@ -836,18 +872,11 @@ func (d *Decoder) prescanCandidateMatches(ctx context.Context) map[string]bool {
 
 		// 16 KB matched — compute full-file MD5 to confirm.
 		d.logger.InfoContext(ctx, "Pre-verifying candidate file...", "candidate", candidatePath, "matchedFile", fd.Filename, "size", fileSize)
-		hasher := md5.New()
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			_ = f.Close()
-			continue
-		}
-		_, copyErr := io.Copy(hasher, f)
+		fullHash, err := computeFileMD5(f)
 		_ = f.Close()
-		if copyErr != nil {
+		if err != nil {
 			continue
 		}
-		var fullHash [16]byte
-		copy(fullHash[:], hasher.Sum(nil))
 		if fullHash != fd.Hash {
 			continue
 		}
@@ -877,8 +906,6 @@ func (d *Decoder) prescanCandidateMatches(ctx context.Context) map[string]bool {
 // on disk by comparing their size, 16 KB hash, and full-file MD5.
 // If a file matches, it populates ShardLocations directly and skips the sliding-window scan.
 func (d *Decoder) prescanProtectedMatches(ctx context.Context) {
-	const quickHashSize = 16 * 1024
-
 	for i := range d.protectedFiles {
 		if ctx.Err() != nil {
 			break
@@ -909,15 +936,11 @@ func (d *Decoder) prescanProtectedMatches(ctx context.Context) {
 			continue
 		}
 
-		// Quick filter: read first 16 KB and hash it.
-		quick := make([]byte, min(quickHashSize, int(fileSize)))
-		n, err := f.ReadAt(quick, 0)
-		if err != nil && err != io.EOF {
+		quickHash, err := quickHash16K(f, fileSize)
+		if err != nil {
 			_ = f.Close()
 			continue
 		}
-		quickHash := md5.Sum(quick[:n])
-
 		if quickHash != fd.SixteenKHash {
 			_ = f.Close()
 			continue
@@ -925,18 +948,11 @@ func (d *Decoder) prescanProtectedMatches(ctx context.Context) {
 
 		// 16 KB matched — compute full-file MD5 to confirm.
 		d.logger.InfoContext(ctx, "Pre-verifying file...", "file", fd.Filename, "size", fileSize)
-		hasher := md5.New()
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			_ = f.Close()
-			continue
-		}
-		_, copyErr := io.Copy(hasher, f)
+		fullHash, err := computeFileMD5(f)
 		_ = f.Close()
-		if copyErr != nil {
+		if err != nil {
 			continue
 		}
-		var fullHash [16]byte
-		copy(fullHash[:], hasher.Sum(nil))
 		if fullHash != fd.Hash {
 			continue
 		}
@@ -1089,6 +1105,9 @@ func (d *Decoder) renameMisnamedFiles(ctx context.Context) int {
 	return renamed
 }
 
+// scanChunkSize is the unit of parallel I/O during the sliding-window scan.
+const scanChunkSize = 32 * 1024 * 1024
+
 func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32Window, sem chan struct{}, lookupTable *crcLookupTable, matchChan chan<- matchEvent, progress *scanProgress) error {
 	f, err := d.root.Open(fd.Filename)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -1120,9 +1139,17 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 		return nil
 	}
 
-	// Chunk size: 32MB for internal parallel scanning of single large file
-	const scanChunkSize = 32 * 1024 * 1024
-	var chunkWg sync.WaitGroup
+	if err := d.scanFileChunks(ctx, f, fd.FileID, fd.Filename, window, sem, lookupTable, matchChan, fileSize, progress); err != nil {
+		return err
+	}
+	return d.scanLastPartialBlock(f, fd.FileID, int64(fd.ByteCount), lookupTable, matchChan)
+}
+
+// scanFileChunks divides f into scanChunkSize-aligned parallel chunks and runs
+// the sliding-window CRC scan on each. name is used only for error log messages.
+// progress may be nil (progress.add is nil-safe).
+func (d *Decoder) scanFileChunks(ctx context.Context, f *os.File, sourceFileID FileID, name string, window *crc32Window, sem chan struct{}, lookupTable *crcLookupTable, matchChan chan<- matchEvent, fileSize int64, progress *scanProgress) error {
+	var wg sync.WaitGroup
 	var chunkErr error
 	var chunkErrMu sync.Mutex
 
@@ -1131,12 +1158,11 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 		if ctx.Err() != nil {
 			break
 		}
-
-		chunkWg.Add(1)
+		wg.Add(1)
 		go func(chunkIdx int64) {
-			defer chunkWg.Done()
+			defer wg.Done()
 
-			// Throttle concurrency at the chunk level to respect memory limits
+			// Throttle concurrency at the chunk level to respect memory limits.
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
@@ -1147,8 +1173,8 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 			start := chunkIdx * scanChunkSize
 			end := min(start+scanChunkSize+int64(d.sliceByteCount)-1, fileSize)
 
-			if err := d.scanChunk(ctx, f, fd.FileID, window, start, end, lookupTable, matchChan); err != nil {
-				d.logger.ErrorContext(ctx, "I/O error during chunk scan", "file", fd.Filename, "offset", start, "err", err)
+			if err := d.scanChunk(ctx, f, sourceFileID, window, start, end, lookupTable, matchChan); err != nil {
+				d.logger.ErrorContext(ctx, "I/O error during chunk scan", "name", name, "offset", start, "err", err)
 				chunkErrMu.Lock()
 				if chunkErr == nil {
 					chunkErr = err
@@ -1160,13 +1186,8 @@ func (d *Decoder) scanFile(ctx context.Context, fd FileDescPacket, window *crc32
 		}(i)
 	}
 
-	chunkWg.Wait()
-
-	if chunkErr != nil {
-		return chunkErr
-	}
-
-	return d.scanLastPartialBlock(f, fd.FileID, int64(fd.ByteCount), lookupTable, matchChan)
+	wg.Wait()
+	return chunkErr
 }
 
 // scanLastPartialBlock checks the final block of a file when its size is not a
@@ -1223,43 +1244,9 @@ func (d *Decoder) scanCandidateFile(ctx context.Context, path string, fileID Fil
 		return nil
 	}
 
-	const scanChunkSize = 32 * 1024 * 1024
-	var chunkWg sync.WaitGroup
-	var chunkErr error
-	var chunkErrMu sync.Mutex
-
-	numChunks := (fileSize + scanChunkSize - 1) / scanChunkSize
-	for i := range numChunks {
-		if ctx.Err() != nil {
-			break
-		}
-		chunkWg.Add(1)
-		go func(chunkIdx int64) {
-			defer chunkWg.Done()
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				return
-			}
-			defer func() { <-sem }()
-
-			start := chunkIdx * scanChunkSize
-			end := min(start+scanChunkSize+int64(d.sliceByteCount)-1, fileSize)
-			if err := d.scanChunk(ctx, f, fileID, window, start, end, lookupTable, matchChan); err != nil {
-				d.logger.ErrorContext(ctx, "I/O error during candidate file chunk scan", "path", path, "offset", start, "err", err)
-				chunkErrMu.Lock()
-				if chunkErr == nil {
-					chunkErr = err
-				}
-				chunkErrMu.Unlock()
-			}
-		}(i)
+	if err := d.scanFileChunks(ctx, f, fileID, path, window, sem, lookupTable, matchChan, fileSize, nil); err != nil {
+		return err
 	}
-	chunkWg.Wait()
-	if chunkErr != nil {
-		return chunkErr
-	}
-
 	// Use the candidate file's actual size for partial-block detection, since we
 	// don't know a priori which protected file it corresponds to.
 	return d.scanLastPartialBlock(f, fileID, fileSize, lookupTable, matchChan)
@@ -1769,56 +1756,3 @@ func (d *Decoder) loadSingleVolumeFile(ctx context.Context, filename string) err
 	return nil
 }
 
-type crcTableEntry struct {
-	crc   uint32
-	valid bool
-	locs  []checksumLocation
-}
-
-type crcLookupTable struct {
-	mask  uint32
-	table []crcTableEntry
-}
-
-func newCRCLookupTable(checksumMap map[uint32][]checksumLocation) *crcLookupTable {
-	numEntries := len(checksumMap)
-	size := 16
-	for size < numEntries*4 {
-		size *= 2
-	}
-
-	t := &crcLookupTable{
-		mask:  uint32(size - 1),
-		table: make([]crcTableEntry, size),
-	}
-
-	for crc, locs := range checksumMap {
-		idx := crc & t.mask
-		for {
-			if !t.table[idx].valid {
-				t.table[idx] = crcTableEntry{
-					crc:   crc,
-					valid: true,
-					locs:  locs,
-				}
-				break
-			}
-			idx = (idx + 1) & t.mask
-		}
-	}
-	return t
-}
-
-func (t *crcLookupTable) Lookup(crc uint32) ([]checksumLocation, bool) {
-	idx := crc & t.mask
-	for {
-		entry := &t.table[idx]
-		if !entry.valid {
-			return nil, false
-		}
-		if entry.crc == crc {
-			return entry.locs, true
-		}
-		idx = (idx + 1) & t.mask
-	}
-}
