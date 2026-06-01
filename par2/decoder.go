@@ -409,6 +409,49 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 		return err
 	}
 
+	d.logFilesAndCandidates(ctx)
+
+	if err := d.checkFileExistence(ctx); err != nil {
+		return err
+	}
+
+	resolvedCandidates := d.prescanCandidateMatches(ctx)
+	d.prescanProtectedMatches(ctx)
+
+	totalBytesToScan := d.calculateBytesToScan()
+	progress := d.initProgress(progressChan, totalBytesToScan)
+
+	window, err := newCRC32Window(d.sliceByteCount)
+	if err != nil {
+		return err
+	}
+
+	lookupTable, err := d.buildLookupTable(ctx)
+	if err != nil {
+		return err
+	}
+
+	scanner := &blockScanner{
+		d:                  d,
+		ctx:                ctx,
+		window:             window,
+		sem:                make(chan struct{}, d.numGoroutines),
+		lookupTable:        lookupTable,
+		matchChan:          make(chan matchEvent, 100),
+		progress:           progress,
+		resolvedCandidates: resolvedCandidates,
+	}
+
+	if err := scanner.scan(); err != nil {
+		return err
+	}
+
+	d.postScanVerify(ctx)
+	return ctx.Err()
+}
+
+// logFilesAndCandidates prints the log list of protected and candidate files.
+func (d *Decoder) logFilesAndCandidates(ctx context.Context) {
 	// ── Phase 1: list protected files sorted alphabetically ──────────────────
 	sorted := make([]FileDescPacket, len(d.protectedFiles))
 	copy(sorted, d.protectedFiles)
@@ -425,8 +468,10 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 			d.logger.InfoContext(ctx, fmt.Sprintf("-  %s", path))
 		}
 	}
+}
 
-	// ── Phase 4: quick existence check — log missing files up front ──────────
+// checkFileExistence verifies if each protected file exists, flagging them as missing if they do not.
+func (d *Decoder) checkFileExistence(ctx context.Context) error {
 	for _, fd := range d.protectedFiles {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -442,20 +487,11 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 		}
 		_ = f.Close()
 	}
+	return nil
+}
 
-	// ── Phase 5: pre-scan candidates for full content matches ────────────────
-	// For each candidate, compute a quick 16 KB hash then the full MD5. If it
-	// matches a missing protected file, populate ShardLocations directly and
-	// skip the expensive sliding-window block scan for that candidate.
-	resolvedCandidates := d.prescanCandidateMatches(ctx)
-
-	// ── Phase 5a: pre-scan protected files for perfect matches ───────────────
-	// Check if any protected files are already 100% healthy on disk to skip
-	// the sliding-window scan for them.
-	d.prescanProtectedMatches(ctx)
-
-	// ── Phase 6: build checksum map and run the block-level scan ─────────────
-	// Calculate total bytes to scan (only files not missing and not pre-verified)
+// calculateBytesToScan returns the total size in bytes of files that need block-level scanning.
+func (d *Decoder) calculateBytesToScan() int64 {
 	var totalBytesToScan int64
 	for _, fd := range d.protectedFiles {
 		d.mu.Lock()
@@ -467,27 +503,29 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 			totalBytesToScan += int64(fd.ByteCount)
 		}
 	}
+	return totalBytesToScan
+}
 
-	var progress *scanProgress
-	if progressChan != nil && totalBytesToScan > 0 {
-		progress = &scanProgress{
-			totalBytes:   totalBytesToScan,
-			progressChan: progressChan,
-		}
-		// Initial 0% progress update
-		progressChan <- Progress{
-			Phase:   "verifying",
-			Current: 0,
-			Total:   totalBytesToScan,
-			Percent: 0.0,
-		}
+// initProgress creates and initializes a progress reporting structure if needed.
+func (d *Decoder) initProgress(progressChan chan<- Progress, totalBytes int64) *scanProgress {
+	if progressChan == nil || totalBytes <= 0 {
+		return nil
 	}
-
-	window, err := newCRC32Window(d.sliceByteCount)
-	if err != nil {
-		return err
+	// Initial 0% progress update
+	progressChan <- Progress{
+		Phase:   "verifying",
+		Current: 0,
+		Total:   totalBytes,
+		Percent: 0.0,
 	}
+	return &scanProgress{
+		totalBytes:   totalBytes,
+		progressChan: progressChan,
+	}
+}
 
+// buildLookupTable constructs an open-addressing CRC lookup table from IFSC packets.
+func (d *Decoder) buildLookupTable(ctx context.Context) (*crcLookupTable, error) {
 	checksumMap := make(map[uint32][]checksumLocation)
 	for fID, ifsc := range d.fileChecksums {
 		// Security guard: ignore IFSC checksums for unknown FileIDs to prevent
@@ -505,28 +543,40 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 			})
 		}
 	}
-	lookupTable := newCRCLookupTable(checksumMap)
+	return newCRCLookupTable(checksumMap), nil
+}
 
-	matchChan := make(chan matchEvent, 100)
-	var scanWg sync.WaitGroup
+// blockScanner orchestrates block-level sliding window CRC & MD5 verification.
+type blockScanner struct {
+	d                  *Decoder
+	ctx                context.Context
+	window             *crc32Window
+	sem                chan struct{}
+	lookupTable        *crcLookupTable
+	matchChan          chan matchEvent
+	progress           *scanProgress
+	scanWg             sync.WaitGroup
+	scanErr            error
+	scanErrMu          sync.Mutex
+	resolvedCandidates map[string]bool
+}
 
-	var scanErr error
-	var scanErrMu sync.Mutex
-	setScanErr := func(err error) {
-		scanErrMu.Lock()
-		defer scanErrMu.Unlock()
-		if scanErr == nil {
-			scanErr = err
-		}
+func (s *blockScanner) setScanErr(err error) {
+	s.scanErrMu.Lock()
+	defer s.scanErrMu.Unlock()
+	if s.scanErr == nil {
+		s.scanErr = err
 	}
+}
 
+func (s *blockScanner) scan() error {
 	var collectorWg sync.WaitGroup
 	collectorWg.Go(func() {
-		for match := range matchChan {
-			d.mu.Lock()
-			state := d.fileIntegrity[match.targetFileID]
+		for match := range s.matchChan {
+			s.d.mu.Lock()
+			state := s.d.fileIntegrity[match.targetFileID]
 			if state.ShardLocations[match.shardIndex].Offset == -1 {
-				d.logger.Debug("Block match found",
+				s.d.logger.Debug("Block match found",
 					"targetFile", state.Filename,
 					"shardIdx", match.shardIndex,
 					"sourceFileID", fmt.Sprintf("%x", match.sourceFileID[:4]),
@@ -536,71 +586,58 @@ func (d *Decoder) VerifyScans(ctx context.Context, progressChan chan<- Progress)
 					Offset: match.offset,
 				}
 			}
-			d.mu.Unlock()
+			s.d.mu.Unlock()
 		}
 	})
 
-	sem := make(chan struct{}, d.numGoroutines)
-
 	// Scan protected files that exist on disk and are not already pre-verified.
-	for _, fDesc := range d.protectedFiles {
-		if ctx.Err() != nil {
+	for _, fDesc := range s.d.protectedFiles {
+		if s.ctx.Err() != nil {
 			break
 		}
-		d.mu.Lock()
-		state := d.fileIntegrity[fDesc.FileID]
+		s.d.mu.Lock()
+		state := s.d.fileIntegrity[fDesc.FileID]
 		missing := state.Missing
 		verified := state.Verified
-		d.mu.Unlock()
+		s.d.mu.Unlock()
 		if missing || verified {
 			continue
 		}
-		scanWg.Add(1)
-		go func(fd FileDescPacket) {
-			defer scanWg.Done()
-			if err := d.scanFile(ctx, fd, window, sem, lookupTable, matchChan, progress); err != nil {
-				d.logger.ErrorContext(ctx, "failed to scan file", "file", fd.Filename, "err", err)
-				setScanErr(err)
+		s.scanWg.Go(func() {
+			if err := s.d.scanFile(s.ctx, fDesc, s.window, s.sem, s.lookupTable, s.matchChan, s.progress); err != nil {
+				s.d.logger.ErrorContext(s.ctx, "failed to scan file", "file", fDesc.Filename, "err", err)
+				s.setScanErr(err)
 			}
-		}(fDesc)
+		})
 	}
 
 	// Scan candidate files not already resolved by the pre-scan phase.
-	// Also skip any candidate whose path matches a protected file: scanFile
-	// already covers that file, and running both concurrently causes a race
-	// where the collector may attribute blocks to the synthetic FileID.
-	protectedNames := make(map[string]bool, len(d.protectedFiles))
-	for _, fd := range d.protectedFiles {
+	protectedNames := make(map[string]bool, len(s.d.protectedFiles))
+	for _, fd := range s.d.protectedFiles {
 		protectedNames[fd.Filename] = true
 	}
-	for path, fileID := range d.candidateFiles {
-		if ctx.Err() != nil {
+	for path, fileID := range s.d.candidateFiles {
+		if s.ctx.Err() != nil {
 			break
 		}
-		if resolvedCandidates[path] || protectedNames[path] {
+		if s.resolvedCandidates[path] || protectedNames[path] {
 			continue
 		}
-		scanWg.Add(1)
-		go func(path string, fileID FileID) {
-			defer scanWg.Done()
-			if err := d.scanCandidateFile(ctx, path, fileID, window, sem, lookupTable, matchChan); err != nil {
-				d.logger.ErrorContext(ctx, "failed to scan candidate file", "path", path, "err", err)
-				setScanErr(err)
+		s.scanWg.Go(func() {
+			if err := s.d.scanCandidateFile(s.ctx, path, fileID, s.window, s.sem, s.lookupTable, s.matchChan); err != nil {
+				s.d.logger.ErrorContext(s.ctx, "failed to scan candidate file", "path", path, "err", err)
+				s.setScanErr(err)
 			}
-		}(path, fileID)
+		})
 	}
 
-	scanWg.Wait()
-	close(matchChan)
+	s.scanWg.Wait()
+	close(s.matchChan)
 	collectorWg.Wait()
 
-	if scanErr != nil {
-		return scanErr
-	}
-
-	d.postScanVerify(ctx)
-	return ctx.Err()
+	return s.scanErr
 }
+
 
 // postScanVerify runs the post-scan MD5 hash verification phase: for each
 // protected file it checks whether the file hash is correct, detects rename
