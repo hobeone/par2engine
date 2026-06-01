@@ -31,22 +31,28 @@ type Coder struct {
 	parityMatrix Matrix
 }
 
-var generators []gf16.T
+var (
+	generators []gf16.T
+	once       sync.Once
+)
 
-func init() {
-	// Generate PAR2 generator elements (primitive elements of order 65535).
-	// 65535 = 3 * 5 * 17 * 257. We check exponents relatively prime to 65535.
-	for i := range 1 << 16 {
-		if i%3 == 0 || i%5 == 0 || i%17 == 0 || i%257 == 0 {
-			continue
+func initGenerators() {
+	once.Do(func() {
+		// Generate PAR2 generator elements (primitive elements of order 65535).
+		// 65535 = 3 * 5 * 17 * 257. We check exponents relatively prime to 65535.
+		for i := range 1 << 16 {
+			if i%3 == 0 || i%5 == 0 || i%17 == 0 || i%257 == 0 {
+				continue
+			}
+			g := gf16.T(2).Pow(uint32(i))
+			generators = append(generators, g)
 		}
-		g := gf16.T(2).Pow(uint32(i))
-		generators = append(generators, g)
-	}
+	})
 }
 
 // NewCoderPAR2Vandermonde constructs a Coder using the standard PAR2 Vandermonde matrix.
 func NewCoderPAR2Vandermonde(dataShards, parityShards int) (*Coder, error) {
+	initGenerators()
 	if dataShards <= 0 || parityShards <= 0 {
 		return nil, errors.New("invalid shard counts")
 	}
@@ -201,44 +207,18 @@ func (c *Coder) Reconstruct(ctx context.Context, data, parity [][]byte, numGorou
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if len(data) != c.dataShards {
-		return ErrInvalidDataShardCount
-	}
-	if len(parity) > c.parityShards {
-		return ErrInvalidParityShardCount
-	}
 
-	sliceLen, err := validateShardLengths(data, parity)
+	sliceLen, err := c.validateReconstructInputs(data, parity)
 	if err != nil {
 		return err
 	}
 
-	var availableRows, missingRows []int
-	var input [][]byte
-	for i, dataShard := range data {
-		if dataShard != nil {
-			availableRows = append(availableRows, i)
-			input = append(input, dataShard)
-		} else {
-			missingRows = append(missingRows, i)
-		}
+	availableRows, missingRows, usedParityRows, input, err := c.analyzeShards(data, parity)
+	if err != nil {
+		return err
 	}
-
 	if len(missingRows) == 0 {
 		return nil // all data shards present
-	}
-
-	// Gather required parity shards
-	var usedParityRows []int
-	for i := 0; i < len(parity) && len(input) < c.dataShards; i++ {
-		if parity[i] != nil {
-			usedParityRows = append(usedParityRows, i)
-			input = append(input, parity[i])
-		}
-	}
-
-	if len(input) < c.dataShards {
-		return ErrNotEnoughParity
 	}
 
 	reconstructionMatrix, err := makeReconstructionMatrix(c.dataShards, availableRows, missingRows, usedParityRows, c.parityMatrix)
@@ -261,6 +241,47 @@ func (c *Coder) Reconstruct(ctx context.Context, data, parity [][]byte, numGorou
 	}
 
 	return nil
+}
+
+// validateReconstructInputs checks that lengths and elements are correct for reconstruction.
+func (c *Coder) validateReconstructInputs(data, parity [][]byte) (int, error) {
+	if len(data) != c.dataShards {
+		return 0, ErrInvalidDataShardCount
+	}
+	if len(parity) > c.parityShards {
+		return 0, ErrInvalidParityShardCount
+	}
+	return validateShardLengths(data, parity)
+}
+
+// analyzeShards identifies missing shards, active rows, and active parity columns.
+func (c *Coder) analyzeShards(data, parity [][]byte) (availableRows, missingRows, usedParityRows []int, input [][]byte, err error) {
+	for i, dataShard := range data {
+		if dataShard != nil {
+			availableRows = append(availableRows, i)
+			input = append(input, dataShard)
+		} else {
+			missingRows = append(missingRows, i)
+		}
+	}
+
+	if len(missingRows) == 0 {
+		return nil, nil, nil, nil, nil // all data shards present
+	}
+
+	// Gather required parity shards
+	for i := 0; i < len(parity) && len(input) < c.dataShards; i++ {
+		if parity[i] != nil {
+			usedParityRows = append(usedParityRows, i)
+			input = append(input, parity[i])
+		}
+	}
+
+	if len(input) < c.dataShards {
+		return nil, nil, nil, nil, ErrNotEnoughParity
+	}
+
+	return availableRows, missingRows, usedParityRows, input, nil
 }
 
 // GenerateParity generates parity shards for the given data shards.
