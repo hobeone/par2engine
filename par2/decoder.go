@@ -68,10 +68,10 @@ type Decoder struct {
 	parityShards   map[uint16][]byte // exponent -> parity bytes loaded from par2 files
 
 	fileIntegrity    map[FileID]*fileIntegrityState
-	candidateFiles   map[string]FileID  // extra files to scan; path → synthetic FileID
-	candidateByID    map[FileID]string  // reverse of candidateFiles: FileID → path
-	parityFileBlocks map[string]int     // par2 filename → number of recovery blocks it contributes
-	mu               sync.Mutex         // protects shared state updates
+	candidateFiles   map[string]FileID // extra files to scan; path → synthetic FileID
+	candidateByID    map[FileID]string // reverse of candidateFiles: FileID → path
+	parityFileBlocks map[string]int    // par2 filename → number of recovery blocks it contributes
+	mu               sync.Mutex        // protects shared state updates
 }
 
 // DecoderOptions contains configuration for the PAR2 decoder.

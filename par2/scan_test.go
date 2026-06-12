@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -337,6 +338,82 @@ func TestRenameMisnamedFile(t *testing.T) {
 	}
 }
 
+func TestRenameMisnamedFile_CreatesDirectory(t *testing.T) {
+	if !hasPar2Cmd() {
+		t.Skip("par2 binary not found in PATH")
+	}
+
+	dir := t.TempDir()
+	r := rand.New(rand.NewPCG(88, 88))
+	fileData := make([]byte, 1024)
+	for i := range fileData {
+		fileData[i] = byte(r.Uint32())
+	}
+
+	// We want target to be nested: nested/dir/correct.dat
+	nestedTarget := filepath.Join("nested", "dir", "correct.dat")
+	correctName := filepath.Join(dir, nestedTarget)
+
+	// Create the directory temporarily to write correctName, then we will recreate the archive
+	if err := os.MkdirAll(filepath.Dir(correctName), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(correctName, fileData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	par2Path := filepath.Join(dir, "set.par2")
+	// Run par2 c relative to dir
+	cmd := exec.Command("par2", "c", "-s1024", "-c1", par2Path, correctName)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("par2 create: %v\n%s", err, out)
+	}
+
+	// Now rename the source and remove the nested directory structure
+	wrongName := filepath.Join(dir, "wrong_name.dat")
+	if err := os.Rename(correctName, wrongName); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(dir, "nested")); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	d, err := NewDecoder(ctx, par2Path, DecoderOptions{Logger: slog.Default()})
+	if err != nil {
+		t.Fatalf("NewDecoder: %v", err)
+	}
+	defer func() { _ = d.Close() }()
+
+	if err := d.AddCandidateFile("wrong_name.dat"); err != nil {
+		t.Fatalf("AddCandidateFile: %v", err)
+	}
+
+	if err := d.VerifyScans(ctx, nil); err != nil {
+		t.Fatalf("VerifyScans: %v", err)
+	}
+
+	progressChan := make(chan Progress, 10)
+	go func() {
+		for range progressChan {
+		}
+	}()
+
+	if err := d.Repair(ctx, progressChan); err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+
+	// Check if nested/dir/correct.dat exists and has correct content
+	repaired, err := os.ReadFile(correctName)
+	if err != nil {
+		t.Fatalf("correctName should exist after rename: %v", err)
+	}
+	if !bytes.Equal(repaired, fileData) {
+		t.Fatal("repaired file content mismatch")
+	}
+}
+
 func TestDecoderMaliciousIFSCPacket(t *testing.T) {
 	dir := t.TempDir()
 	dummyFile := filepath.Join(dir, "dummy.dat")
@@ -419,7 +496,7 @@ func TestScanLastPartialBlock(t *testing.T) {
 
 	var fid FileID
 	scanner := &blockScanner{
-		d:           &Decoder{sliceByteCount: sliceSize, logger: slog.Default()},
+		d: &Decoder{sliceByteCount: sliceSize, logger: slog.Default()},
 		lookupTable: newCRCLookupTable(map[uint32][]checksumLocation{
 			crcVal: {{fileID: fid, shardIndex: 1, md5Hash: md5Val}},
 		}),
@@ -491,10 +568,10 @@ func TestScanCandidateFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	scanner := &blockScanner{
-		d:   &Decoder{sliceByteCount: sliceSize, logger: slog.Default(), root: root},
-		ctx: context.Background(),
-		window:      window,
-		sem:         make(chan struct{}, 4),
+		d:      &Decoder{sliceByteCount: sliceSize, logger: slog.Default(), root: root},
+		ctx:    context.Background(),
+		window: window,
+		sem:    make(chan struct{}, 4),
 		lookupTable: newCRCLookupTable(map[uint32][]checksumLocation{
 			crc0: {{fileID: targetFileID, shardIndex: 0, md5Hash: md5of0}},
 		}),
@@ -656,4 +733,175 @@ func TestDetectRenameCandidate(t *testing.T) {
 			t.Errorf("want %q, got %q", candidateName, got)
 		}
 	})
+}
+
+func TestVerificationReporting(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "ok.dat"), []byte("okfilecontent"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Decoder{
+		root:          root,
+		logger:        logger,
+		fileChecksums: make(map[FileID]*IFSCPacket),
+		parityShards:  make(map[uint16][]byte),
+		fileIntegrity: make(map[FileID]*fileIntegrityState),
+	}
+	defer func() { _ = d.Close() }()
+
+	idOK := FileID{0x01}
+	idMissing := FileID{0x02}
+	idMismatch := FileID{0x03}
+	idRename := FileID{0x04}
+	idDamaged := FileID{0x05}
+
+	d.protectedFiles = []FileDescPacket{
+		{FileID: idOK, Filename: "ok.dat", ByteCount: 13},
+		{FileID: idMissing, Filename: "missing.dat", ByteCount: 10},
+		{FileID: idMismatch, Filename: "mismatch.dat", ByteCount: 10},
+		{FileID: idRename, Filename: "rename_dest.dat", ByteCount: 10},
+		{FileID: idDamaged, Filename: "damaged.dat", ByteCount: 10},
+	}
+
+	d.fileIntegrity[idOK] = &fileIntegrityState{
+		ShardLocations: []shardLocation{{FileID: idOK, Offset: 0}},
+	}
+	d.fileIntegrity[idMissing] = &fileIntegrityState{
+		Missing:        true,
+		ShardLocations: []shardLocation{{FileID: idMissing, Offset: -1}},
+	}
+	d.fileIntegrity[idMismatch] = &fileIntegrityState{
+		SizeMismatch:   true,
+		ShardLocations: []shardLocation{{FileID: idMismatch, Offset: -1}},
+	}
+	d.fileIntegrity[idRename] = &fileIntegrityState{
+		RenameSource:   "rename_src.dat",
+		ShardLocations: []shardLocation{{FileID: idRename, Offset: -1}},
+	}
+	d.fileIntegrity[idDamaged] = &fileIntegrityState{
+		HashMismatch:   true,
+		ShardLocations: []shardLocation{{FileID: idDamaged, Offset: -1}},
+	}
+
+	d.logVerificationReport(context.Background(), ShardCounts{
+		UnusableDataShardCount: 2,
+		RenamesNeeded:          1,
+	})
+
+	logOutput := buf.String()
+	t.Log(logOutput)
+
+	expectedLogs := []string{
+		"File status: OK",
+		"File status: SIZE MISMATCH",
+		"File status: DAMAGED",
+		"File status: MISNAMED",
+		"Verification summary",
+		"totalFiles=5",
+		"ok=1",
+		"missing=1",
+		"damaged=2",
+		"misnamed=1",
+	}
+
+	for _, expected := range expectedLogs {
+		if !strings.Contains(logOutput, expected) {
+			t.Errorf("expected log output to contain %q", expected)
+		}
+	}
+}
+
+func TestRenameMisnamedFiles_ErrorPaths(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(dir, "subdir"), []byte("not a dir"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Decoder{
+		root:          root,
+		logger:        slog.Default(),
+		fileChecksums: make(map[FileID]*IFSCPacket),
+		parityShards:  make(map[uint16][]byte),
+		fileIntegrity: make(map[FileID]*fileIntegrityState),
+	}
+	defer func() { _ = d.Close() }()
+
+	idMkdirFail := FileID{0x01}
+	idRenameFail := FileID{0x02}
+
+	d.protectedFiles = []FileDescPacket{
+		{FileID: idMkdirFail, Filename: "subdir/dest.dat", ByteCount: 10},
+		{FileID: idRenameFail, Filename: "dest2.dat", ByteCount: 10},
+	}
+
+	d.fileIntegrity[idMkdirFail] = &fileIntegrityState{
+		RenameSource:   "source1.dat",
+		ShardLocations: []shardLocation{{Offset: -1}},
+	}
+	d.fileIntegrity[idRenameFail] = &fileIntegrityState{
+		RenameSource:   "nonexistent_source.dat",
+		ShardLocations: []shardLocation{{Offset: -1}},
+	}
+
+	renamed := d.renameMisnamedFiles(context.Background())
+	if renamed != 0 {
+		t.Errorf("expected 0 files renamed, got %d", renamed)
+	}
+
+	state1 := d.fileIntegrity[idMkdirFail]
+	if state1.RenameSource != "" || !state1.HashMismatch {
+		t.Errorf("expected fallback to repair for MkdirAll failure, got RenameSource=%q HashMismatch=%v", state1.RenameSource, state1.HashMismatch)
+	}
+
+	state2 := d.fileIntegrity[idRenameFail]
+	if state2.RenameSource != "" || !state2.HashMismatch {
+		t.Errorf("expected fallback to repair for Rename failure, got RenameSource=%q HashMismatch=%v", state2.RenameSource, state2.HashMismatch)
+	}
+}
+
+func TestScanFileChunks_ErrorPropagation(t *testing.T) {
+	dir := t.TempDir()
+	fname := "testfile.dat"
+	if err := os.WriteFile(filepath.Join(dir, fname), make([]byte, 100), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+
+	f, err := root.Open(fname)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	scanner := &blockScanner{
+		d:           &Decoder{sliceByteCount: 8, logger: slog.Default(), root: root},
+		ctx:         context.Background(),
+		sem:         make(chan struct{}, 1),
+		lookupTable: newCRCLookupTable(nil),
+	}
+
+	err = scanner.scanFileChunks(f, FileID{}, fname, 100)
+	if err == nil {
+		t.Fatal("expected error from scanning closed file descriptor, got nil")
+	}
 }
