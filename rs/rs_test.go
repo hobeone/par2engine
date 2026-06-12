@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
+	"slices"
 	"testing"
 )
 
@@ -206,4 +207,71 @@ func TestRSInputValidation(t *testing.T) {
 			t.Fatalf("got err = %v, want ErrInvalidParityShardCount", err)
 		}
 	})
+}
+
+func TestNewCoderValidation(t *testing.T) {
+	t.Run("data_shards_zero", func(t *testing.T) {
+		_, err := NewCoderPAR2Vandermonde(0, 2)
+		if err == nil || err.Error() != "invalid shard counts" {
+			t.Fatalf("expected 'invalid shard counts', got: %v", err)
+		}
+	})
+	t.Run("parity_shards_zero", func(t *testing.T) {
+		_, err := NewCoderPAR2Vandermonde(4, 0)
+		if err == nil || err.Error() != "invalid shard counts" {
+			t.Fatalf("expected 'invalid shard counts', got: %v", err)
+		}
+	})
+	t.Run("too_many_data_shards", func(t *testing.T) {
+		// generators limit is 32768
+		_, err := NewCoderPAR2Vandermonde(32769, 2)
+		if err == nil || err.Error() != "too many data shards for generator limit" {
+			t.Fatalf("expected 'too many data shards for generator limit', got: %v", err)
+		}
+	})
+	t.Run("too_many_parity_shards", func(t *testing.T) {
+		_, err := NewCoderPAR2Vandermonde(4, 65536)
+		if err == nil || err.Error() != "too many parity shards for GF(2^16)" {
+			t.Fatalf("expected 'too many parity shards for GF(2^16)', got: %v", err)
+		}
+	})
+}
+
+func TestRSParallelBoundaries(t *testing.T) {
+	coder, err := NewCoderPAR2Vandermonde(2, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := rand.New(rand.NewPCG(42, 42))
+
+	ctx := context.Background()
+
+	// Test various sizes that exercise the parallel slicing logic and SIMD alignment (16-byte boundary).
+	sizes := []int{16, 20, 32, 34, 48, 64, 80, 128, 256}
+	for _, size := range sizes {
+		data := make([][]byte, 2)
+		for i := range data {
+			data[i] = make([]byte, size)
+			for j := range data[i] {
+				data[i][j] = byte(r.Uint32())
+			}
+		}
+		dataOrig := [][]byte{slices.Clone(data[0]), slices.Clone(data[1])}
+
+		parity, err := coder.GenerateParity(ctx, data, 4) // force parallel execution
+		if err != nil {
+			t.Fatalf("size=%d parallel GenerateParity failed: %v", size, err)
+		}
+
+		data[0] = nil                                 // lose first shard
+		err = coder.Reconstruct(ctx, data, parity, 4) // parallel Reconstruct
+		if err != nil {
+			t.Fatalf("size=%d parallel Reconstruct failed: %v", size, err)
+		}
+
+		if !bytes.Equal(data[0], dataOrig[0]) {
+			t.Fatalf("size=%d parallel Reconstruct data mismatch", size)
+		}
+	}
 }
