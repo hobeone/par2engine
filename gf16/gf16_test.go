@@ -51,6 +51,14 @@ func TestPow(t *testing.T) {
 	requireEqual(t, T(5), T(5).Pow(1))
 	requireEqual(t, T(5).Times(T(5)), T(5).Pow(2))
 	requireEqual(t, T(5).Times(T(5)).Times(T(5)), T(5).Pow(3))
+
+	// Large power test to verify modulo behavior on exponentiation
+	largeBase := T(5)
+	expectedLarge := T(1)
+	for i := 0; i < 50000; i++ {
+		expectedLarge = expectedLarge.Times(largeBase)
+	}
+	requireEqual(t, expectedLarge, largeBase.Pow(50000))
 }
 
 func TestCalcTable(t *testing.T) {
