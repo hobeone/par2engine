@@ -3,7 +3,7 @@ module github.com/hobeone/par2engine
 go 1.26.3
 
 require (
-	github.com/klauspost/cpuid/v2 v2.3.0
+	github.com/klauspost/cpuid/v2 v2.4.0
 	github.com/mmcloughlin/avo v0.6.0
 )
 
