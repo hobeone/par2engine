@@ -10,6 +10,13 @@
       "matchDatasources": ["go"],
       "matchPackageNames": ["golang.org/x/**"],
       "groupName": "golang.org/x modules"
+    },
+    {
+      "description": "Bump the go.mod `go` directive itself. This is a library with no Dockerfile, and go.mod has no separate `toolchain` line - the `go` directive is pinned to a full patch version (e.g. `go 1.26.3`) and does double duty. Renovate's default policy never bumps a bare `go` directive (it treats it as a minimum-compatibility floor, not a pinned version), so matchDepNames+rangeStrategy=bump are required to opt in.",
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["golang"],
+      "matchDepNames": ["go"],
+      "rangeStrategy": "bump"
     }
   ]
 }
