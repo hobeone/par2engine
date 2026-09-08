@@ -9,6 +9,19 @@ on:
 permissions:
   contents: read
 
+# Every action is pinned to a full commit SHA rather than a major tag, because a
+# tag is mutable and its owner can repoint it at unreviewed code. This workflow
+# holds no secrets and only has read scope, so the exposure is not credential
+# theft -- it is that a tampered action could falsify test results, and a green
+# check on broken Reed-Solomon math is exactly the failure this repo cannot
+# afford. renovate.json enables helpers:pinGitHubActionDigests so these SHAs are
+# kept current; pinning without that automation would just freeze known-stale
+# versions in place.
+#
+# checkout additionally sets persist-credentials: false. No job pushes, and the
+# only git use is a local `git diff` in the generate job, so the token that
+# checkout would otherwise leave in .git/config is never needed.
+
 # A new push to a branch supersedes any run still in flight for it.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -20,12 +33,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # go-version-file reads the `go` directive from go.mod, so the toolchain
       # under test tracks whatever Renovate has bumped it to. This is what makes
       # those dependency PRs meaningful rather than unverified.
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
 
@@ -64,7 +79,7 @@ jobs:
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage
           path: coverage.out
@@ -75,13 +90,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
       # v9 of the action requires golangci-lint v2, which is what .golangci.yml
       # declares with `version: "2"`.
-      - uses: golangci/golangci-lint-action@v9
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.13
 
@@ -90,8 +107,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
 
@@ -113,8 +132,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
 
@@ -124,7 +145,7 @@ jobs:
       # cache exactly when the fixture set changes -- including when the pin is
       # bumped. A partial restore is safe: resolveFixtures re-downloads only the
       # archives that are missing.
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: tests/testdata
           key: par2-fixtures-${{ hashFiles('tests/testmain_test.go') }}
@@ -157,8 +178,10 @@ jobs:
           - goos: windows
             goarch: amd64
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
 
