@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -904,4 +905,84 @@ func TestScanFileChunks_ErrorPropagation(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from scanning closed file descriptor, got nil")
 	}
+}
+
+// TestScanProgressAdd covers scanProgress.add, which the existing suite reaches
+// only through a nil receiver: initProgress returns nil whenever no progress
+// channel is supplied, so the accumulate-and-report body never executed under
+// test before this. That left the atomic counter -- the only concurrent mutable
+// state in the scan path -- unexercised.
+func TestScanProgressAdd(t *testing.T) {
+	t.Run("nil receiver is a no-op", func(t *testing.T) {
+		var p *scanProgress
+		p.add(100) // must not panic
+	})
+
+	t.Run("nil channel is a no-op", func(t *testing.T) {
+		p := &scanProgress{totalBytes: 100}
+		p.add(50) // must not panic or block
+		if got := p.scannedBytes.Load(); got != 0 {
+			t.Errorf("scannedBytes = %d, want 0 when no channel is attached", got)
+		}
+	})
+
+	t.Run("reports cumulative bytes and percent", func(t *testing.T) {
+		ch := make(chan Progress, 4)
+		p := &scanProgress{totalBytes: 200, progressChan: ch}
+
+		p.add(50)
+		p.add(50)
+
+		want := []Progress{
+			{Phase: "verifying", Current: 50, Total: 200, Percent: 25},
+			{Phase: "verifying", Current: 100, Total: 200, Percent: 50},
+		}
+		for i, w := range want {
+			got := <-ch
+			if got != w {
+				t.Errorf("update %d = %+v, want %+v", i, got, w)
+			}
+		}
+	})
+
+	t.Run("percent is capped at 100 when scanned exceeds total", func(t *testing.T) {
+		ch := make(chan Progress, 2)
+		p := &scanProgress{totalBytes: 100, progressChan: ch}
+
+		p.add(250)
+
+		got := <-ch
+		if got.Percent != 100 {
+			t.Errorf("Percent = %v, want 100 (capped)", got.Percent)
+		}
+		if got.Current != 250 {
+			t.Errorf("Current = %d, want 250 (uncapped byte count)", got.Current)
+		}
+	})
+
+	// The scan path calls add from every worker goroutine concurrently, so the
+	// counter must accumulate exactly. Run under -race to also catch a
+	// regression from atomic.Int64 back to a plain field.
+	t.Run("concurrent adds accumulate exactly", func(t *testing.T) {
+		const workers, perWorker = 8, 100
+		ch := make(chan Progress, workers*perWorker)
+		p := &scanProgress{totalBytes: workers * perWorker, progressChan: ch}
+
+		var wg sync.WaitGroup
+		for range workers {
+			wg.Go(func() {
+				for range perWorker {
+					p.add(1)
+				}
+			})
+		}
+		wg.Wait()
+
+		if got, want := p.scannedBytes.Load(), int64(workers*perWorker); got != want {
+			t.Errorf("scannedBytes = %d, want %d", got, want)
+		}
+		if got, want := len(ch), workers*perWorker; got != want {
+			t.Errorf("sent %d updates, want %d", got, want)
+		}
+	})
 }

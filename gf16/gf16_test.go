@@ -55,7 +55,7 @@ func TestPow(t *testing.T) {
 	// Large power test to verify modulo behavior on exponentiation
 	largeBase := T(5)
 	expectedLarge := T(1)
-	for i := 0; i < 50000; i++ {
+	for range 50000 {
 		expectedLarge = expectedLarge.Times(largeBase)
 	}
 	requireEqual(t, expectedLarge, largeBase.Pow(50000))
