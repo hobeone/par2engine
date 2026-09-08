@@ -20,6 +20,13 @@ const allocRuns = 50
 // keeps the table population representative.
 const allocCoefficient = T(0xACE1)
 
+// allocCase is one buffer size to assert against. Declared as a named type so
+// gf16_alloc_amd64_test.go can extend the table with amd64-only dispatch paths.
+type allocCase struct {
+	name string
+	size int
+}
+
 // allocPathCases enumerates buffer sizes that, between them, reach every dispatch
 // branch in MulByteSliceLE and MulAndAddByteSliceLE.
 //
@@ -34,10 +41,7 @@ const allocCoefficient = T(0xACE1)
 // The one shape not reachable from here is the hasAVX2/hasSSSE3 false branch:
 // those are package-level vars set from CPU detection at init, so exercising the
 // pure-scalar dispatch on an AVX2 machine would require making them injectable.
-var allocPathCases = []struct {
-	name string
-	size int
-}{
+var allocPathCases = []allocCase{
 	{"empty", 0},                    // n == 0 early return, before any dispatch
 	{"scalar_only", 8},              // below every vector threshold
 	{"ssse3_block", 32},             // one SSSE3 block, below the AVX2 threshold

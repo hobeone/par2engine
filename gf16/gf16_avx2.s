@@ -209,3 +209,99 @@ DATA conv_mask_avx2_add<>+8(SB)/8, $0x00ff00ff00ff00ff
 DATA conv_mask_avx2_add<>+16(SB)/8, $0x00ff00ff00ff00ff
 DATA conv_mask_avx2_add<>+24(SB)/8, $0x00ff00ff00ff00ff
 GLOBL conv_mask_avx2_add<>(SB), RODATA|NOPTR, $32
+
+DATA gfni_lo_mask<>+0(SB)/8, $0x00ff00ff00ff00ff
+DATA gfni_lo_mask<>+8(SB)/8, $0x00ff00ff00ff00ff
+DATA gfni_lo_mask<>+16(SB)/8, $0x00ff00ff00ff00ff
+DATA gfni_lo_mask<>+24(SB)/8, $0x00ff00ff00ff00ff
+GLOBL gfni_lo_mask<>(SB), RODATA|NOPTR, $32
+
+DATA gfni_hi_mask<>+0(SB)/8, $0xff00ff00ff00ff00
+DATA gfni_hi_mask<>+8(SB)/8, $0xff00ff00ff00ff00
+DATA gfni_hi_mask<>+16(SB)/8, $0xff00ff00ff00ff00
+DATA gfni_hi_mask<>+24(SB)/8, $0xff00ff00ff00ff00
+GLOBL gfni_hi_mask<>(SB), RODATA|NOPTR, $32
+
+// func MulByteSliceLE_GFNI(matrices *[4]uint64, in []byte, out []byte)
+// Requires: AVX, AVX2, GFNI
+TEXT ·MulByteSliceLE_GFNI(SB), NOSPLIT, $0-56
+	MOVQ         matrices+0(FP), AX
+	MOVQ         in_base+8(FP), CX
+	MOVQ         in_len+16(FP), DX
+	MOVQ         out_base+32(FP), BX
+	VPBROADCASTQ (AX), Y0
+	VPBROADCASTQ 8(AX), Y1
+	VPBROADCASTQ 16(AX), Y2
+	VPBROADCASTQ 24(AX), Y3
+	VMOVDQU      gfni_lo_mask<>+0(SB), Y4
+	VMOVDQU      gfni_hi_mask<>+0(SB), Y5
+	MOVQ         DX, AX
+	SHRQ         $0x05, AX
+
+MulByteSliceLE_GFNI_loop:
+	CMPQ           AX, $0x00
+	JE             MulByteSliceLE_GFNI_done
+	VMOVDQU        (CX), Y6
+	VGF2P8AFFINEQB $0x00, Y0, Y6, Y7
+	VGF2P8AFFINEQB $0x00, Y1, Y6, Y8
+	VGF2P8AFFINEQB $0x00, Y2, Y6, Y9
+	VGF2P8AFFINEQB $0x00, Y3, Y6, Y6
+	VPSRLW         $0x08, Y8, Y8
+	VPSLLW         $0x08, Y9, Y9
+	VPXOR          Y7, Y8, Y8
+	VPXOR          Y6, Y9, Y9
+	VPAND          Y4, Y8, Y8
+	VPAND          Y5, Y9, Y9
+	VPOR           Y8, Y9, Y6
+	VMOVDQU        Y6, (BX)
+	ADDQ           $0x20, CX
+	ADDQ           $0x20, BX
+	DECQ           AX
+	JMP            MulByteSliceLE_GFNI_loop
+
+MulByteSliceLE_GFNI_done:
+	VZEROUPPER
+	RET
+
+// func MulAndAddByteSliceLE_GFNI(matrices *[4]uint64, in []byte, out []byte)
+// Requires: AVX, AVX2, GFNI
+TEXT ·MulAndAddByteSliceLE_GFNI(SB), NOSPLIT, $0-56
+	MOVQ         matrices+0(FP), AX
+	MOVQ         in_base+8(FP), CX
+	MOVQ         in_len+16(FP), DX
+	MOVQ         out_base+32(FP), BX
+	VPBROADCASTQ (AX), Y0
+	VPBROADCASTQ 8(AX), Y1
+	VPBROADCASTQ 16(AX), Y2
+	VPBROADCASTQ 24(AX), Y3
+	VMOVDQU      gfni_lo_mask<>+0(SB), Y4
+	VMOVDQU      gfni_hi_mask<>+0(SB), Y5
+	MOVQ         DX, AX
+	SHRQ         $0x05, AX
+
+MulAndAddByteSliceLE_GFNI_loop:
+	CMPQ           AX, $0x00
+	JE             MulAndAddByteSliceLE_GFNI_done
+	VMOVDQU        (CX), Y6
+	VGF2P8AFFINEQB $0x00, Y0, Y6, Y7
+	VGF2P8AFFINEQB $0x00, Y1, Y6, Y8
+	VGF2P8AFFINEQB $0x00, Y2, Y6, Y9
+	VGF2P8AFFINEQB $0x00, Y3, Y6, Y6
+	VPSRLW         $0x08, Y8, Y8
+	VPSLLW         $0x08, Y9, Y9
+	VPXOR          Y7, Y8, Y8
+	VPXOR          Y6, Y9, Y9
+	VPAND          Y4, Y8, Y8
+	VPAND          Y5, Y9, Y9
+	VPOR           Y8, Y9, Y6
+	VMOVDQU        (BX), Y7
+	VPXOR          Y7, Y6, Y6
+	VMOVDQU        Y6, (BX)
+	ADDQ           $0x20, CX
+	ADDQ           $0x20, BX
+	DECQ           AX
+	JMP            MulAndAddByteSliceLE_GFNI_loop
+
+MulAndAddByteSliceLE_GFNI_done:
+	VZEROUPPER
+	RET

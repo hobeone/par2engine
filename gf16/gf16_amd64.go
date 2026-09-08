@@ -86,6 +86,18 @@ func MulByteSliceLE(c T, in, out []byte) {
 		return
 	}
 
+	if hasGFNI && n >= gfniMinBytes {
+		gfniLen := n - (n % 32)
+		if gfniLen > 0 {
+			blocks := calcGFNIBlocks(c)
+			MulByteSliceLE_GFNI((*[4]uint64)(&blocks), in[:gfniLen], out[:gfniLen])
+			if gfniLen < n {
+				MulByteSliceLE(c, in[gfniLen:], out[gfniLen:])
+			}
+			return
+		}
+	}
+
 	if hasAVX2 {
 		avx2Len := n - (n % 64)
 		if avx2Len > 0 {
@@ -121,6 +133,18 @@ func MulAndAddByteSliceLE(c T, in, out []byte) {
 	n := len(in)
 	if n == 0 {
 		return
+	}
+
+	if hasGFNI && n >= gfniMinBytes {
+		gfniLen := n - (n % 32)
+		if gfniLen > 0 {
+			blocks := calcGFNIBlocks(c)
+			MulAndAddByteSliceLE_GFNI((*[4]uint64)(&blocks), in[:gfniLen], out[:gfniLen])
+			if gfniLen < n {
+				MulAndAddByteSliceLE(c, in[gfniLen:], out[gfniLen:])
+			}
+			return
+		}
 	}
 
 	if hasAVX2 {

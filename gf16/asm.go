@@ -8,11 +8,27 @@ import (
 	. "github.com/mmcloughlin/avo/reg"
 )
 
+// gfniLoMask and gfniHiMask are shared by both GFNI kernels. They are declared
+// once in main rather than inside the generator, which runs per kernel and
+// would otherwise emit each symbol twice.
+var gfniLoMask, gfniHiMask Mem
+
 func main() {
 	ConstraintExpr("amd64")
 
 	generateMul()
 	generateMulAndAdd()
+	gfniLoMask = GLOBL("gfni_lo_mask", RODATA|NOPTR)
+	for i := range 4 {
+		DATA(8*i, U64(0x00ff00ff00ff00ff))
+	}
+	gfniHiMask = GLOBL("gfni_hi_mask", RODATA|NOPTR)
+	for i := range 4 {
+		DATA(8*i, U64(0xff00ff00ff00ff00))
+	}
+
+	generateGFNIKernel("MulByteSliceLE_GFNI", false)
+	generateGFNIKernel("MulAndAddByteSliceLE_GFNI", true)
 
 	Generate()
 }
@@ -254,4 +270,101 @@ func mulAltMapByte(s0, s4, s8, s12, inLow, inHigh, mulMask, out, tmp0, tmp1 Regi
 func mulAltMap(s0Low, s4Low, s8Low, s12Low, s0High, s4High, s8High, s12High, inLow, inHigh, mulMask, outLow, outHigh, tmp0, tmp1 Register) {
 	mulAltMapByte(s0Low, s4Low, s8Low, s12Low, inLow, inHigh, mulMask, outLow, tmp0, tmp1)
 	mulAltMapByte(s0High, s4High, s8High, s12High, inLow, inHigh, mulMask, outHigh, tmp0, tmp1)
+}
+
+// generateGFNIKernel emits a GF(2^16) multiply kernel built on VGF2P8AFFINEQB.
+//
+// Multiplication by a constant is a GF(2)-linear map on 16 bits, so its 16x16
+// matrix splits into four 8x8 blocks, each one affine transform:
+//
+//	[yl]   [a00 a01] [xl]
+//	[yh] = [a10 a11] [xh]
+//
+// Each transform applies its block to every byte, so the wanted half of each
+// result lands in alternating byte positions. Rather than deinterleave into
+// planar halves the way the PSHUFB kernel does, the two cross terms are slid
+// into place with 16-bit lane shifts and the unwanted halves masked off. The
+// data stays interleaved end to end, which removes the pack/unpack round trip
+// that dominates the AVX2 path.
+//
+// The instruction reads row i of its matrix from byte 7-i of the qword; the Go
+// side builds the qwords in that order. Processes 32 bytes per iteration.
+// If accumulate is true the result is XORed into out rather than stored.
+func generateGFNIKernel(name string, accumulate bool) {
+	verb := "storing the result in"
+	if accumulate {
+		verb = "XORing the result into"
+	}
+	TEXT(name, NOSPLIT, "func(matrices *[4]uint64, in []byte, out []byte)")
+	Doc(
+		name+" multiplies each 16-bit element in 'in' by the constant whose",
+		"GF(2) block matrices are given in 'matrices', "+verb+" 'out'.",
+		"Requires GFNI and AVX2. Processes 32 bytes (16 elements) per iteration.",
+		"len(in) must be a multiple of 32.",
+	)
+	// Callers pass a stack-local [4]uint64. Without this the compiler must
+	// assume the pointer escapes and moves the matrices to the heap, which
+	// would break the package's zero-allocation guarantee.
+	Pragma("noescape")
+
+	matPtr := Mem{Base: Load(Param("matrices"), GP64())}
+	inPtr := Mem{Base: Load(Param("in").Base(), GP64())}
+	inLen := Load(Param("in").Len(), GP64())
+	outPtr := Mem{Base: Load(Param("out").Base(), GP64())}
+
+	// One 8x8 block matrix per YMM register, broadcast to every qword lane so
+	// the same block applies across the whole vector.
+	a00, a01, a10, a11 := YMM(), YMM(), YMM(), YMM()
+	VPBROADCASTQ(matPtr.Offset(0), a00)
+	VPBROADCASTQ(matPtr.Offset(8), a01)
+	VPBROADCASTQ(matPtr.Offset(16), a10)
+	VPBROADCASTQ(matPtr.Offset(24), a11)
+
+	loMask, hiMask := YMM(), YMM()
+	VMOVDQU(gfniLoMask, loMask)
+	VMOVDQU(gfniHiMask, hiMask)
+
+	count := GP64()
+	MOVQ(inLen, count)
+	SHRQ(Imm(5), count) // 32 bytes per iteration
+
+	Label(name + "_loop")
+	CMPQ(count, Imm(0))
+	JE(LabelRef(name + "_done"))
+
+	x := YMM()
+	VMOVDQU(inPtr.Offset(0), x)
+
+	t00, t01, t10, t11 := YMM(), YMM(), YMM(), YMM()
+	VGF2P8AFFINEQB(Imm(0), a00, x, t00)
+	VGF2P8AFFINEQB(Imm(0), a01, x, t01)
+	VGF2P8AFFINEQB(Imm(0), a10, x, t10)
+	VGF2P8AFFINEQB(Imm(0), a11, x, t11)
+
+	// Slide the cross terms into their destination byte and drop the halves
+	// each transform computed for the wrong position.
+	VPSRLW(Imm(8), t01, t01)
+	VPSLLW(Imm(8), t10, t10)
+	VPXOR(t00, t01, t01)
+	VPXOR(t11, t10, t10)
+	VPAND(loMask, t01, t01)
+	VPAND(hiMask, t10, t10)
+
+	res := YMM()
+	VPOR(t01, t10, res)
+	if accumulate {
+		prev := YMM()
+		VMOVDQU(outPtr.Offset(0), prev)
+		VPXOR(prev, res, res)
+	}
+	VMOVDQU(res, outPtr.Offset(0))
+
+	ADDQ(Imm(32), inPtr.Base)
+	ADDQ(Imm(32), outPtr.Base)
+	DECQ(count)
+	JMP(LabelRef(name + "_loop"))
+
+	Label(name + "_done")
+	VZEROUPPER()
+	RET()
 }

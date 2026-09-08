@@ -13,3 +13,19 @@ func MulByteSliceLE_AVX2(tables *[128]byte, in []byte, out []byte)
 // using AVX2 planar repack and 4-bit shuffles, XORing the result into 'out'.
 // Processes 64 bytes (32 elements) per iteration. len(in) must be a multiple of 64.
 func MulAndAddByteSliceLE_AVX2(tables *[128]byte, in []byte, out []byte)
+
+// MulByteSliceLE_GFNI multiplies each 16-bit element in 'in' by the constant whose
+// GF(2) block matrices are given in 'matrices', storing the result in 'out'.
+// Requires GFNI and AVX2. Processes 32 bytes (16 elements) per iteration.
+// len(in) must be a multiple of 32.
+//
+//go:noescape
+func MulByteSliceLE_GFNI(matrices *[4]uint64, in []byte, out []byte)
+
+// MulAndAddByteSliceLE_GFNI multiplies each 16-bit element in 'in' by the constant whose
+// GF(2) block matrices are given in 'matrices', XORing the result into 'out'.
+// Requires GFNI and AVX2. Processes 32 bytes (16 elements) per iteration.
+// len(in) must be a multiple of 32.
+//
+//go:noescape
+func MulAndAddByteSliceLE_GFNI(matrices *[4]uint64, in []byte, out []byte)
