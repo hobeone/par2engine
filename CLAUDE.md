@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build and Test Commands
 
 ```bash
-# Build the CLI binary (required before running integration tests)
+# Build the CLI binary
 go build -o par2engine-cli ./cmd/gopar
 
 # Run all tests (unit, integration, benchmarks)
@@ -16,14 +16,22 @@ go test -v ./par2/...
 go test -v ./rs/...
 go test -v ./gf16/...
 
-# Run gf16 benchmarks (required after any gf16 edits to verify zero-allocation)
+# Assert the zero-allocation guarantee (must not run under -race; see below)
+go test -run ZeroAlloc ./gf16/...
+
+# Run gf16 benchmarks to see throughput numbers after any gf16 edits
 go test -v -bench=. ./gf16/...
+
+# Regenerate the avo-produced AVX2 assembly after editing gf16/asm.go
+go generate ./gf16/...
 
 # Run a single test by name
 go test -v -run TestFunctionName ./par2/...
 ```
 
-**Integration tests** (`tests/`) require canonical `par2cmdline` test fixture archives at `../../par2cmdline/tests/`. They skip automatically if the sibling repo is not present. The test also resolves the CLI binary at `../par2engine-cli` relative to the `tests/` directory, so rebuild the binary before running integration tests.
+**Integration tests** (`tests/`) are self-sufficient — `TestMain` resolves the canonical `par2cmdline` fixture archives in three steps: the `tests/testdata/` cache from a previous run, then a sibling clone at `../../par2cmdline/tests/`, then downloading them from `parchive/par2cmdline` into `tests/testdata/`. It also builds the CLI at `../par2engine-cli` itself if that binary is absent, so no separate build step is needed first. The only external requirement is network access on the first run.
+
+**CI** (`.github/workflows/ci.yml`) runs build/vet/`-race` tests, the zero-allocation assertions, golangci-lint, a generated-assembly drift check, the integration suite, and cross-compile builds for 386/arm/arm64/darwin-arm64/windows.
 
 ## Architecture
 
@@ -39,7 +47,12 @@ tests/             E2E integration tests against par2cmdline canonical archives
 
 ### gf16 — Zero-Allocation Field Math
 
-`MulTable` (1 KB) is **always stack-allocated** as a local variable inside `MulByteSliceLE` and `MulAndAddByteSliceLE`. These two functions are the hot path for all RS math. Any change that heap-allocates `MulTable` breaks the `0 B/op` performance guarantee. Verify with `go test -bench=. ./gf16/...` after any edit.
+The 1 KB `mulTable` is **always stack-allocated**, as a local variable inside `mulScalarByteSliceLE` and `mulAndAddScalarByteSliceLE` (`gf16.go`) — the scalar path that the exported `MulByteSliceLE` and `MulAndAddByteSliceLE` delegate to. Those two exported functions are the hot path for all RS math. Any change that heap-allocates `mulTable` breaks the `0 B/op` performance guarantee.
+
+`TestMulByteSliceLEZeroAlloc` / `TestMulAndAddByteSliceLEZeroAlloc` (`gf16_alloc_test.go`) assert this and run in CI. Two things about them are load-bearing:
+
+- On amd64 with AVX2, any length that is a whole multiple of 64 dispatches straight to the assembly kernel and **never reaches the scalar path**. The tests therefore cover unaligned sizes too; a test using only aligned buffers would pass while measuring nothing.
+- They carry a `//go:build !race` constraint, because the race detector allocates for its own instrumentation. Run them without `-race`.
 
 ### rs — Reed-Solomon Coder
 
@@ -60,7 +73,7 @@ Key internal types:
 
 These are correctness and security invariants — violations cause silent data corruption, security holes, or panics:
 
-1. **gf16 zero-allocation**: `MulTable` must stay stack-allocated. Run bench after edits.
+1. **gf16 zero-allocation**: `mulTable` must stay stack-allocated. Verified by `go test -run ZeroAlloc ./gf16/...` (without `-race`), which CI enforces.
 
 2. **Parity exponent alignment**: `parity[exp]` in `Reconstruct` calls must match the RS exponent, not be compressed sequentially. Missing exponent slots must be `nil`.
 

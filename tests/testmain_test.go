@@ -10,7 +10,14 @@ import (
 	"testing"
 )
 
-const fixtureBaseURL = "https://raw.githubusercontent.com/parchive/par2cmdline/master/tests"
+// fixturePin is the parchive/par2cmdline commit the fixture archives are fetched
+// from. It is deliberately a commit SHA rather than a branch name: CI runs this
+// download on every pull request, including from forks, so resolving through a
+// mutable ref would let an upstream push silently change what this repo's tests
+// parse. Bump it intentionally when new fixtures are wanted.
+const fixturePin = "69d6aa0107cc28565a2ff92a7caf7abb3473f923"
+
+const fixtureBaseURL = "https://raw.githubusercontent.com/parchive/par2cmdline/" + fixturePin + "/tests"
 
 // allArchives lists every fixture archive downloaded from parchive/par2cmdline.
 var allArchives = []string{
