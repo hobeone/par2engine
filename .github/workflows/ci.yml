@@ -71,10 +71,15 @@ jobs:
       # -v run is deliberate: a build-tag-excluded test is indistinguishable from
       # a passing one in summary output, so this prints the subtest names as
       # evidence the gate actually ran rather than silently vanishing.
+      #
+      # GFNIAvailability is included for the same reason. The GFNI kernels are
+      # unreachable on a runner whose CPU lacks the feature, and those tests then
+      # skip silently -- so this prints the detected feature set, making it
+      # visible whether that dispatch tier was covered by this run at all.
       - name: Zero-allocation assertions (no race detector)
         run: |
           go test ./gf16/...
-          go test -v -run ZeroAlloc ./gf16/...
+          go test -v -run 'ZeroAlloc|GFNIAvailability' ./gf16/...
 
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
