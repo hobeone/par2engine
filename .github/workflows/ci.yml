@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Only read access is needed; no job publishes anything.
+permissions:
+  contents: read
+
+# A new push to a branch supersedes any run still in flight for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # go-version-file reads the `go` directive from go.mod, so the toolchain
+      # under test tracks whatever Renovate has bumped it to. This is what makes
+      # those dependency PRs meaningful rather than unverified.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # The race detector allocates on its own behalf, so the zero-allocation
+      # assertions in gf16 carry a !race build tag and do not run in this pass.
+      - name: Unit tests (race detector)
+        run: go test -race -coverprofile=coverage.out ./gf16/... ./par2/... ./rs/... ./cmd/...
+
+      # Second pass without -race, which is the only build where the
+      # zero-allocation assertions are compiled in and can execute.
+      - name: Zero-allocation assertions (no race detector)
+        run: go test ./gf16/...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+          if-no-files-found: error
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      # v9 of the action requires golangci-lint v2, which is what .golangci.yml
+      # declares with `version: "2"`.
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13
+
+  generate:
+    name: Generated assembly is current
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # gf16/gf16_avx2.s and gf16/stub.go are produced from gf16/asm.go by avo
+      # and committed to the repo, so nothing otherwise catches asm.go being
+      # edited without regenerating. gf16/gf16_amd64.s is hand-written SSSE3 and
+      # is deliberately not covered here.
+      - name: Regenerate and check for drift
+        run: |
+          go generate ./gf16/...
+          if ! git diff --quiet -- gf16/; then
+            echo "::error::Generated assembly is out of date. Run 'go generate ./gf16/...' and commit the result."
+            git diff -- gf16/
+            exit 1
+          fi
+
+  integration:
+    name: Integration (par2cmdline fixtures)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # tests/testmain_test.go downloads the canonical archives from
+      # parchive/par2cmdline when they are absent. Both the archive list and the
+      # pinned upstream commit live in that file, so hashing it invalidates the
+      # cache exactly when the fixture set changes -- including when the pin is
+      # bumped. A partial restore is safe: resolveFixtures re-downloads only the
+      # archives that are missing.
+      - uses: actions/cache@v6
+        with:
+          path: tests/testdata
+          key: par2-fixtures-${{ hashFiles('tests/testmain_test.go') }}
+          restore-keys: |
+            par2-fixtures-
+
+      # TestMain builds the CLI itself, so no separate build step is needed.
+      - name: Integration tests
+        run: go test -v ./tests/...
+
+  cross-build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 32-bit targets exercise the gf16_nonamd64.go scalar fallback and
+          # surface the atomic-alignment class of problem that does not appear
+          # on amd64.
+          - goos: linux
+            goarch: "386"
+          - goos: linux
+            goarch: arm
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Build only. Executing these would need emulation; the goal here is to
+      # catch compile breakage in the non-amd64 paths.
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build ./...

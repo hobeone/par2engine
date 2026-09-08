@@ -20,8 +20,9 @@ tests/             E2E integration tests against par2cmdline canonical archives
 
 ### gf16 — Zero-Allocation Field Math
 - **Performance Target**: Hot paths in `gf16` (specifically `MulByteSliceLE` and `MulAndAddByteSliceLE`) **MUST** run at zero heap allocations (`0 B/op`, `0 allocs/op`).
-- **Multiplication Tables**: Do **NOT** allocate L1 multiplication tables on the heap. They must be stack-allocated (`MulTable` is a local array struct of 1 KB) inside the hot path functions and generated on-demand per coefficient via `CalcTable`.
-- **Verification**: If you edit `gf16`, you **MUST** run benchmarks to verify throughput and allocations:
+- **Multiplication Tables**: Do **NOT** allocate L1 multiplication tables on the heap. `mulTable` is a 1 KB local array struct, stack-allocated inside `mulScalarByteSliceLE` and `mulAndAddScalarByteSliceLE` in `gf16.go` — the scalar path the two exported hot-path functions delegate to — and generated on-demand per coefficient via `calcTable`.
+- **Allocation gate**: `go test -run ZeroAlloc ./gf16/...` asserts the guarantee and is enforced in CI. It **MUST NOT** be run under `-race` (the detector allocates for its own instrumentation, which is why `gf16_alloc_test.go` carries a `//go:build !race` constraint). The cases deliberately include unaligned sizes: on amd64 with AVX2 any multiple of 64 goes straight to the assembly kernel and never reaches the scalar path being asserted about.
+- **Verification**: If you edit `gf16`, you **MUST** run benchmarks to verify throughput:
   ```bash
   go test -v -bench=. ./gf16/...
   ```
@@ -47,7 +48,7 @@ Key internal design details:
 
 These are correctness and security invariants — violations cause silent data corruption, security holes, or panics:
 
-1. **gf16 zero-allocation**: `MulTable` must stay stack-allocated inside `MulByteSliceLE` and `MulAndAddByteSliceLE`. Run benchmarks after any edits to verify `0 B/op`.
+1. **gf16 zero-allocation**: `mulTable` must stay stack-allocated inside the scalar helpers that `MulByteSliceLE` and `MulAndAddByteSliceLE` delegate to. Verified by `go test -run ZeroAlloc ./gf16/...` (without `-race`), which CI enforces.
 2. **Parity exponent alignment**: `parity[exp]` in `Reconstruct` calls must match the RS exponent, not be compressed sequentially. Missing exponent slots must be `nil`.
 3. **Directory sandboxing**: Under **NO** circumstances use raw `os.Open`, `os.OpenFile`, or `os.Create` for target data files. All file descriptors **MUST** be opened safely through `d.root` using the Go 1.24+ `os.Root` API. The sandbox path must be resolved to a canonical absolute path using `filepath.EvalSymlinks` before opening `os.Root` to handle symlinked directories (e.g., `/tmp` or `/var`).
 4. **Path sanitization**: Filenames from PAR2 packets are attacker-controlled and can trigger directory traversal attacks. You **MUST** sanitize all paths through `DefangPath`:
@@ -75,11 +76,17 @@ go test -v ./par2/...
 go test -v ./rs/...
 go test -v ./gf16/...
 
-# 4. Run gf16 benchmarks (verify zero-allocation)
+# 4. Run gf16 benchmarks (throughput) and the allocation gate
 go test -v -bench=. ./gf16/...
+go test -run ZeroAlloc ./gf16/...
+
+# 5. Regenerate the avo-produced AVX2 assembly after editing gf16/asm.go
+go generate ./gf16/...
 ```
 
-**Integration tests** (`tests/`) require canonical `par2cmdline` test fixture archives at `../../par2cmdline/tests/`. They skip automatically if the sibling repo is not present. The E2E tests resolve the CLI binary at `../par2engine-cli` relative to the `tests/` directory, so rebuild the binary before running integration tests.
+**Integration tests** (`tests/`) are self-sufficient. `TestMain` resolves the canonical `par2cmdline` fixture archives in three steps — the `tests/testdata/` cache from a previous run, then a sibling clone at `../../par2cmdline/tests/`, then downloading them from `parchive/par2cmdline` into `tests/testdata/` — and builds the CLI at `../par2engine-cli` itself when that binary is absent. No separate build step is required first; the only external requirement is network access on the first run.
+
+**CI** (`.github/workflows/ci.yml`) runs build/vet/`-race` tests, the zero-allocation assertions, golangci-lint, a generated-assembly drift check, the integration suite, and cross-compile builds for 386/arm/arm64/darwin-arm64/windows.
 
 ---
 

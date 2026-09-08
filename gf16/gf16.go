@@ -1,3 +1,9 @@
+// The AVX2 kernels in gf16_avx2.s and their stubs in stub.go are generated from
+// asm.go by avo. Regenerate with `go generate ./gf16/...` after editing asm.go;
+// CI fails if the committed output does not match. The SSSE3 kernels in
+// gf16_amd64.s are hand-written and are not covered by this directive.
+//go:generate go run asm.go -pkg gf16 -out gf16_avx2.s -stubs stub.go
+
 package gf16
 
 import (
