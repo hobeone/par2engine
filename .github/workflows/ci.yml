@@ -29,6 +29,17 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # Five tests in par2/ call t.Skip when the reference par2cmdline binary is
+      # absent from PATH -- they generate PAR2 sets with the C++ implementation
+      # and cross-check this engine against them. Without this the suite still
+      # reports success while silently skipping them; par2 package coverage
+      # drops from ~86% to ~55%.
+      - name: Install reference par2cmdline
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y par2
+          par2 --version || true
+
       - name: Build
         run: go build ./...
 
@@ -41,9 +52,14 @@ jobs:
         run: go test -race -coverprofile=coverage.out ./gf16/... ./par2/... ./rs/... ./cmd/...
 
       # Second pass without -race, which is the only build where the
-      # zero-allocation assertions are compiled in and can execute.
+      # zero-allocation assertions are compiled in and can execute. The targeted
+      # -v run is deliberate: a build-tag-excluded test is indistinguishable from
+      # a passing one in summary output, so this prints the subtest names as
+      # evidence the gate actually ran rather than silently vanishing.
       - name: Zero-allocation assertions (no race detector)
-        run: go test ./gf16/...
+        run: |
+          go test ./gf16/...
+          go test -v -run ZeroAlloc ./gf16/...
 
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
