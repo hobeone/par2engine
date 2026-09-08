@@ -18,7 +18,7 @@ import (
 )
 
 type scanProgress struct {
-	scannedBytes int64
+	scannedBytes atomic.Int64
 	totalBytes   int64
 	progressChan chan<- Progress
 }
@@ -27,7 +27,7 @@ func (p *scanProgress) add(bytes int64) {
 	if p == nil || p.progressChan == nil {
 		return
 	}
-	scanned := atomic.AddInt64(&p.scannedBytes, bytes)
+	scanned := p.scannedBytes.Add(bytes)
 	pct := min(float64(scanned)/float64(p.totalBytes)*100, 100.0)
 	p.progressChan <- Progress{
 		Phase:   "verifying",
