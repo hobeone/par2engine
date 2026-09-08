@@ -2,12 +2,13 @@
 
 package gf16
 
-// Above gfniMinBytes the dispatch switches to the GFNI kernel, which is the only
-// path that hands a stack-local pointer -- the block matrices -- to assembly.
-// Without //go:noescape on those stubs the matrices are moved to the heap and
-// the package's zero-allocation guarantee is lost, so these cases are what
-// actually tests that pragma. The arch-independent table tops out well below the
-// threshold and would never reach this code.
+// Larger buffers for the GFNI dispatch tier. On hardware with GFNI these sizes
+// run the affine kernel rather than AVX2, so without them the tier that handles
+// almost all real traffic would never appear in the allocation assertions.
+//
+// These do not test the //go:noescape pragma on the GFNI stubs: the block
+// matrices live in a package-level table, so the kernels receive a global
+// pointer and removing the pragma does not by itself cause an allocation here.
 func init() {
 	allocPathCases = append(allocPathCases,
 		allocCase{"gfni_whole_blocks", gfniMinBytes},

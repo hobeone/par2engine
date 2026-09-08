@@ -21,18 +21,22 @@ func TestGFNIAvailability(t *testing.T) {
 	}
 }
 
-// gfniTestSizes spans the dispatch threshold and includes remainders, so the
-// GFNI block loop, its tail hand-off, and the sub-threshold fallback are all
-// covered. Sizes must be even.
+// gfniTestSizes covers the GFNI block loop, the tail hand-off to the smaller
+// kernels, and the sub-threshold fallback. Sizes reflecting real repair traffic
+// are deliberate: a chunk is split across goroutines before reaching this
+// package, so the slices it actually sees are tens of bytes to a few KB rather
+// than megabytes. Sizes must be even.
 var gfniTestSizes = []int{
-	gfniMinBytes - 2,  // just below the threshold: must not take the GFNI path
-	gfniMinBytes,      // exactly at the threshold, whole 32-byte blocks
-	gfniMinBytes + 2,  // threshold plus a 2-byte tail
-	gfniMinBytes + 30, // tail just under one block
-	gfniMinBytes + 32, // one extra whole block
-	gfniMinBytes + 94, // several blocks plus a 30-byte tail
-	64 * 1024,         // comfortably above, whole blocks
-	64*1024 + 66,      // large with a tail that itself needs sub-dispatch
+	2,            // below one GFNI block: must fall through entirely
+	30,           // still below a block
+	gfniMinBytes, // exactly one block, no tail
+	34,           // one block plus a 2-byte tail
+	62,           // one block plus a 30-byte tail
+	64,           // two whole blocks
+	126,          // blocks plus a tail
+	1024,         // typical of a real per-goroutine slice
+	4096,         // larger real-world slice
+	65536 + 66,   // large with a tail needing sub-dispatch
 }
 
 func TestMulByteSliceLEGFNIMatchesScalar(t *testing.T) {

@@ -89,8 +89,7 @@ func MulByteSliceLE(c T, in, out []byte) {
 	if hasGFNI && n >= gfniMinBytes {
 		gfniLen := n - (n % 32)
 		if gfniLen > 0 {
-			blocks := calcGFNIBlocks(c)
-			MulByteSliceLE_GFNI((*[4]uint64)(&blocks), in[:gfniLen], out[:gfniLen])
+			MulByteSliceLE_GFNI((*[4]uint64)(&gfniTable[c]), in[:gfniLen], out[:gfniLen])
 			if gfniLen < n {
 				MulByteSliceLE(c, in[gfniLen:], out[gfniLen:])
 			}
@@ -138,8 +137,7 @@ func MulAndAddByteSliceLE(c T, in, out []byte) {
 	if hasGFNI && n >= gfniMinBytes {
 		gfniLen := n - (n % 32)
 		if gfniLen > 0 {
-			blocks := calcGFNIBlocks(c)
-			MulAndAddByteSliceLE_GFNI((*[4]uint64)(&blocks), in[:gfniLen], out[:gfniLen])
+			MulAndAddByteSliceLE_GFNI((*[4]uint64)(&gfniTable[c]), in[:gfniLen], out[:gfniLen])
 			if gfniLen < n {
 				MulAndAddByteSliceLE(c, in[gfniLen:], out[gfniLen:])
 			}

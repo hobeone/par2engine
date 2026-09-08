@@ -302,9 +302,9 @@ func generateGFNIKernel(name string, accumulate bool) {
 		"Requires GFNI and AVX2. Processes 32 bytes (16 elements) per iteration.",
 		"len(in) must be a multiple of 32.",
 	)
-	// Callers pass a stack-local [4]uint64. Without this the compiler must
-	// assume the pointer escapes and moves the matrices to the heap, which
-	// would break the package's zero-allocation guarantee.
+	// The kernels retain none of their arguments. Without this the compiler
+	// must assume the slice and matrix pointers escape, which can force a
+	// caller's buffers to the heap. Matches the hand-written SSSE3 stubs.
 	Pragma("noescape")
 
 	matPtr := Mem{Base: Load(Param("matrices"), GP64())}
