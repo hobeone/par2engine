@@ -91,6 +91,29 @@ func applyMatrixSlice(ctx context.Context, m Matrix, in, out [][]byte, outStart,
 	}
 }
 
+// vectorBlockBytes is the widest block gf16's kernels consume in one step: the
+// AVX2 path takes 64 bytes at a time, the SSSE3 path 32.
+const vectorBlockBytes = 64
+
+// perGoroutineSplit returns how many bytes of a chunk each goroutine multiplies.
+//
+// The split is rounded up to a whole vector block so the kernels consume each
+// goroutine's slice entirely. Rounding to 16 instead left a tail on every call:
+// a default repair slices a 7648-byte chunk 32 ways into 240 bytes, which is
+// 192 bytes of AVX2, 32 of SSSE3 and then 16 bytes the scalar path has to pick
+// up -- 34% of all calls in a measured repair, for 6% of the bytes.
+//
+// One goroutine still gets whatever is left over, and that remainder is a short
+// slice the others wait on at the barrier. gf16's small-slice path is what keeps
+// that straggler cheap; rounding here without it trades wall time for CPU time.
+func perGoroutineSplit(dataLength, numGoroutines int) int {
+	split := max((dataLength+numGoroutines-1)/numGoroutines, vectorBlockBytes)
+	if rem := split % vectorBlockBytes; rem != 0 {
+		split += vectorBlockBytes - rem
+	}
+	return split
+}
+
 func applyMatrixParallelData(ctx context.Context, m Matrix, in, out [][]byte, numGoroutines int) error {
 	if len(in) == 0 || len(out) == 0 {
 		return nil
@@ -103,13 +126,7 @@ func applyMatrixParallelData(ctx context.Context, m Matrix, in, out [][]byte, nu
 	}
 
 	dataLength := len(out[0])
-	// Split bytes within the shards for horizontal thread scaling.
-	// Capped at multiples of 16 bytes for optimal SIMD memory alignments.
-	perGoroutineDataLength := max((dataLength+numGoroutines-1)/numGoroutines, 16)
-	rem := perGoroutineDataLength % 16
-	if rem != 0 {
-		perGoroutineDataLength += (16 - rem)
-	}
+	perGoroutineDataLength := perGoroutineSplit(dataLength, numGoroutines)
 
 	actualNumGoroutines := (dataLength + perGoroutineDataLength - 1) / perGoroutineDataLength
 	if actualNumGoroutines < 2 {
