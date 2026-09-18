@@ -18,6 +18,24 @@ const order = 1 << 16
 var logTable [order - 1]uint16
 var expTable [order - 1]T
 
+// smallSliceBytes is the length at or below which the scalar kernels multiply
+// element by element instead of building a mulTable first.
+//
+// calcTable writes 512 entries whatever the input length, so on a short slice it
+// is nearly the whole cost: a 16-byte call measures ~150ns, of which ~140ns is
+// calcTable, against ~12ns for the element-by-element loop. The table only pays
+// for itself once enough elements share it -- measured crossover on amd64 is
+// between 256 and 384 bytes.
+//
+// The threshold sits far below that crossover on purpose, because the scalar
+// kernels are only ever reached with a tail: the exported entry points hand off
+// multiples of 64 to AVX2 and 32 to SSSE3, so what is left is at most 30 bytes,
+// and Gaussian elimination in rs/matrix.go calls in with 26. Choosing 64 keeps
+// every one of those on the cheap side while leaving the table path in charge
+// wherever its setup is earned -- which, on a build without SSSE3, is the whole
+// slice.
+const smallSliceBytes = 64
+
 // mulTable is a 1KB lookup table for a specific coefficient,
 // allowing fast multiplication of 16-bit elements 8 bits at a time.
 type mulTable struct {
@@ -78,6 +96,14 @@ func calcTable(c T, table *mulTable) {
 // mulScalarByteSliceLE sets each out[i] to c * in[i] using the 1KB stack-allocated
 // mulTable. This is the portable scalar path — zero heap allocation guaranteed.
 func mulScalarByteSliceLE(c T, in, out []byte) {
+	if len(in) <= smallSliceBytes {
+		for i := 0; i < len(in); i += 2 {
+			v := T(binary.LittleEndian.Uint16(in[i:]))
+			binary.LittleEndian.PutUint16(out[i:], uint16(c.Times(v)))
+		}
+		return
+	}
+
 	var table mulTable
 	calcTable(c, &table)
 
@@ -115,6 +141,15 @@ func mulScalarByteSliceLE(c T, in, out []byte) {
 // mulAndAddScalarByteSliceLE adds (XORs) c * in[i] to each out[i] using the 1KB
 // stack-allocated mulTable. Zero heap allocation guaranteed.
 func mulAndAddScalarByteSliceLE(c T, in, out []byte) {
+	if len(in) <= smallSliceBytes {
+		for i := 0; i < len(in); i += 2 {
+			v := T(binary.LittleEndian.Uint16(in[i:]))
+			d := binary.LittleEndian.Uint16(out[i:]) ^ uint16(c.Times(v))
+			binary.LittleEndian.PutUint16(out[i:], d)
+		}
+		return
+	}
+
 	var table mulTable
 	calcTable(c, &table)
 
