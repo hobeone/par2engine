@@ -91,25 +91,27 @@ func applyMatrixSlice(ctx context.Context, m Matrix, in, out [][]byte, outStart,
 	}
 }
 
-// vectorBlockBytes is the widest block gf16's kernels consume in one step: the
-// AVX2 path takes 64 bytes at a time, the SSSE3 path 32.
-const vectorBlockBytes = 64
-
 // perGoroutineSplit returns how many bytes of a chunk each goroutine multiplies.
 //
-// The split is rounded up to a whole vector block so the kernels consume each
-// goroutine's slice entirely. Rounding to 16 instead left a tail on every call:
-// a default repair slices a 7648-byte chunk 32 ways into 240 bytes, which is
-// 192 bytes of AVX2, 32 of SSSE3 and then 16 bytes the scalar path has to pick
-// up -- 34% of all calls in a measured repair, for 6% of the bytes.
+// The split is rounded up to a whole gf16 kernel block so the vector path
+// consumes each goroutine's slice entirely. Rounding to 16 instead left a tail
+// on every call: a default repair slices a 7648-byte chunk 32 ways into 240
+// bytes, which is 192 bytes of AVX2, 32 of SSSE3 and then 16 bytes the scalar
+// path has to pick up -- 34% of all calls in a measured repair, for 6% of the
+// bytes. The block width comes from gf16 rather than being restated here, so a
+// wider kernel cannot leave this rounding silently behind.
 //
-// One goroutine still gets whatever is left over, and that remainder is a short
+// Rounding up costs ranges: the result is under a block larger than the exact
+// share, so at most (block/16) times fewer goroutines than the old rounding
+// gave, and only where a share was already smaller than a few hundred bytes.
+// One goroutine also gets whatever is left over, and that remainder is a short
 // slice the others wait on at the barrier. gf16's small-slice path is what keeps
 // that straggler cheap; rounding here without it trades wall time for CPU time.
 func perGoroutineSplit(dataLength, numGoroutines int) int {
-	split := max((dataLength+numGoroutines-1)/numGoroutines, vectorBlockBytes)
-	if rem := split % vectorBlockBytes; rem != 0 {
-		split += vectorBlockBytes - rem
+	block := gf16.KernelBlockBytes()
+	split := max((dataLength+numGoroutines-1)/numGoroutines, block)
+	if rem := split % block; rem != 0 {
+		split += block - rem
 	}
 	return split
 }

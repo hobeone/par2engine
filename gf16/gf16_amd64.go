@@ -38,6 +38,28 @@ var hasSSSE3 = cpuid.CPU.Supports(cpuid.SSSE3)
 // hasAVX2 is true when the CPU supports AVX2 (required for VBROADCASTI128/planar repack).
 var hasAVX2 = cpuid.CPU.Supports(cpuid.AVX2)
 
+// Block sizes the vector kernels consume per iteration. The dispatch below
+// peels whole blocks and leaves the remainder to the scalar path, so these are
+// also what decides how long a scalar tail can be.
+const (
+	avx2BlockBytes  = 64
+	ssse3BlockBytes = 32
+)
+
+// blockBytes reports the largest run of bytes a single kernel call consumes on
+// this CPU, which is what a caller slicing work up should align to. See
+// KernelBlockBytes.
+var blockBytes = func() int {
+	switch {
+	case hasAVX2:
+		return avx2BlockBytes
+	case hasSSSE3:
+		return ssse3BlockBytes
+	default:
+		return elementBytes
+	}
+}()
+
 func init() {
 	// Relies on logTable/expTable already populated by gf16.go's init (runs first by
 	// alphabetical file order within the package).
@@ -87,7 +109,7 @@ func MulByteSliceLE(c T, in, out []byte) {
 	}
 
 	if hasAVX2 {
-		avx2Len := n - (n % 64)
+		avx2Len := n - (n % avx2BlockBytes)
 		if avx2Len > 0 {
 			MulByteSliceLE_AVX2((*[128]byte)(unsafe.Pointer(&mulTable64[c])), in[:avx2Len], out[:avx2Len])
 			if avx2Len < n {
@@ -98,7 +120,7 @@ func MulByteSliceLE(c T, in, out []byte) {
 	}
 
 	if hasSSSE3 {
-		ssse3Len := n - (n % 32)
+		ssse3Len := n - (n % ssse3BlockBytes)
 		if ssse3Len > 0 {
 			mulSliceSSSE3(&mulTable64[c], in[:ssse3Len], out[:ssse3Len])
 		}
@@ -124,7 +146,7 @@ func MulAndAddByteSliceLE(c T, in, out []byte) {
 	}
 
 	if hasAVX2 {
-		avx2Len := n - (n % 64)
+		avx2Len := n - (n % avx2BlockBytes)
 		if avx2Len > 0 {
 			MulAndAddByteSliceLE_AVX2((*[128]byte)(unsafe.Pointer(&mulTable64[c])), in[:avx2Len], out[:avx2Len])
 			if avx2Len < n {
@@ -135,7 +157,7 @@ func MulAndAddByteSliceLE(c T, in, out []byte) {
 	}
 
 	if hasSSSE3 {
-		ssse3Len := n - (n % 32)
+		ssse3Len := n - (n % ssse3BlockBytes)
 		if ssse3Len > 0 {
 			mulAndAddSliceSSSE3(&mulTable64[c], in[:ssse3Len], out[:ssse3Len])
 		}
