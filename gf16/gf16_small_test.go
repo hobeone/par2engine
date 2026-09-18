@@ -12,15 +12,22 @@ import (
 // mulTable first. These tests pin that the choice is invisible in the output --
 // the threshold is a performance decision and must never be an arithmetic one.
 
-// refMulLE multiplies element by element through T.Times, which is the log/exp
-// path used everywhere outside the kernels. It is deliberately not the code
-// under test: comparing the two kernel shapes only against each other would
-// pass if both were wrong in the same way.
+// refMulLE is the TABLE path, run without its length threshold: build the 1 KB
+// mulTable and read every element out of it.
+//
+// It must not be a copy of the small path's own loop. An earlier version of this
+// file multiplied through T.Times, which is exactly what the small path does, so
+// for every length at or below the threshold -- the only lengths this test is
+// about -- it compared that loop against itself and would have passed whatever
+// the table did. The claim under test is that the two SHAPES agree, so the
+// reference has to be the shape the kernels no longer take.
 func refMulLE(c T, in []byte) []byte {
+	var table mulTable
+	calcTable(c, &table)
+
 	out := make([]byte, len(in))
-	for i := 0; i < len(in); i += 2 {
-		v := T(binary.LittleEndian.Uint16(in[i:]))
-		binary.LittleEndian.PutUint16(out[i:], uint16(c.Times(v)))
+	for i := 0; i+1 < len(in); i += 2 {
+		binary.LittleEndian.PutUint16(out[i:], uint16(table.s0[in[i]]^table.s8[in[i+1]]))
 	}
 	return out
 }
@@ -79,17 +86,35 @@ func TestScalarKernelsAgreeAcrossTheSmallSliceThreshold(t *testing.T) {
 }
 
 // TestExportedKernelsAgreeWithReference runs the same comparison through the
-// exported entry points, so the vector dispatch and its scalar tail are covered
-// together. A tail is never longer than 30 bytes on amd64, so these sizes are
-// what actually exercise the small path in production.
+// exported entry points, so the vector dispatch and the scalar tail it leaves
+// are covered together. A tail is never longer than 30 bytes on amd64, so the
+// sizes that are not whole blocks are what exercise the small path in
+// production.
 func TestExportedKernelsAgreeWithReference(t *testing.T) {
 	for _, size := range []int{2, 16, 30, 64, 70, 100, 240, 368, 4102} {
 		for _, c := range smallTestCoefficients {
 			in := patternedBytes(size)
+			want := refMulLE(c, in)
+
 			got := make([]byte, size)
 			MulByteSliceLE(c, in, got)
-			if want := refMulLE(c, in); !bytes.Equal(got, want) {
-				t.Errorf("MulByteSliceLE(size=%d, c=%#04x) mismatch", size, c)
+			if !bytes.Equal(got, want) {
+				t.Errorf("MulByteSliceLE(size=%d, c=%#04x) = %x, want %x", size, c, got, want)
+			}
+
+			// The accumulating kernel is the hotter of the two in a repair, so
+			// it gets the same coverage rather than being assumed to follow.
+			acc := make([]byte, size)
+			copy(acc, patternedBytes(size))
+			accWant := make([]byte, size)
+			copy(accWant, acc)
+			for i := range accWant {
+				accWant[i] ^= want[i]
+			}
+
+			MulAndAddByteSliceLE(c, in, acc)
+			if !bytes.Equal(acc, accWant) {
+				t.Errorf("MulAndAddByteSliceLE(size=%d, c=%#04x) = %x, want %x", size, c, acc, accWant)
 			}
 		}
 	}

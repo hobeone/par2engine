@@ -115,11 +115,12 @@ func TestScalarKernelsZeroAllocOnTheTablePath(t *testing.T) {
 	for _, k := range kernels {
 		for _, size := range tablePathSizes {
 			t.Run(fmt.Sprintf("%s/size=%d", k.name, size), func(t *testing.T) {
-				in := make([]byte, size)
-				out := make([]byte, size)
-				for i := range in {
-					in[i] = byte(i)
+				if size <= smallSliceBytes {
+					t.Fatalf("size %d is at or below smallSliceBytes (%d), so it takes the "+
+						"table-free path and this case asserts nothing", size, smallSliceBytes)
 				}
+				in := patternedBytes(size)
+				out := make([]byte, size)
 
 				avg := testing.AllocsPerRun(allocRuns, func() {
 					k.fn(allocCoefficient, in, out)
