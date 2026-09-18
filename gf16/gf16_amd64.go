@@ -101,10 +101,19 @@ func mulAndAddSliceSSSE3(cEntry *mulTable64Entry, in, out []byte)
 // On amd64 with SSSE3, the bulk of the work is done by the vectorized SSSE3 path
 // (32 bytes = 16 elements per loop iteration via PSHUFB). Any trailing bytes that
 // don't fill a complete 32-byte chunk fall through to the scalar path.
+//
+// A zero coefficient zeroes out without dispatching, which is what the build
+// with no vector kernels already does by delegating straight to the scalar
+// kernel -- see the note in MulAndAddByteSliceLE for why this is about keeping
+// the architectures alike rather than about speed.
 func MulByteSliceLE(c T, in, out []byte) {
 	validateSlicePair(in, out)
 	n := len(in)
 	if n == 0 {
+		return
+	}
+	if c == 0 {
+		clear(out)
 		return
 	}
 
@@ -138,10 +147,23 @@ func MulByteSliceLE(c T, in, out []byte) {
 //
 // On amd64 with SSSE3, the bulk of the work is done by the vectorized SSSE3 path.
 // Any trailing bytes fall through to the scalar path.
+//
+// Adding a zero coefficient is the identity, and it returns here rather than
+// running a vector pass that reads out, XORs a table of zeros into it and writes
+// it back unchanged. This is not a measured win: a repair of a 100 MB set makes
+// 212 such calls out of 81,090,828, because a reconstruction matrix is the
+// inverse of a Vandermonde submatrix and those are dense. It is here so that the
+// same call does the same thing on every build -- the scalar kernels already
+// short-circuit, so a !amd64 build returned immediately while this one did the
+// full pass, and an architecture-dependent divergence reads as an oversight
+// whatever it costs.
 func MulAndAddByteSliceLE(c T, in, out []byte) {
 	validateSlicePair(in, out)
 	n := len(in)
 	if n == 0 {
+		return
+	}
+	if c == 0 {
 		return
 	}
 
