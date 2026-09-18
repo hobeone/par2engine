@@ -91,6 +91,13 @@ func applyMatrixSlice(ctx context.Context, m Matrix, in, out [][]byte, outStart,
 	}
 }
 
+// minSplitBytes is the smallest slice worth handing a goroutine, whatever the
+// kernel block width is. Without it a build with no vector kernels -- where
+// gf16.KernelBlockBytes reports a single element -- would split a 64-byte chunk
+// into 32 two-byte ranges, and the WaitGroup barrier would cost more than the
+// arithmetic. 16 is what this split used before it aligned to kernel blocks.
+const minSplitBytes = 16
+
 // perGoroutineSplit returns how many bytes of a chunk each goroutine multiplies.
 //
 // The split is rounded up to a whole gf16 kernel block so the vector path
@@ -102,13 +109,22 @@ func applyMatrixSlice(ctx context.Context, m Matrix, in, out [][]byte, outStart,
 // wider kernel cannot leave this rounding silently behind.
 //
 // Rounding up costs ranges: the result is under a block larger than the exact
-// share, so at most (block/16) times fewer goroutines than the old rounding
-// gave, and only where a share was already smaller than a few hundred bytes.
-// One goroutine also gets whatever is left over, and that remainder is a short
-// slice the others wait on at the barrier. gf16's small-slice path is what keeps
-// that straggler cheap; rounding here without it trades wall time for CPU time.
+// share, so at most (block/minSplitBytes) times fewer goroutines than the old
+// rounding gave, and only where a share was already smaller than a few hundred
+// bytes. One goroutine also gets whatever is left over, and that remainder is a
+// short slice the others wait on at the barrier. gf16's small-slice path is what
+// keeps that straggler cheap; rounding here without it trades wall time for CPU
+// time.
 func perGoroutineSplit(dataLength, numGoroutines int) int {
-	block := gf16.KernelBlockBytes()
+	return splitForBlock(dataLength, numGoroutines, gf16.KernelBlockBytes())
+}
+
+// splitForBlock is perGoroutineSplit with the kernel block width passed in, so a
+// test can exercise a width this machine does not have -- the floor below only
+// binds where the block is smaller than it, which never happens on a CPU with
+// vector kernels.
+func splitForBlock(dataLength, numGoroutines, kernelBlock int) int {
+	block := max(kernelBlock, minSplitBytes)
 	split := max((dataLength+numGoroutines-1)/numGoroutines, block)
 	if rem := split % block; rem != 0 {
 		split += block - rem

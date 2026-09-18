@@ -49,12 +49,28 @@ func patternedBytes(n int) []byte {
 	return b
 }
 
+// dirtyBytes is a destination buffer with no zero byte in it, for a kernel that
+// must overwrite what it finds. Passing a fresh make([]byte, n) hides a kernel
+// that writes nothing wherever the correct answer happens to be zero.
+func dirtyBytes(n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i%251) | 0x01
+	}
+	return b
+}
+
 func TestScalarKernelsAgreeAcrossTheSmallSliceThreshold(t *testing.T) {
 	for _, size := range smallTestSizes {
 		for _, c := range smallTestCoefficients {
 			t.Run(fmt.Sprintf("mul/size=%d/c=%#04x", size, c), func(t *testing.T) {
 				in := patternedBytes(size)
-				got := make([]byte, size)
+
+				// Dirty, not freshly allocated. mulScalarByteSliceLE must
+				// overwrite every byte of out, and a zeroed buffer cannot tell
+				// "wrote the answer" from "wrote nothing" when the answer is
+				// zero -- which is the whole output when c is 0.
+				got := dirtyBytes(size)
 				mulScalarByteSliceLE(c, in, got)
 
 				if want := refMulLE(c, in); !bytes.Equal(got, want) {
@@ -96,7 +112,7 @@ func TestExportedKernelsAgreeWithReference(t *testing.T) {
 			in := patternedBytes(size)
 			want := refMulLE(c, in)
 
-			got := make([]byte, size)
+			got := dirtyBytes(size)
 			MulByteSliceLE(c, in, got)
 			if !bytes.Equal(got, want) {
 				t.Errorf("MulByteSliceLE(size=%d, c=%#04x) = %x, want %x", size, c, got, want)

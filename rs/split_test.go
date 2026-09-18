@@ -12,16 +12,23 @@ import (
 // whole slice or leave a tail for the scalar path. These tests pin the
 // alignment, not the arithmetic that produces it.
 
+// effectiveBlock is the granularity perGoroutineSplit actually rounds to: the
+// kernel block, or minSplitBytes where the block is smaller than it. On amd64
+// with AVX2 that is 64; on a build with no vector kernels the floor decides, and
+// a test expecting the bare block width would fail there rather than on the
+// machine it was written on.
+func effectiveBlock() int { return max(gf16.KernelBlockBytes(), minSplitBytes) }
+
 func TestPerGoroutineSplitIsVectorAligned(t *testing.T) {
 	for _, dataLength := range []int{1, 16, 64, 100, 368, 7648, 11600, 15968, 38128, 1 << 20} {
 		for _, goroutines := range []int{1, 2, 8, 32, 64} {
 			t.Run(fmt.Sprintf("len=%d/g=%d", dataLength, goroutines), func(t *testing.T) {
 				split := perGoroutineSplit(dataLength, goroutines)
 
-				if split%gf16.KernelBlockBytes() != 0 {
+				if split%effectiveBlock() != 0 {
 					t.Errorf("perGoroutineSplit(%d, %d) = %d, want a multiple of %d -- "+
 						"a split that is not lets every goroutine leave a scalar tail",
-						dataLength, goroutines, split, gf16.KernelBlockBytes())
+						dataLength, goroutines, split, effectiveBlock())
 				}
 				if split <= 0 {
 					t.Fatalf("perGoroutineSplit(%d, %d) = %d, want a positive size", dataLength, goroutines, split)
@@ -45,12 +52,46 @@ func TestPerGoroutineSplitIsVectorAligned(t *testing.T) {
 // enough to give every goroutine a whole block must still do so.
 func TestPerGoroutineSplitUsesEveryGoroutine(t *testing.T) {
 	const goroutines = 32
-	dataLength := goroutines * gf16.KernelBlockBytes() * 4
+	dataLength := goroutines * effectiveBlock() * 4
 
 	split := perGoroutineSplit(dataLength, goroutines)
 	if got := (dataLength + split - 1) / split; got != goroutines {
 		t.Errorf("perGoroutineSplit(%d, %d) = %d yields %d ranges, want %d",
 			dataLength, goroutines, split, got, goroutines)
+	}
+}
+
+// TestPerGoroutineSplitKeepsAFloor pins the lower bound on a range's size. It
+// matters on builds with no vector kernels, where gf16.KernelBlockBytes is a
+// single element: without a floor, a small chunk over many goroutines splits
+// into two-byte ranges and the barrier costs more than the arithmetic. The
+// assertion holds on every architecture, so it does not depend on which one runs
+// the test.
+func TestPerGoroutineSplitKeepsAFloor(t *testing.T) {
+	// elementBlock is what gf16.KernelBlockBytes reports on a build with no
+	// vector kernels. It is passed in rather than read from this CPU, which has
+	// them -- the floor is unobservable at a 64-byte block, so a test that only
+	// ran the local width would pass with the floor deleted.
+	const elementBlock = 2
+
+	for _, tc := range []struct{ dataLength, goroutines int }{
+		{64, 32},
+		{2, 32},
+		{16, 64},
+		{100, 256},
+	} {
+		t.Run(fmt.Sprintf("len=%d/g=%d", tc.dataLength, tc.goroutines), func(t *testing.T) {
+			split := splitForBlock(tc.dataLength, tc.goroutines, elementBlock)
+			if split < minSplitBytes {
+				t.Errorf("splitForBlock(%d, %d, %d) = %d, want at least %d -- "+
+					"a chunk this small must not be cut into ranges the barrier costs more than",
+					tc.dataLength, tc.goroutines, elementBlock, split, minSplitBytes)
+			}
+			if split%elementBlock != 0 {
+				t.Errorf("splitForBlock(%d, %d, %d) = %d, want a multiple of the block",
+					tc.dataLength, tc.goroutines, elementBlock, split)
+			}
+		})
 	}
 }
 
@@ -60,7 +101,7 @@ func TestPerGoroutineSplitUsesEveryGoroutine(t *testing.T) {
 // under one block more than the exact share, so no chunk loses more than
 // block/16 of the ranges the old 16-byte rounding produced.
 func TestPerGoroutineSplitBoundsTheRangesLost(t *testing.T) {
-	block := gf16.KernelBlockBytes()
+	block := effectiveBlock()
 
 	for _, tc := range []struct{ dataLength, goroutines int }{
 		{11600, 32}, // the default memory limit's chunk, 32 cores

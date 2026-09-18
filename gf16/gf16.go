@@ -108,14 +108,20 @@ func calcTable(c T, table *mulTable) {
 	}
 }
 
-// mulScalarByteSliceLE sets each out[i] to c * in[i] using the 1KB stack-allocated
-// mulTable. This is the portable scalar path — zero heap allocation guaranteed.
+// mulScalarByteSliceLE sets each out[i] to c * in[i]. This is the portable
+// scalar path — zero heap allocation guaranteed.
+//
+// Inputs at or below smallSliceBytes multiply element by element through the
+// log/exp tables; longer ones build the 1 KB stack-allocated mulTable first and
+// read every element out of it. A zero coefficient zeroes out at any length,
+// without building a table of zeros to do it.
 func mulScalarByteSliceLE(c T, in, out []byte) {
+	if c == 0 {
+		clear(out[:len(in)])
+		return
+	}
+
 	if len(in) <= smallSliceBytes {
-		if c == 0 {
-			clear(out[:len(in)])
-			return
-		}
 		// The log of the coefficient is the same for every element, and so is
 		// the answer to "are the tables built yet" -- T.Times re-checks both per
 		// call and does not inline. Hoisting them out is ~27% of this loop.
@@ -168,13 +174,19 @@ func mulScalarByteSliceLE(c T, in, out []byte) {
 	}
 }
 
-// mulAndAddScalarByteSliceLE adds (XORs) c * in[i] to each out[i] using the 1KB
-// stack-allocated mulTable. Zero heap allocation guaranteed.
+// mulAndAddScalarByteSliceLE adds (XORs) c * in[i] to each out[i]. Zero heap
+// allocation guaranteed.
+//
+// It takes the same two shapes as mulScalarByteSliceLE: element by element at or
+// below smallSliceBytes, through the 1 KB stack-allocated mulTable above it.
+// Adding a zero coefficient is the identity at any length, so it returns without
+// building a table of zeros to XOR in.
 func mulAndAddScalarByteSliceLE(c T, in, out []byte) {
+	if c == 0 {
+		return
+	}
+
 	if len(in) <= smallSliceBytes {
-		if c == 0 {
-			return // adding zero leaves out unchanged
-		}
 		// See mulScalarByteSliceLE for why this reaches past T.Times.
 		logC := int(logTable[c-1])
 		for i := 0; i < len(in); i += 2 {
