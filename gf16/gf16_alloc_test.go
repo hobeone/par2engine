@@ -8,7 +8,10 @@
 
 package gf16
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 // allocRuns is the sample count handed to testing.AllocsPerRun. The measured
 // functions are deterministic, so a small number of runs is sufficient; the
@@ -30,6 +33,17 @@ const allocCoefficient = T(0xACE1)
 // measured a single large aligned buffer would therefore report zero allocations
 // while never once exercising the stack-allocation guarantee it claims to defend.
 // Sizes must be even; validateSlicePair panics on odd lengths.
+//
+// NONE OF THESE SIZES BUILDS A TABLE on amd64 with SSSE3, and that is not a gap
+// in the list -- it is unreachable through the exported entry points. A slice at
+// or below smallSliceBytes multiplies element by element, and a vector dispatch
+// never leaves more than 30 bytes for the scalar kernels, so every tail is below
+// the threshold too. Measured directly: with a counter in calcTable, all nine
+// cases below enter it exactly zero times. The table path is therefore asserted
+// separately, against the kernels themselves, by
+// TestScalarKernelsZeroAllocOnTheTablePath. Deleting that test and keeping only
+// these leaves the stack-allocation guarantee untested while every assertion
+// still passes.
 //
 // The one shape not reachable from here is the hasAVX2/hasSSSE3 false branch:
 // those are package-level vars set from CPU detection at init, so exercising the
@@ -75,6 +89,49 @@ func TestMulByteSliceLEZeroAlloc(t *testing.T) {
 					"the 1 KB mulTable has likely escaped to the heap", tc.size, avg)
 			}
 		})
+	}
+}
+
+// tablePathSizes are lengths above smallSliceBytes, so mulScalarByteSliceLE and
+// mulAndAddScalarByteSliceLE declare the 1 KB mulTable local that this file
+// exists to keep on the stack. They are passed to the kernels directly: no input
+// reaches them at these lengths through MulByteSliceLE on a machine with SSSE3,
+// which is why allocPathCases cannot carry this assertion (see its comment).
+var tablePathSizes = []int{smallSliceBytes + 2, 128, 1024, 4096}
+
+// TestScalarKernelsZeroAllocOnTheTablePath asserts the guarantee CLAUDE.md calls
+// non-negotiable: the 1 KB mulTable is stack-allocated. It calls the scalar
+// kernels rather than the exported functions, because only the kernels can be
+// handed a slice long enough to build a table.
+func TestScalarKernelsZeroAllocOnTheTablePath(t *testing.T) {
+	kernels := []struct {
+		name string
+		fn   func(T, []byte, []byte)
+	}{
+		{"mulScalarByteSliceLE", mulScalarByteSliceLE},
+		{"mulAndAddScalarByteSliceLE", mulAndAddScalarByteSliceLE},
+	}
+
+	for _, k := range kernels {
+		for _, size := range tablePathSizes {
+			t.Run(fmt.Sprintf("%s/size=%d", k.name, size), func(t *testing.T) {
+				if size <= smallSliceBytes {
+					t.Fatalf("size %d is at or below smallSliceBytes (%d), so it takes the "+
+						"table-free path and this case asserts nothing", size, smallSliceBytes)
+				}
+				in := patternedBytes(size)
+				out := make([]byte, size)
+
+				avg := testing.AllocsPerRun(allocRuns, func() {
+					k.fn(allocCoefficient, in, out)
+				})
+
+				if avg != 0 {
+					t.Errorf("%s(size=%d) allocated %v times per call, want 0; "+
+						"the 1 KB mulTable has likely escaped to the heap", k.name, size, avg)
+				}
+			})
+		}
 	}
 }
 
