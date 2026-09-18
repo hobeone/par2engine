@@ -95,34 +95,24 @@ func mulSliceSSSE3(cEntry *mulTable64Entry, in, out []byte)
 //go:noescape
 func mulAndAddSliceSSSE3(cEntry *mulTable64Entry, in, out []byte)
 
-// MulByteSliceLE treats in and out as arrays of T (stored little-endian),
-// and sets each out[i] to c * in[i].
+// mulBulkByteSliceLE is the amd64 half of MulByteSliceLE; see the contract on
+// the declaration beside it in gf16.go for what it may assume.
 //
-// On amd64 with SSSE3, the bulk of the work is done by the vectorized SSSE3 path
-// (32 bytes = 16 elements per loop iteration via PSHUFB). Any trailing bytes that
-// don't fill a complete 32-byte chunk fall through to the scalar path.
-//
-// A zero coefficient zeroes out without dispatching, which is what the build
-// with no vector kernels already does by delegating straight to the scalar
-// kernel -- see the note in MulAndAddByteSliceLE for why this is about keeping
-// the architectures alike rather than about speed.
-func MulByteSliceLE(c T, in, out []byte) {
-	validateSlicePair(in, out)
+// With SSSE3 the bulk of the work is done by the vectorized path (32 bytes = 16
+// elements per loop iteration via PSHUFB). Any trailing bytes that don't fill a
+// complete 32-byte chunk fall through to the scalar path.
+func mulBulkByteSliceLE(c T, in, out []byte) {
 	n := len(in)
-	if n == 0 {
-		return
-	}
-	if c == 0 {
-		clear(out)
-		return
-	}
 
 	if hasAVX2 {
 		avx2Len := n - (n % avx2BlockBytes)
 		if avx2Len > 0 {
 			MulByteSliceLE_AVX2((*[128]byte)(unsafe.Pointer(&mulTable64[c])), in[:avx2Len], out[:avx2Len])
 			if avx2Len < n {
-				MulByteSliceLE(c, in[avx2Len:], out[avx2Len:])
+				// The remainder, not the exported entry point: it is nonempty by
+				// the test above and c is unchanged, so re-running the guards
+				// would answer questions already answered.
+				mulBulkByteSliceLE(c, in[avx2Len:], out[avx2Len:])
 			}
 			return
 		}
@@ -142,37 +132,22 @@ func MulByteSliceLE(c T, in, out []byte) {
 	mulScalarByteSliceLE(c, in, out)
 }
 
-// MulAndAddByteSliceLE treats in and out as arrays of T (stored little-endian),
-// and adds (XORs) c * in[i] to out[i].
+// mulAndAddBulkByteSliceLE is the amd64 half of MulAndAddByteSliceLE; see the
+// contract on the declaration beside it in gf16.go for what it may assume.
 //
-// On amd64 with SSSE3, the bulk of the work is done by the vectorized SSSE3 path.
-// Any trailing bytes fall through to the scalar path.
-//
-// Adding a zero coefficient is the identity, and it returns here rather than
-// running a vector pass that reads out, XORs a table of zeros into it and writes
-// it back unchanged. This is not a measured win: a repair of a 100 MB set makes
-// 212 such calls out of 81,090,828, because a reconstruction matrix is the
-// inverse of a Vandermonde submatrix and those are dense. It is here so that the
-// same call does the same thing on every build -- the scalar kernels already
-// short-circuit, so a !amd64 build returned immediately while this one did the
-// full pass, and an architecture-dependent divergence reads as an oversight
-// whatever it costs.
-func MulAndAddByteSliceLE(c T, in, out []byte) {
-	validateSlicePair(in, out)
+// With SSSE3 the bulk of the work is done by the vectorized path. Any trailing
+// bytes fall through to the scalar path.
+func mulAndAddBulkByteSliceLE(c T, in, out []byte) {
 	n := len(in)
-	if n == 0 {
-		return
-	}
-	if c == 0 {
-		return
-	}
 
 	if hasAVX2 {
 		avx2Len := n - (n % avx2BlockBytes)
 		if avx2Len > 0 {
 			MulAndAddByteSliceLE_AVX2((*[128]byte)(unsafe.Pointer(&mulTable64[c])), in[:avx2Len], out[:avx2Len])
 			if avx2Len < n {
-				MulAndAddByteSliceLE(c, in[avx2Len:], out[avx2Len:])
+				// See mulBulkByteSliceLE for why this is the remainder rather
+				// than the exported entry point.
+				mulAndAddBulkByteSliceLE(c, in[avx2Len:], out[avx2Len:])
 			}
 			return
 		}

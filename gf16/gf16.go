@@ -108,6 +108,57 @@ func calcTable(c T, table *mulTable) {
 	}
 }
 
+// MulByteSliceLE treats in and out as arrays of T (stored little-endian), and
+// sets each out[i] to c * in[i].
+//
+// A zero coefficient zeroes out without reaching a kernel, and an empty slice
+// does nothing. Everything past those two answers goes to mulBulkByteSliceLE,
+// which each build tag implements over whatever kernels it has.
+func MulByteSliceLE(c T, in, out []byte) {
+	validateSlicePair(in, out)
+	if len(in) == 0 {
+		return
+	}
+	if c == 0 {
+		clear(out)
+		return
+	}
+	mulBulkByteSliceLE(c, in, out)
+}
+
+// MulAndAddByteSliceLE treats in and out as arrays of T (stored little-endian),
+// and adds (XORs) c * in[i] to out[i].
+//
+// Adding a zero coefficient is the identity, so it returns rather than running a
+// pass that reads out, XORs zeros into it and writes it back unchanged.
+//
+// That shortcut is not a measured win: a repair of a 100 MB set makes 212 such
+// calls out of 81,090,828, because a reconstruction matrix is the inverse of a
+// Vandermonde submatrix and those are dense. It lives here because this is the
+// one place every build passes through. It was previously written into the amd64
+// dispatch by hand, which a build with no vector kernels got for free by
+// delegating to a scalar kernel that already had it -- so the same call returned
+// immediately on one architecture and ran a full vector pass on the other. A
+// third backend would have reintroduced that divergence silently; reaching the
+// kernels only through here is what makes it unrepresentable instead.
+func MulAndAddByteSliceLE(c T, in, out []byte) {
+	validateSlicePair(in, out)
+	if len(in) == 0 {
+		return
+	}
+	if c == 0 {
+		return
+	}
+	mulAndAddBulkByteSliceLE(c, in, out)
+}
+
+// mulBulkByteSliceLE and mulAndAddBulkByteSliceLE are the per-architecture
+// halves of the two functions above, one implementation per build tag. Both are
+// called only from there, and may assume what those guards established: len(in)
+// is positive and even, len(out) == len(in), and c is nonzero. The scalar
+// kernels keep their own zero-coefficient guard regardless, because a test calls
+// them directly and logTable[c-1] would index out of range.
+
 // mulScalarByteSliceLE sets each out[i] to c * in[i]. This is the portable
 // scalar path — zero heap allocation guaranteed.
 //
