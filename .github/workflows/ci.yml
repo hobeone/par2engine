@@ -76,6 +76,17 @@ jobs:
           go test ./gf16/...
           go test -v -run ZeroAlloc ./gf16/...
 
+      # A 32-bit build is the only one that compiles gf16_nonamd64.go, so this
+      # is the only pass that executes the non-vector half of the gf16 kernels.
+      # The cross-build job compiles it and nothing more: gutting that half
+      # entirely left every amd64 test green and failed four here. linux/386
+      # runs natively on this runner, so no emulation is needed. -race does not
+      # support linux/386, which is why this is a plain run.
+      - name: Unit tests (GOARCH=386, non-vector kernels)
+        env:
+          GOARCH: "386"
+        run: go test ./gf16/... ./par2/... ./rs/... ./cmd/...
+
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -1
 
@@ -164,9 +175,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 32-bit targets exercise the gf16_nonamd64.go scalar fallback and
+          # 32-bit targets compile the gf16_nonamd64.go scalar fallback and
           # surface the atomic-alignment class of problem that does not appear
-          # on amd64.
+          # on amd64. Compiling is all this job does; the 386 half is executed
+          # by the test job's GOARCH=386 step.
           - goos: linux
             goarch: "386"
           - goos: linux
