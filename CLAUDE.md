@@ -49,10 +49,15 @@ tests/             E2E integration tests against par2cmdline canonical archives
 
 The 1 KB `mulTable` is **always stack-allocated**, as a local variable inside `mulScalarByteSliceLE` and `mulAndAddScalarByteSliceLE` (`gf16.go`) — the scalar path that the exported `MulByteSliceLE` and `MulAndAddByteSliceLE` delegate to. Those two exported functions are the hot path for all RS math. Any change that heap-allocates `mulTable` breaks the `0 B/op` performance guarantee.
 
-`TestMulByteSliceLEZeroAlloc` / `TestMulAndAddByteSliceLEZeroAlloc` (`gf16_alloc_test.go`) assert this and run in CI. Two things about them are load-bearing:
+`TestScalarKernelsZeroAllocOnTheTablePath` (`gf16_alloc_test.go`) is the assertion that defends it, and it calls the two kernels **directly**. It has to: below `smallSliceBytes` they multiply element by element and build no table at all, and no input reaches the table path through the exported functions on amd64 with SSSE3 — a vector dispatch never leaves a tail longer than 30 bytes. Measured with a counter in `calcTable`, every case in `allocPathCases` enters it zero times. `TestMulByteSliceLEZeroAlloc` / `TestMulAndAddByteSliceLEZeroAlloc` still run, and still pin that no dispatch arm allocates, but on amd64 they no longer reach the table; on 386, arm and any build without SSSE3 they do, because there the whole slice goes scalar.
 
+Three things here are load-bearing:
+
+- **The kernels must be called directly.** Routing the assertion through the exported functions is what made the older version of this gate decorative: with `mulTable` forced onto the heap, both exported-path tests stay green and only the direct one fails.
 - On amd64 with AVX2, any length that is a whole multiple of 64 dispatches straight to the assembly kernel and **never reaches the scalar path**. The tests therefore cover unaligned sizes too; a test using only aligned buffers would pass while measuring nothing.
 - They carry a `//go:build !race` constraint, because the race detector allocates for its own instrumentation. Run them without `-race`.
+
+`gf16.KernelBlockBytes()` reports how many bytes one kernel call consumes on the running CPU (64 with AVX2, 32 with SSSE3, one element otherwise). A caller that splits a buffer across goroutines rounds each piece to it — `rs.perGoroutineSplit` does — so the vector path consumes whole slices instead of leaving every goroutine a scalar tail. It is exported so that a future kernel width cannot leave a caller's hardcoded guess behind.
 
 ### rs — Reed-Solomon Coder
 

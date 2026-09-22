@@ -38,6 +38,28 @@ var hasSSSE3 = cpuid.CPU.Supports(cpuid.SSSE3)
 // hasAVX2 is true when the CPU supports AVX2 (required for VBROADCASTI128/planar repack).
 var hasAVX2 = cpuid.CPU.Supports(cpuid.AVX2)
 
+// Block sizes the vector kernels consume per iteration. The dispatch below
+// peels whole blocks and leaves the remainder to the scalar path, so these are
+// also what decides how long a scalar tail can be.
+const (
+	avx2BlockBytes  = 64
+	ssse3BlockBytes = 32
+)
+
+// blockBytes reports the largest run of bytes a single kernel call consumes on
+// this CPU, which is what a caller slicing work up should align to. See
+// KernelBlockBytes.
+var blockBytes = func() int {
+	switch {
+	case hasAVX2:
+		return avx2BlockBytes
+	case hasSSSE3:
+		return ssse3BlockBytes
+	default:
+		return elementBytes
+	}
+}()
+
 func init() {
 	// Relies on logTable/expTable already populated by gf16.go's init (runs first by
 	// alphabetical file order within the package).
@@ -73,32 +95,31 @@ func mulSliceSSSE3(cEntry *mulTable64Entry, in, out []byte)
 //go:noescape
 func mulAndAddSliceSSSE3(cEntry *mulTable64Entry, in, out []byte)
 
-// MulByteSliceLE treats in and out as arrays of T (stored little-endian),
-// and sets each out[i] to c * in[i].
+// mulBulkByteSliceLE is the amd64 half of MulByteSliceLE; see the contract on
+// the declaration beside it in gf16.go for what it may assume.
 //
-// On amd64 with SSSE3, the bulk of the work is done by the vectorized SSSE3 path
-// (32 bytes = 16 elements per loop iteration via PSHUFB). Any trailing bytes that
-// don't fill a complete 32-byte chunk fall through to the scalar path.
-func MulByteSliceLE(c T, in, out []byte) {
-	validateSlicePair(in, out)
+// With SSSE3 the bulk of the work is done by the vectorized path (32 bytes = 16
+// elements per loop iteration via PSHUFB). Any trailing bytes that don't fill a
+// complete 32-byte chunk fall through to the scalar path.
+func mulBulkByteSliceLE(c T, in, out []byte) {
 	n := len(in)
-	if n == 0 {
-		return
-	}
 
 	if hasAVX2 {
-		avx2Len := n - (n % 64)
+		avx2Len := n - (n % avx2BlockBytes)
 		if avx2Len > 0 {
 			MulByteSliceLE_AVX2((*[128]byte)(unsafe.Pointer(&mulTable64[c])), in[:avx2Len], out[:avx2Len])
 			if avx2Len < n {
-				MulByteSliceLE(c, in[avx2Len:], out[avx2Len:])
+				// The remainder, not the exported entry point: it is nonempty by
+				// the test above and c is unchanged, so re-running the guards
+				// would answer questions already answered.
+				mulBulkByteSliceLE(c, in[avx2Len:], out[avx2Len:])
 			}
 			return
 		}
 	}
 
 	if hasSSSE3 {
-		ssse3Len := n - (n % 32)
+		ssse3Len := n - (n % ssse3BlockBytes)
 		if ssse3Len > 0 {
 			mulSliceSSSE3(&mulTable64[c], in[:ssse3Len], out[:ssse3Len])
 		}
@@ -111,31 +132,29 @@ func MulByteSliceLE(c T, in, out []byte) {
 	mulScalarByteSliceLE(c, in, out)
 }
 
-// MulAndAddByteSliceLE treats in and out as arrays of T (stored little-endian),
-// and adds (XORs) c * in[i] to out[i].
+// mulAndAddBulkByteSliceLE is the amd64 half of MulAndAddByteSliceLE; see the
+// contract on the declaration beside it in gf16.go for what it may assume.
 //
-// On amd64 with SSSE3, the bulk of the work is done by the vectorized SSSE3 path.
-// Any trailing bytes fall through to the scalar path.
-func MulAndAddByteSliceLE(c T, in, out []byte) {
-	validateSlicePair(in, out)
+// With SSSE3 the bulk of the work is done by the vectorized path. Any trailing
+// bytes fall through to the scalar path.
+func mulAndAddBulkByteSliceLE(c T, in, out []byte) {
 	n := len(in)
-	if n == 0 {
-		return
-	}
 
 	if hasAVX2 {
-		avx2Len := n - (n % 64)
+		avx2Len := n - (n % avx2BlockBytes)
 		if avx2Len > 0 {
 			MulAndAddByteSliceLE_AVX2((*[128]byte)(unsafe.Pointer(&mulTable64[c])), in[:avx2Len], out[:avx2Len])
 			if avx2Len < n {
-				MulAndAddByteSliceLE(c, in[avx2Len:], out[avx2Len:])
+				// See mulBulkByteSliceLE for why this is the remainder rather
+				// than the exported entry point.
+				mulAndAddBulkByteSliceLE(c, in[avx2Len:], out[avx2Len:])
 			}
 			return
 		}
 	}
 
 	if hasSSSE3 {
-		ssse3Len := n - (n % 32)
+		ssse3Len := n - (n % ssse3BlockBytes)
 		if ssse3Len > 0 {
 			mulAndAddSliceSSSE3(&mulTable64[c], in[:ssse3Len], out[:ssse3Len])
 		}

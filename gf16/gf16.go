@@ -18,6 +18,39 @@ const order = 1 << 16
 var logTable [order - 1]uint16
 var expTable [order - 1]T
 
+// elementBytes is the width of one T in a byte slice. Every length this package
+// accepts is a multiple of it; validateSlicePair rejects the rest.
+const elementBytes = 2
+
+// KernelBlockBytes reports the run of bytes MulByteSliceLE and
+// MulAndAddByteSliceLE consume per kernel call on this CPU: 64 with AVX2, 32
+// with SSSE3, and one element where neither is available.
+//
+// A caller that splits a buffer across goroutines should make each piece a
+// multiple of this, or every piece leaves a remainder for the scalar path to
+// finish -- which is the whole reason the value is exported rather than being
+// each caller's own guess at what the kernels do.
+func KernelBlockBytes() int { return blockBytes }
+
+// smallSliceBytes is the length at or below which the scalar kernels multiply
+// element by element instead of building a mulTable first.
+//
+// calcTable writes 512 entries whatever the input length, so on a short slice it
+// is nearly the whole cost: a 16-byte call measures ~150ns, of which ~140ns is
+// calcTable, against ~12ns for the element-by-element loop. The table only pays
+// for itself once enough elements share it -- measured crossover on amd64 is
+// between 256 and 384 bytes.
+//
+// The threshold sits far below that crossover on purpose, because the scalar
+// kernels are only ever reached with a tail: the exported entry points hand off
+// whole avx2BlockBytes and ssse3BlockBytes runs to the vector kernels, so what
+// is left is at most 30 bytes. Gaussian elimination in rs/matrix.go calls in
+// with a row at a time, which lands in the same range (26 and 28 bytes in two
+// measured repairs). Choosing 64 keeps every one of those on the cheap side
+// while leaving the table path in charge wherever its setup is earned -- which,
+// on a build without SSSE3, is the whole slice.
+const smallSliceBytes = 64
+
 // mulTable is a 1KB lookup table for a specific coefficient,
 // allowing fast multiplication of 16-bit elements 8 bits at a time.
 type mulTable struct {
@@ -75,9 +108,89 @@ func calcTable(c T, table *mulTable) {
 	}
 }
 
-// mulScalarByteSliceLE sets each out[i] to c * in[i] using the 1KB stack-allocated
-// mulTable. This is the portable scalar path — zero heap allocation guaranteed.
+// MulByteSliceLE treats in and out as arrays of T (stored little-endian), and
+// sets each out[i] to c * in[i].
+//
+// A zero coefficient zeroes out without reaching a kernel, and an empty slice
+// does nothing. Everything past those two answers goes to mulBulkByteSliceLE,
+// which each build tag implements over whatever kernels it has.
+func MulByteSliceLE(c T, in, out []byte) {
+	validateSlicePair(in, out)
+	if len(in) == 0 {
+		return
+	}
+	if c == 0 {
+		clear(out)
+		return
+	}
+	mulBulkByteSliceLE(c, in, out)
+}
+
+// MulAndAddByteSliceLE treats in and out as arrays of T (stored little-endian),
+// and adds (XORs) c * in[i] to out[i].
+//
+// Adding a zero coefficient is the identity, so it returns rather than running a
+// pass that reads out, XORs zeros into it and writes it back unchanged.
+//
+// That shortcut is not a measured win: a repair of a 100 MB set makes 212 such
+// calls out of 81,090,828, because a reconstruction matrix is the inverse of a
+// Vandermonde submatrix and those are dense. It lives here because this is the
+// one place every build passes through. It was previously written into the amd64
+// dispatch by hand, which a build with no vector kernels got for free by
+// delegating to a scalar kernel that already had it -- so the same call returned
+// immediately on one architecture and ran a full vector pass on the other. A
+// third backend would have reintroduced that divergence silently; reaching the
+// kernels only through here is what makes it unrepresentable instead.
+func MulAndAddByteSliceLE(c T, in, out []byte) {
+	validateSlicePair(in, out)
+	if len(in) == 0 {
+		return
+	}
+	if c == 0 {
+		return
+	}
+	mulAndAddBulkByteSliceLE(c, in, out)
+}
+
+// mulBulkByteSliceLE and mulAndAddBulkByteSliceLE are the per-architecture
+// halves of the two functions above, one implementation per build tag. Both are
+// called only from there, and may assume what those guards established: len(in)
+// is positive and even, len(out) == len(in), and c is nonzero. The scalar
+// kernels keep their own zero-coefficient guard regardless, because a test calls
+// them directly and logTable[c-1] would index out of range.
+
+// mulScalarByteSliceLE sets each out[i] to c * in[i]. This is the portable
+// scalar path — zero heap allocation guaranteed.
+//
+// Inputs at or below smallSliceBytes multiply element by element through the
+// log/exp tables; longer ones build the 1 KB stack-allocated mulTable first and
+// read every element out of it. A zero coefficient zeroes out at any length,
+// without building a table of zeros to do it.
 func mulScalarByteSliceLE(c T, in, out []byte) {
+	if c == 0 {
+		clear(out[:len(in)])
+		return
+	}
+
+	if len(in) <= smallSliceBytes {
+		// The log of the coefficient is the same for every element, and so is
+		// the answer to "are the tables built yet" -- T.Times re-checks both per
+		// call and does not inline. Hoisting them out is ~27% of this loop.
+		// Reaching past Times is only safe below the kernels' own callers: the
+		// bootstrap in init() multiplies through timesPoly while these tables
+		// are still empty, and never through a kernel.
+		logC := int(logTable[c-1])
+		for i := 0; i < len(in); i += 2 {
+			v := binary.LittleEndian.Uint16(in[i:])
+			var r uint16
+			if v != 0 {
+				r = uint16(expTable[(logC+int(logTable[v-1]))%(order-1)])
+			}
+			binary.LittleEndian.PutUint16(out[i:], r)
+		}
+		return
+	}
+
 	var table mulTable
 	calcTable(c, &table)
 
@@ -112,9 +225,32 @@ func mulScalarByteSliceLE(c T, in, out []byte) {
 	}
 }
 
-// mulAndAddScalarByteSliceLE adds (XORs) c * in[i] to each out[i] using the 1KB
-// stack-allocated mulTable. Zero heap allocation guaranteed.
+// mulAndAddScalarByteSliceLE adds (XORs) c * in[i] to each out[i]. Zero heap
+// allocation guaranteed.
+//
+// It takes the same two shapes as mulScalarByteSliceLE: element by element at or
+// below smallSliceBytes, through the 1 KB stack-allocated mulTable above it.
+// Adding a zero coefficient is the identity at any length, so it returns without
+// building a table of zeros to XOR in.
 func mulAndAddScalarByteSliceLE(c T, in, out []byte) {
+	if c == 0 {
+		return
+	}
+
+	if len(in) <= smallSliceBytes {
+		// See mulScalarByteSliceLE for why this reaches past T.Times.
+		logC := int(logTable[c-1])
+		for i := 0; i < len(in); i += 2 {
+			v := binary.LittleEndian.Uint16(in[i:])
+			var r uint16
+			if v != 0 {
+				r = uint16(expTable[(logC+int(logTable[v-1]))%(order-1)])
+			}
+			binary.LittleEndian.PutUint16(out[i:], binary.LittleEndian.Uint16(out[i:])^r)
+		}
+		return
+	}
+
 	var table mulTable
 	calcTable(c, &table)
 
