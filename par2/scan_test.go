@@ -764,6 +764,7 @@ func TestVerificationReporting(t *testing.T) {
 	idMismatch := FileID{0x03}
 	idRename := FileID{0x04}
 	idDamaged := FileID{0x05}
+	idCorrupt := FileID{0x06}
 
 	d.protectedFiles = []FileDescPacket{
 		{FileID: idOK, Filename: "ok.dat", ByteCount: 13},
@@ -771,6 +772,7 @@ func TestVerificationReporting(t *testing.T) {
 		{FileID: idMismatch, Filename: "mismatch.dat", ByteCount: 10},
 		{FileID: idRename, Filename: "rename_dest.dat", ByteCount: 10},
 		{FileID: idDamaged, Filename: "damaged.dat", ByteCount: 10},
+		{FileID: idCorrupt, Filename: "corrupt.dat", ByteCount: 10},
 	}
 
 	d.fileIntegrity[idOK] = &fileIntegrityState{
@@ -792,6 +794,12 @@ func TestVerificationReporting(t *testing.T) {
 		HashMismatch:   true,
 		ShardLocations: []shardLocation{{FileID: idDamaged, Offset: -1}},
 	}
+	// All blocks present (no -1 offsets) but the hash still doesn't match: real
+	// corruption, not missing data — distinct log branch from idDamaged above.
+	d.fileIntegrity[idCorrupt] = &fileIntegrityState{
+		HashMismatch:   true,
+		ShardLocations: []shardLocation{{FileID: idCorrupt, Offset: 0}},
+	}
 
 	d.logVerificationReport(context.Background(), ShardCounts{
 		UnusableDataShardCount: 2,
@@ -805,18 +813,39 @@ func TestVerificationReporting(t *testing.T) {
 		"File status: OK",
 		"File status: SIZE MISMATCH",
 		"File status: DAMAGED",
+		"File status: CORRUPT",
 		"File status: MISNAMED",
 		"Verification summary",
-		"totalFiles=5",
+		"totalFiles=6",
 		"ok=1",
 		"missing=1",
-		"damaged=2",
+		"damaged=3",
 		"misnamed=1",
 	}
 
 	for _, expected := range expectedLogs {
 		if !strings.Contains(logOutput, expected) {
 			t.Errorf("expected log output to contain %q", expected)
+		}
+	}
+
+	// Pin each status message to its specific file, not just presence anywhere
+	// in the log: a substring-only check can't tell "damaged.dat got DAMAGED
+	// and corrupt.dat got CORRUPT" apart from the two messages swapped between
+	// the two files, which is exactly what flipping the "missing > 0" branch
+	// condition in logVerificationReport would do.
+	fileStatus := map[string]string{
+		"ok.dat":       "File status: OK",
+		"missing.dat":  "File status: MISSING",
+		"mismatch.dat": "File status: SIZE MISMATCH",
+		"damaged.dat":  "File status: DAMAGED",
+		"corrupt.dat":  "File status: CORRUPT",
+	}
+	for _, line := range strings.Split(logOutput, "\n") {
+		for file, status := range fileStatus {
+			if strings.Contains(line, "file="+file) && !strings.Contains(line, status) {
+				t.Errorf("line for %s does not contain %q:\n%s", file, status, line)
+			}
 		}
 	}
 }
@@ -872,6 +901,43 @@ func TestRenameMisnamedFiles_ErrorPaths(t *testing.T) {
 	state2 := d.fileIntegrity[idRenameFail]
 	if state2.RenameSource != "" || !state2.HashMismatch {
 		t.Errorf("expected fallback to repair for Rename failure, got RenameSource=%q HashMismatch=%v", state2.RenameSource, state2.HashMismatch)
+	}
+}
+
+// TestRenameMisnamedFiles_Success confirms the returned count reflects an
+// actual successful rename. The existing end-to-end coverage
+// (TestRenameMisnamedFile) drives this through a full Repair flow but never
+// inspects renameMisnamedFiles' own return value.
+func TestRenameMisnamedFiles_Success(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "source.dat"), []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Decoder{
+		root:          root,
+		logger:        slog.Default(),
+		fileIntegrity: make(map[FileID]*fileIntegrityState),
+	}
+	defer func() { _ = d.Close() }()
+
+	fid := FileID{0x01}
+	d.protectedFiles = []FileDescPacket{{FileID: fid, Filename: "dest.dat", ByteCount: 4}}
+	d.fileIntegrity[fid] = &fileIntegrityState{
+		RenameSource:   "source.dat",
+		ShardLocations: []shardLocation{{Offset: -1}},
+	}
+
+	if renamed := d.renameMisnamedFiles(context.Background()); renamed != 1 {
+		t.Errorf("renameMisnamedFiles returned %d, want 1", renamed)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "dest.dat")); err != nil {
+		t.Errorf("dest.dat should exist after rename: %v", err)
 	}
 }
 
@@ -985,4 +1051,228 @@ func TestScanProgressAdd(t *testing.T) {
 			t.Errorf("sent %d updates, want %d", got, want)
 		}
 	})
+}
+
+// TestPostScanVerifyTally confirms the usable/unusable/rename tallies
+// postScanVerify computes from ShardLocations. Pre-Verified states make
+// verifyProtectedFilesHashes skip its I/O entirely (see its
+// "state.Verified || state.SizeMismatch" guard), isolating the tally
+// arithmetic from the hash-verification path already covered elsewhere.
+// The tallies are local to postScanVerify, so this reads them back out of
+// the log line logVerificationReport emits rather than a stored field.
+func TestPostScanVerifyTally(t *testing.T) {
+	newDecoder := func(t *testing.T) (*Decoder, *bytes.Buffer) {
+		t.Helper()
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		dir := t.TempDir()
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d := &Decoder{
+			root:          root,
+			logger:        logger,
+			fileChecksums: make(map[FileID]*IFSCPacket),
+			parityShards:  map[uint16][]byte{0: {}, 1: {}},
+			fileIntegrity: make(map[FileID]*fileIntegrityState),
+		}
+		t.Cleanup(func() { _ = d.Close() })
+		return d, &buf
+	}
+
+	// The outer switch in logVerificationReport checks UnusableDataShardCount
+	// before RenamesNeeded, so a rename-only scenario is needed to observe the
+	// RenamesNeeded tally in the emitted log — a scenario mixing both would
+	// mask the rename branch entirely.
+	t.Run("usable_and_unusable_shards", func(t *testing.T) {
+		d, buf := newDecoder(t)
+
+		idHealthy := FileID{0x01}
+		idPartial := FileID{0x02}
+		d.protectedFiles = []FileDescPacket{
+			{FileID: idHealthy, Filename: "healthy.dat"},
+			{FileID: idPartial, Filename: "partial.dat"},
+		}
+		// 2 usable shards.
+		d.fileIntegrity[idHealthy] = &fileIntegrityState{
+			Verified:       true,
+			ShardLocations: []shardLocation{{FileID: idHealthy, Offset: 0}, {FileID: idHealthy, Offset: 8}},
+		}
+		// 1 usable + 1 unusable shard.
+		d.fileIntegrity[idPartial] = &fileIntegrityState{
+			Verified:       true,
+			ShardLocations: []shardLocation{{FileID: idPartial, Offset: 0}, {Offset: -1}},
+		}
+
+		d.postScanVerify(context.Background())
+
+		logOutput := buf.String()
+		for _, want := range []string{"usableDataShards=3", "unusableDataShards=1", "usableParityShards=2"} {
+			if !strings.Contains(logOutput, want) {
+				t.Errorf("log output missing %q\nfull output:\n%s", want, logOutput)
+			}
+		}
+	})
+
+	t.Run("rename_needed_no_unusable_shards", func(t *testing.T) {
+		d, buf := newDecoder(t)
+
+		idRenamed := FileID{0x03}
+		d.protectedFiles = []FileDescPacket{{FileID: idRenamed, Filename: "renamed.dat"}}
+		d.fileIntegrity[idRenamed] = &fileIntegrityState{
+			Verified:       true,
+			RenameSource:   "old_name.dat",
+			ShardLocations: []shardLocation{{FileID: idRenamed, Offset: 0}},
+		}
+
+		d.postScanVerify(context.Background())
+
+		logOutput := buf.String()
+		for _, want := range []string{"usableDataShards=1", "unusableDataShards=0", "filesToRename=1"} {
+			if !strings.Contains(logOutput, want) {
+				t.Errorf("log output missing %q\nfull output:\n%s", want, logOutput)
+			}
+		}
+	})
+}
+
+// TestPrescanCandidateMatches_FullHashMismatch confirms a candidate whose
+// quick 16 KB hash matches a missing file's SixteenKHash, but whose
+// full-file MD5 does not, is rejected rather than accepted on the partial
+// match alone.
+func TestPrescanCandidateMatches_FullHashMismatch(t *testing.T) {
+	const size = quickHashSize + 100 // bigger than the 16 KB quick-hash prefix
+
+	shared := make([]byte, quickHashSize)
+	for i := range shared {
+		shared[i] = byte(i)
+	}
+	genuine := append(append([]byte{}, shared...), bytes.Repeat([]byte{0xAA}, size-quickHashSize)...)
+	forged := append(append([]byte{}, shared...), bytes.Repeat([]byte{0xBB}, size-quickHashSize)...)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "candidate.dat"), forged, 0644); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := &Decoder{
+		root:           root,
+		logger:         slog.Default(),
+		sliceByteCount: 1024,
+		fileIntegrity:  make(map[FileID]*fileIntegrityState),
+		candidateFiles: map[string]FileID{"candidate.dat": {0x02}},
+	}
+	defer func() { _ = d.Close() }()
+
+	fd := FileDescPacket{
+		FileID:       FileID{0x01},
+		Filename:     "target.dat",
+		ByteCount:    size,
+		SixteenKHash: md5.Sum(shared),
+		Hash:         md5.Sum(genuine),
+	}
+	d.protectedFiles = []FileDescPacket{fd}
+	d.fileIntegrity[fd.FileID] = &fileIntegrityState{FileID: fd.FileID, Missing: true}
+
+	resolved := d.prescanCandidateMatches(context.Background())
+
+	if resolved["candidate.dat"] {
+		t.Error("candidate resolved despite full-file MD5 mismatch after a matching quick hash")
+	}
+	if state := d.fileIntegrity[fd.FileID]; state.Verified {
+		t.Error("target marked Verified despite full-file MD5 mismatch")
+	}
+}
+
+// TestComputeFileMD5_Errors covers the two I/O failure paths in
+// computeFileMD5 (Seek and the io.Copy read), neither of which the
+// happy-path callers (prescan, verifySingleFileHash, detectRenameCandidate)
+// ever trigger.
+func TestComputeFileMD5_Errors(t *testing.T) {
+	t.Run("seek_error_on_closed_file", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "f.dat")
+		if err := os.WriteFile(path, []byte("data"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = f.Close() // Seek on a closed file errors.
+
+		if _, err := computeFileMD5(f); err == nil {
+			t.Error("expected an error from Seek on a closed file, got nil")
+		}
+	})
+
+	t.Run("copy_error_reading_a_directory", func(t *testing.T) {
+		dir := t.TempDir()
+		f, err := os.Open(dir) // Seek(0) succeeds on a directory; Read does not.
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = f.Close() }()
+
+		if _, err := computeFileMD5(f); err == nil {
+			t.Error("expected an error from io.Copy reading a directory, got nil")
+		}
+	})
+}
+
+// TestQuickHash16K_ReadError covers quickHash16K's non-EOF error return —
+// every existing caller only ever hits the success or EOF-on-short-file path.
+func TestQuickHash16K_ReadError(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.Open(dir) // ReadAt on a directory fd fails.
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	if _, err := quickHash16K(f, 4096); err == nil {
+		t.Error("expected an error reading from a directory fd, got nil")
+	}
+}
+
+// TestCheckFileExistence_NonNotExistError confirms an Open failure other
+// than ErrNotExist (e.g. a permission error) propagates as a real error
+// instead of being treated like a missing file.
+func TestCheckFileExistence_NonNotExistError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root; permission checks are bypassed")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "noperm.dat")
+	if err := os.WriteFile(path, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0000); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(path, 0644) }() // allow TempDir cleanup
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fid := FileID{0x01}
+	d := &Decoder{
+		root:           root,
+		logger:         slog.Default(),
+		protectedFiles: []FileDescPacket{{FileID: fid, Filename: "noperm.dat"}},
+		fileIntegrity:  map[FileID]*fileIntegrityState{fid: {}},
+	}
+	defer func() { _ = d.Close() }()
+
+	if err := d.checkFileExistence(context.Background()); err == nil {
+		t.Error("expected a permission error, got nil")
+	}
 }
