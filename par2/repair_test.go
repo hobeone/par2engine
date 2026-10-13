@@ -253,6 +253,9 @@ func newInstallTestPipeline(t *testing.T, files ...installTestFile) (*repairPipe
 		tempNames: make(map[string]string),
 	}
 	for i, tf := range files {
+		if err := os.MkdirAll(filepath.Join(dir, filepath.Dir(tf.name)), 0755); err != nil {
+			t.Fatal(err)
+		}
 		if err := os.WriteFile(filepath.Join(dir, tf.name), tf.original, 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -282,36 +285,55 @@ func assertFileContents(t *testing.T, path string, want []byte) {
 	}
 }
 
+// TestRepairPipelineInstall runs each case with the files at the top of the
+// sandbox and again inside a nested directory, where the temp file is created
+// beside its target in that directory.
 func TestRepairPipelineInstall(t *testing.T) {
+	for _, layout := range []struct{ name, dir string }{
+		{"top_level", ""},
+		{"nested_dir", filepath.Join("sub", "dir")},
+	} {
+		t.Run(layout.name, func(t *testing.T) {
+			testRepairPipelineInstall(t, filepath.Join(layout.dir, "a.dat"), filepath.Join(layout.dir, "b.dat"))
+		})
+	}
+}
+
+func testRepairPipelineInstall(t *testing.T, aName, bName string) {
 	original := []byte("old contents")
 	rebuilt := []byte("rebuilt contents")
 
 	t.Run("hash_match_installs_and_keeps_mode", func(t *testing.T) {
-		p, dir := newInstallTestPipeline(t, installTestFile{"a.dat", original, rebuilt, md5.Sum(rebuilt)})
+		p, dir := newInstallTestPipeline(t, installTestFile{aName, original, rebuilt, md5.Sum(rebuilt)})
+		// The temp file sits beside its target, so the final rename never
+		// crosses a directory and so never crosses a filesystem.
+		if got := filepath.Dir(p.tempNames[aName]); got != filepath.Dir(aName) {
+			t.Errorf("temp file for %s is in %q, want %q", aName, got, filepath.Dir(aName))
+		}
 		if err := p.install(); err != nil {
 			t.Fatalf("install failed: %v", err)
 		}
 		p.close()
 
-		assertFileContents(t, filepath.Join(dir, "a.dat"), rebuilt)
-		info, err := os.Stat(filepath.Join(dir, "a.dat"))
+		assertFileContents(t, filepath.Join(dir, aName), rebuilt)
+		info, err := os.Stat(filepath.Join(dir, aName))
 		if err != nil {
 			t.Fatal(err)
 		}
 		if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
-			t.Errorf("a.dat mode = %v, want 0600 kept from the replaced file", info.Mode().Perm())
+			t.Errorf("%s mode = %v, want 0600 kept from the replaced file", aName, info.Mode().Perm())
 		}
 		assertNoRepairTempFiles(t, dir)
 	})
 
 	t.Run("hash_mismatch_leaves_original_and_no_temp", func(t *testing.T) {
-		p, dir := newInstallTestPipeline(t, installTestFile{"a.dat", original, rebuilt, md5.Sum([]byte("something else"))})
+		p, dir := newInstallTestPipeline(t, installTestFile{aName, original, rebuilt, md5.Sum([]byte("something else"))})
 		if err := p.install(); err == nil {
 			t.Fatal("install succeeded despite a hash mismatch")
 		}
 		p.close()
 
-		assertFileContents(t, filepath.Join(dir, "a.dat"), original)
+		assertFileContents(t, filepath.Join(dir, aName), original)
 		assertNoRepairTempFiles(t, dir)
 	})
 
@@ -320,30 +342,30 @@ func TestRepairPipelineInstall(t *testing.T) {
 	t.Run("one_mismatch_installs_no_file", func(t *testing.T) {
 		otherRebuilt := []byte("other rebuilt")
 		p, dir := newInstallTestPipeline(t,
-			installTestFile{"a.dat", original, rebuilt, md5.Sum(rebuilt)},
-			installTestFile{"b.dat", original, otherRebuilt, md5.Sum([]byte("something else"))},
+			installTestFile{aName, original, rebuilt, md5.Sum(rebuilt)},
+			installTestFile{bName, original, otherRebuilt, md5.Sum([]byte("something else"))},
 		)
 		if err := p.install(); err == nil {
 			t.Fatal("install succeeded despite a hash mismatch")
 		}
 		p.close()
 
-		assertFileContents(t, filepath.Join(dir, "a.dat"), original)
-		assertFileContents(t, filepath.Join(dir, "b.dat"), original)
+		assertFileContents(t, filepath.Join(dir, aName), original)
+		assertFileContents(t, filepath.Join(dir, bName), original)
 		assertNoRepairTempFiles(t, dir)
 	})
 
 	// A file marked for writing that never got an output must fail the repair
 	// rather than be reported as rebuilt.
 	t.Run("file_without_output_fails", func(t *testing.T) {
-		p, dir := newInstallTestPipeline(t, installTestFile{"a.dat", original, rebuilt, md5.Sum(rebuilt)})
+		p, dir := newInstallTestPipeline(t, installTestFile{aName, original, rebuilt, md5.Sum(rebuilt)})
 		p.plan.needsWrite["never-written.dat"] = true
 		if err := p.install(); err == nil {
 			t.Fatal("install succeeded although a file marked for writing has no output")
 		}
 		p.close()
 
-		assertFileContents(t, filepath.Join(dir, "a.dat"), original)
+		assertFileContents(t, filepath.Join(dir, aName), original)
 		assertNoRepairTempFiles(t, dir)
 	})
 }

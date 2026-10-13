@@ -3,10 +3,12 @@ package par2
 import (
 	"bytes"
 	"context"
+	"io/fs"
 	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 )
@@ -19,6 +21,13 @@ const fileStateSliceSize = 16384
 // the original bytes.
 func newFileStateSet(t *testing.T, recoveryBlocks int) (dir, par2Path string, orig []byte) {
 	t.Helper()
+	return newFileStateSetAt(t, "f.dat", recoveryBlocks)
+}
+
+// newFileStateSetAt is newFileStateSet with the protected file at name, a
+// slash-separated path relative to the set's directory.
+func newFileStateSetAt(t *testing.T, name string, recoveryBlocks int) (dir, par2Path string, orig []byte) {
+	t.Helper()
 	if _, ok := hasPar2(); !ok {
 		t.Skip("par2 binary not found in PATH; skipping integration test")
 	}
@@ -28,11 +37,15 @@ func newFileStateSet(t *testing.T, recoveryBlocks int) (dir, par2Path string, or
 	for i := range orig {
 		orig[i] = byte(r.Uint32())
 	}
-	if err := os.WriteFile(filepath.Join(dir, "f.dat"), orig, 0644); err != nil {
+	path := filepath.Join(dir, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, orig, 0644); err != nil {
 		t.Fatal(err)
 	}
 	par2Path = filepath.Join(dir, "set.par2")
-	cmd := exec.Command("par2", "c", "-s16384", "-c"+strconv.Itoa(recoveryBlocks), par2Path, "f.dat")
+	cmd := exec.Command("par2", "c", "-s16384", "-c"+strconv.Itoa(recoveryBlocks), par2Path, filepath.FromSlash(name))
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("failed to create par2 set: %v\n%s", err, out)
@@ -201,10 +214,64 @@ func TestRepairRebuildsFilesWhoseBlocksAreAllLocated(t *testing.T) {
 	}
 }
 
-// assertNoRepairTempFiles fails if a repair left a temporary file behind.
+// TestRepairRebuildsCorruptFileInSubdirectory rebuilds a file that is present
+// but corrupt in a nested directory, so the temp file is created beside it in
+// that directory and renamed over it. The file keeps its permissions, and no
+// temp file is left in the subdirectory.
+func TestRepairRebuildsCorruptFileInSubdirectory(t *testing.T) {
+	dir, par2Path, orig := newFileStateSetAt(t, "sub/dir/f.dat", 4)
+	path := filepath.Join(dir, "sub", "dir", "f.dat")
+	bad := append([]byte{}, orig...)
+	bad[5*fileStateSliceSize+10] ^= 0xFF
+	if err := os.WriteFile(path, bad, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	d, err := NewDecoder(ctx, par2Path, DecoderOptions{})
+	if err != nil {
+		t.Fatalf("NewDecoder failed: %v", err)
+	}
+	defer func() { _ = d.Close() }()
+	if err := d.VerifyScans(ctx, nil); err != nil {
+		t.Fatalf("VerifyScans failed: %v", err)
+	}
+	if counts := d.ShardCounts(); !counts.RepairNeeded() {
+		t.Fatalf("RepairNeeded() = false for a corrupt file; counts=%+v", counts)
+	}
+	if err := d.Repair(ctx, nil); err != nil {
+		t.Fatalf("Repair failed: %v", err)
+	}
+
+	assertFileContents(t, path, orig)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
+		t.Errorf("f.dat mode = %v, want 0600 kept from the replaced file", info.Mode().Perm())
+	}
+	assertNoRepairTempFiles(t, dir)
+}
+
+// assertNoRepairTempFiles fails if a repair left a temporary file anywhere
+// under dir, including in subdirectories.
 func assertNoRepairTempFiles(t *testing.T, dir string) {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(dir, "*"+repairTempMarker+"*"+repairTempExt))
+	var matches []string
+	err := filepath.WalkDir(dir, func(path string, e fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		// Match fails only on a malformed pattern, and this one is constant.
+		if ok, _ := filepath.Match("*"+repairTempMarker+"*"+repairTempExt, e.Name()); ok {
+			matches = append(matches, path)
+		}
+		return nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
