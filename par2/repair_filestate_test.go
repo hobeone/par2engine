@@ -4,54 +4,11 @@ import (
 	"bytes"
 	"context"
 	"io/fs"
-	"math/rand/v2"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"testing"
 )
-
-const fileStateSliceSize = 16384
-
-// newFileStateSet writes a 16-block protected file "f.dat" into a fresh
-// directory and creates a PAR2 set for it with par2cmdline, using
-// recoveryBlocks recovery blocks. It returns the directory, the index path and
-// the original bytes.
-func newFileStateSet(t *testing.T, recoveryBlocks int) (dir, par2Path string, orig []byte) {
-	t.Helper()
-	return newFileStateSetAt(t, "f.dat", recoveryBlocks)
-}
-
-// newFileStateSetAt is newFileStateSet with the protected file at name, a
-// slash-separated path relative to the set's directory.
-func newFileStateSetAt(t *testing.T, name string, recoveryBlocks int) (dir, par2Path string, orig []byte) {
-	t.Helper()
-	if _, ok := hasPar2(); !ok {
-		t.Skip("par2 binary not found in PATH; skipping integration test")
-	}
-	dir = t.TempDir()
-	r := rand.New(rand.NewPCG(7, 7))
-	orig = make([]byte, 16*fileStateSliceSize)
-	for i := range orig {
-		orig[i] = byte(r.Uint32())
-	}
-	path := filepath.Join(dir, filepath.FromSlash(name))
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, orig, 0644); err != nil {
-		t.Fatal(err)
-	}
-	par2Path = filepath.Join(dir, "set.par2")
-	cmd := exec.Command("par2", "c", "-s16384", "-c"+strconv.Itoa(recoveryBlocks), par2Path, filepath.FromSlash(name))
-	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("failed to create par2 set: %v\n%s", err, out)
-	}
-	return dir, par2Path, orig
-}
 
 // splice returns a copy of orig with del bytes removed at offset at and ins
 // inserted in their place.
@@ -61,8 +18,12 @@ func splice(orig []byte, at int, ins []byte, del int) []byte {
 	return append(out, orig[at+del:]...)
 }
 
-func writeTestFile(t *testing.T, path string, data []byte) {
+// writeTestFile writes data to path, creating its parent directories.
+func writeTestFile(t testing.TB, path string, data []byte) {
 	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -81,17 +42,17 @@ func TestRepairRebuildsFilesWhoseBlocksAreAllLocated(t *testing.T) {
 	const smallMem = 64 * 1024
 
 	tests := []struct {
-		name           string
-		recoveryBlocks int
-		memoryLimit    int64
+		name        string
+		set         par2Fixture // a 16-block f.dat
+		memoryLimit int64
 		// damage mutates dir and returns any candidate files to register.
 		damage func(t *testing.T, dir string, orig []byte) []string
 	}{
 		{
 			// A stored archive holds the file's bytes at a nonzero offset, and the
 			// file itself is gone: not a rename, but every block is present.
-			name:           "missing_file_blocks_inside_container",
-			recoveryBlocks: 4,
+			name: "missing_file_blocks_inside_container",
+			set:  fixtureFileState,
 			damage: func(t *testing.T, dir string, orig []byte) []string {
 				writeTestFile(t, filepath.Join(dir, "stored.rar"), splice(orig, 0, bytes.Repeat([]byte{0xAB}, 1000), 0))
 				if err := os.Remove(filepath.Join(dir, "f.dat")); err != nil {
@@ -101,17 +62,17 @@ func TestRepairRebuildsFilesWhoseBlocksAreAllLocated(t *testing.T) {
 			},
 		},
 		{
-			name:           "bytes_inserted_at_block_boundary",
-			recoveryBlocks: 4,
+			name: "bytes_inserted_at_block_boundary",
+			set:  fixtureFileState,
 			damage: func(t *testing.T, dir string, orig []byte) []string {
 				writeTestFile(t, filepath.Join(dir, "f.dat"), splice(orig, 3*fileStateSliceSize, []byte("hello"), 0))
 				return nil
 			},
 		},
 		{
-			name:           "bytes_inserted_at_block_boundary_small_memory",
-			recoveryBlocks: 4,
-			memoryLimit:    smallMem,
+			name:        "bytes_inserted_at_block_boundary_small_memory",
+			set:         fixtureFileState,
+			memoryLimit: smallMem,
 			damage: func(t *testing.T, dir string, orig []byte) []string {
 				writeTestFile(t, filepath.Join(dir, "f.dat"), splice(orig, 3*fileStateSliceSize, bytes.Repeat([]byte{9}, 2000), 0))
 				return nil
@@ -120,16 +81,16 @@ func TestRepairRebuildsFilesWhoseBlocksAreAllLocated(t *testing.T) {
 		{
 			// Every block is located, so the rebuild is a pure reassembly and must
 			// not depend on recovery blocks being present.
-			name:           "bytes_inserted_no_recovery_blocks",
-			recoveryBlocks: 0,
+			name: "bytes_inserted_no_recovery_blocks",
+			set:  fixtureFileStateNoRecovery,
 			damage: func(t *testing.T, dir string, orig []byte) []string {
 				writeTestFile(t, filepath.Join(dir, "f.dat"), splice(orig, 3*fileStateSliceSize, []byte("hello"), 0))
 				return nil
 			},
 		},
 		{
-			name:           "trailing_bytes_appended",
-			recoveryBlocks: 4,
+			name: "trailing_bytes_appended",
+			set:  fixtureFileState,
 			damage: func(t *testing.T, dir string, orig []byte) []string {
 				writeTestFile(t, filepath.Join(dir, "f.dat"), append(append([]byte{}, orig...), 1, 2, 3))
 				return nil
@@ -138,8 +99,8 @@ func TestRepairRebuildsFilesWhoseBlocksAreAllLocated(t *testing.T) {
 		{
 			// The corrupt block of f.dat is found only inside the container, so its
 			// blocks come from two files and the rename path cannot apply.
-			name:           "corrupt_file_with_container_candidate",
-			recoveryBlocks: 4,
+			name: "corrupt_file_with_container_candidate",
+			set:  fixtureFileState,
 			damage: func(t *testing.T, dir string, orig []byte) []string {
 				bad := append([]byte{}, orig...)
 				bad[5*fileStateSliceSize+10] ^= 0xFF
@@ -151,18 +112,18 @@ func TestRepairRebuildsFilesWhoseBlocksAreAllLocated(t *testing.T) {
 		{
 			// Shard 0 is destroyed and shards 1..15 sit 2000 bytes late in the same
 			// file, so repair reads and writes one file at overlapping offsets.
-			name:           "in_place_shift_insert_small_memory",
-			recoveryBlocks: 4,
-			memoryLimit:    smallMem,
+			name:        "in_place_shift_insert_small_memory",
+			set:         fixtureFileState,
+			memoryLimit: smallMem,
 			damage: func(t *testing.T, dir string, orig []byte) []string {
 				writeTestFile(t, filepath.Join(dir, "f.dat"), splice(orig, 5000, bytes.Repeat([]byte{9}, 2000), 0))
 				return nil
 			},
 		},
 		{
-			name:           "in_place_shift_delete_small_memory",
-			recoveryBlocks: 4,
-			memoryLimit:    smallMem,
+			name:        "in_place_shift_delete_small_memory",
+			set:         fixtureFileState,
+			memoryLimit: smallMem,
 			damage: func(t *testing.T, dir string, orig []byte) []string {
 				writeTestFile(t, filepath.Join(dir, "f.dat"), splice(orig, 5000, nil, 3000))
 				return nil
@@ -172,7 +133,8 @@ func TestRepairRebuildsFilesWhoseBlocksAreAllLocated(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir, par2Path, orig := newFileStateSet(t, tt.recoveryBlocks)
+			dir, par2Path, files := tt.set.load(t)
+			orig := files["f.dat"]
 			candidates := tt.damage(t, dir, orig)
 
 			ctx := context.Background()
@@ -219,7 +181,8 @@ func TestRepairRebuildsFilesWhoseBlocksAreAllLocated(t *testing.T) {
 // that directory and renamed over it. The file keeps its permissions, and no
 // temp file is left in the subdirectory.
 func TestRepairRebuildsCorruptFileInSubdirectory(t *testing.T) {
-	dir, par2Path, orig := newFileStateSetAt(t, "sub/dir/f.dat", 4)
+	dir, par2Path, files := fixtureFileStateNested.load(t)
+	orig := files["sub/dir/f.dat"]
 	path := filepath.Join(dir, "sub", "dir", "f.dat")
 	bad := append([]byte{}, orig...)
 	bad[5*fileStateSliceSize+10] ^= 0xFF
