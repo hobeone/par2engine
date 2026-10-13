@@ -133,6 +133,94 @@ func TestScanChunkCRCCollisionDoesNotSkipShard(t *testing.T) {
 	}
 }
 
+// TestScanChunkPeriodicDataMidBlockFlipLosesNoOtherShards reproduces issue #41.
+// A single flipped byte in the middle of a block of a file whose bytes repeat
+// with a period that is not a multiple of the block size used to make the
+// sliding scan count the intact blocks that follow it as missing too. Only the
+// block that holds the flipped byte may go unlocated, at any flip offset the
+// issue lists.
+func TestScanChunkPeriodicDataMidBlockFlipLosesNoOtherShards(t *testing.T) {
+	const (
+		sliceSize = 1024
+		fileSize  = 8192
+	)
+
+	// Byte i is 0x10 + i%251. The 251-byte period is coprime with the block
+	// size, so a window shifted by 251 bytes is an exact copy of another block's
+	// content that a look-up cannot tell apart — the aliasing the
+	// jump-after-match shortcut trips over.
+	original := make([]byte, fileSize)
+	for i := range original {
+		original[i] = byte((0x10 + i%251) & 0xFF)
+	}
+
+	var targetFileID FileID
+
+	// The clean file is the pool of blocks the scan searches for, so every
+	// block is registered under its own checksum.
+	checksumMap := make(map[uint32][]checksumLocation)
+	for shard := 0; shard < fileSize/sliceSize; shard++ {
+		block := original[shard*sliceSize : (shard+1)*sliceSize]
+		crc := crc32.ChecksumIEEE(block)
+		checksumMap[crc] = append(checksumMap[crc], checksumLocation{
+			fileID:     targetFileID,
+			shardIndex: shard,
+			md5Hash:    md5.Sum(block),
+		})
+	}
+
+	// The offsets from the issue's table. Each damages exactly one block.
+	flipOffsets := []int{0, 2048, 3000, 5000, 8191}
+
+	for _, flipAt := range flipOffsets {
+		damaged := append([]byte(nil), original...)
+		damaged[flipAt] ^= 0xFF
+
+		tmp, err := os.CreateTemp(t.TempDir(), "periodic-flip")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tmp.Write(damaged); err != nil {
+			_ = tmp.Close()
+			t.Fatal(err)
+		}
+
+		window, err := newCRC32Window(sliceSize)
+		if err != nil {
+			_ = tmp.Close()
+			t.Fatal(err)
+		}
+
+		scanner := &blockScanner{
+			d:           &Decoder{sliceByteCount: sliceSize, logger: slog.Default()},
+			ctx:         context.Background(),
+			window:      window,
+			lookupTable: newCRCLookupTable(checksumMap),
+			matchChan:   make(chan matchEvent, 64),
+		}
+		err = scanner.scanChunk(tmp, targetFileID, 0, fileSize)
+		_ = tmp.Close()
+		if err != nil {
+			t.Fatalf("flip@%d: scanChunk: %v", flipAt, err)
+		}
+		close(scanner.matchChan)
+
+		located := make(map[int]bool)
+		for ev := range scanner.matchChan {
+			located[ev.shardIndex] = true
+		}
+
+		// Only the block holding the flipped byte may go unlocated.
+		for shard := 0; shard < fileSize/sliceSize; shard++ {
+			wantLocated := shard != flipAt/sliceSize
+			if located[shard] != wantLocated {
+				t.Errorf("flip@%d: shard %d located=%v, want located=%v (issue #41)",
+					flipAt, shard, located[shard], wantLocated)
+			}
+		}
+	}
+}
+
 func TestDecoderEndToEndMultiChunk(t *testing.T) {
 	// A 40 MB file — large enough to cross the 32 MB scanChunkSize boundary.
 	_, par2Path, _ := fixtureMultiChunk.load(t)

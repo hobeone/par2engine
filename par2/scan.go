@@ -1089,8 +1089,14 @@ func (s *blockScanner) scanChunk(f *os.File, sourceFileID FileID, start, end int
 		}
 
 		if md5Matched {
-			// True shard match: advance past this block.
-			j += s.d.sliceByteCount
+			// True shard match: advance to the next shard boundary rather than a
+			// whole slice from here. A file whose bytes repeat can alias a match
+			// onto an off-grid offset; stepping a slice from there would skip the
+			// boundary just ahead, which holds the next intact block, and lose it.
+			// Advancing to the boundary never skips one. See issue #41.
+			sliceByteCount := int64(s.d.sliceByteCount)
+			absPos += sliceByteCount - absPos%sliceByteCount
+			j = int(absPos - start)
 			justMissed = false
 		} else {
 			// CRC collision with no MD5 confirmation — treat as a miss and slide
