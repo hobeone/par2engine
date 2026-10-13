@@ -156,6 +156,19 @@ func openSandbox(dir string) (*os.Root, error) {
 	return root, nil
 }
 
+// ensureParentDir creates the parent directories of name, a path inside the
+// sandbox, if they do not exist yet. A file in the sandbox root needs none.
+func (d *Decoder) ensureParentDir(name string) error {
+	dir := filepath.Dir(name)
+	if dir == "." {
+		return nil
+	}
+	if err := d.root.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	}
+	return nil
+}
+
 func (d *Decoder) Close() error {
 	if d.root != nil {
 		return d.root.Close()

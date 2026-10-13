@@ -166,3 +166,33 @@ func osIsPermissionOrNotExist(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "permission denied") || strings.Contains(msg, "no such file") || strings.Contains(msg, "does not exist") || strings.Contains(msg, "outside root")
 }
+
+func TestEnsureParentDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "plain"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	d := &Decoder{root: root}
+
+	if err := d.ensureParentDir("top.dat"); err != nil {
+		t.Errorf("file in the sandbox root: %v", err)
+	}
+
+	nested := filepath.Join("a", "b", "c.dat")
+	if err := d.ensureParentDir(nested); err != nil {
+		t.Fatalf("nested file: %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(dir, "a", "b")); err != nil || !info.IsDir() {
+		t.Errorf("parent of %s not created as a directory (err %v)", nested, err)
+	}
+
+	// A regular file where a parent directory belongs cannot be replaced.
+	if err := d.ensureParentDir(filepath.Join("plain", "x.dat")); err == nil {
+		t.Error("expected an error when a parent path is a regular file")
+	}
+}

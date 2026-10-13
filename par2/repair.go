@@ -8,7 +8,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path/filepath"
 
 	"github.com/hobeone/par2engine/rs"
 )
@@ -329,10 +328,8 @@ func (p *repairPipeline) getOutput(target string) (*os.File, error) {
 	if f, ok := p.outputs[target]; ok {
 		return f, nil
 	}
-	if dir := filepath.Dir(target); dir != "." {
-		if err := p.d.root.MkdirAll(dir, 0755); err != nil {
-			return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
-		}
+	if err := p.d.ensureParentDir(target); err != nil {
+		return nil, err
 	}
 	tmp := target + repairTempMarker + rand.Text()[:16] + repairTempExt
 	f, err := p.d.root.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
