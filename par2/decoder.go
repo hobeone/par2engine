@@ -31,10 +31,15 @@ type ShardCounts struct {
 	UsableParityShardCount   int
 	UnusableParityShardCount int
 	RenamesNeeded            int // files whose content is intact in a candidate under a different name
+	// FilesNeedingRebuild counts protected files that are missing, the wrong
+	// size or fail their hash, and that no rename will fix. It is nonzero even
+	// when every block was located (shifted, inside another file, or followed
+	// by extra bytes): such a file is rebuilt by reassembling its blocks.
+	FilesNeedingRebuild int
 }
 
 func (sc ShardCounts) RepairNeeded() bool {
-	return sc.UnusableDataShardCount > 0 || sc.RenamesNeeded > 0
+	return sc.UnusableDataShardCount > 0 || sc.RenamesNeeded > 0 || sc.FilesNeedingRebuild > 0
 }
 
 func (sc ShardCounts) RepairPossible() bool {
@@ -323,33 +328,27 @@ func (d *Decoder) handlePacket(ctx context.Context, h Header, body []byte, filen
 func (d *Decoder) ShardCounts() ShardCounts {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	return d.shardCountsLocked()
+}
 
-	usableData := 0
-	unusableData := 0
+// shardCountsLocked computes ShardCounts. Assumes d.mu is held.
+func (d *Decoder) shardCountsLocked() ShardCounts {
+	sc := ShardCounts{UsableParityShardCount: len(d.parityShards)}
 	for _, state := range d.fileIntegrity {
 		for _, loc := range state.ShardLocations {
 			if loc.Offset == -1 {
-				unusableData++
+				sc.UnusableDataShardCount++
 			} else {
-				usableData++
+				sc.UsableDataShardCount++
 			}
 		}
-	}
-
-	renamesNeeded := 0
-	for _, state := range d.fileIntegrity {
 		if state.RenameSource != "" {
-			renamesNeeded++
+			sc.RenamesNeeded++
+		} else if state.needsRebuild() {
+			sc.FilesNeedingRebuild++
 		}
 	}
-
-	return ShardCounts{
-		UsableDataShardCount:     usableData,
-		UnusableDataShardCount:   unusableData,
-		UsableParityShardCount:   len(d.parityShards),
-		UnusableParityShardCount: 0,
-		RenamesNeeded:            renamesNeeded,
-	}
+	return sc
 }
 
 func (d *Decoder) loadVolumeFiles(ctx context.Context, indexFilename string) error {
