@@ -7,9 +7,7 @@ import (
 	"errors"
 	"hash/crc32"
 	"log/slog"
-	"math/rand/v2"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -49,11 +47,6 @@ func TestScanCandidateFileNotFound(t *testing.T) {
 	if err := scanner.scanCandidateFile("no_such_file.dat", FileID{}); err != nil {
 		t.Errorf("expected nil for missing candidate, got %v", err)
 	}
-}
-
-func hasPar2Cmd() bool {
-	_, err := exec.LookPath("par2")
-	return err == nil
 }
 
 func TestScanChunkCRCCollisionDoesNotSkipShard(t *testing.T) {
@@ -141,30 +134,8 @@ func TestScanChunkCRCCollisionDoesNotSkipShard(t *testing.T) {
 }
 
 func TestDecoderEndToEndMultiChunk(t *testing.T) {
-	if !hasPar2Cmd() {
-		t.Skip("par2 binary not found in PATH; skipping multi-chunk integration test")
-	}
-
-	dir := t.TempDir()
-
-	// 40 MB file — large enough to cross the 32 MB scanChunkSize boundary.
-	const fileSize = 40 * 1024 * 1024
-	r := rand.New(rand.NewPCG(99, 99))
-	fileData := make([]byte, fileSize)
-	for i := range fileData {
-		fileData[i] = byte(r.Uint32())
-	}
-
-	inputFile := filepath.Join(dir, "bigfile.dat")
-	if err := os.WriteFile(inputFile, fileData, 0644); err != nil {
-		t.Fatalf("write bigfile: %v", err)
-	}
-
-	par2Path := filepath.Join(dir, "big.par2")
-	out, err := exec.Command("par2", "c", "-s10485760", "-c4", par2Path, inputFile).CombinedOutput()
-	if err != nil {
-		t.Fatalf("par2 create: %v\n%s", err, out)
-	}
+	// A 40 MB file — large enough to cross the 32 MB scanChunkSize boundary.
+	_, par2Path, _ := fixtureMultiChunk.load(t)
 
 	d, err := NewDecoder(context.Background(), par2Path, DecoderOptions{Logger: slog.Default()})
 	if err != nil {
@@ -184,26 +155,9 @@ func TestDecoderEndToEndMultiChunk(t *testing.T) {
 }
 
 func TestAddCandidateFile(t *testing.T) {
-	if !hasPar2Cmd() {
-		t.Skip("par2 binary not found in PATH")
-	}
-
-	dir := t.TempDir()
-	r := rand.New(rand.NewPCG(77, 77))
-	fileData := make([]byte, 64*1024)
-	for i := range fileData {
-		fileData[i] = byte(r.Uint32())
-	}
-
+	dir, par2Path, files := fixtureCorrectDat.load(t)
+	fileData := files["correct.dat"]
 	correctName := filepath.Join(dir, "correct.dat")
-	if err := os.WriteFile(correctName, fileData, 0644); err != nil {
-		t.Fatal(err)
-	}
-	par2Path := filepath.Join(dir, "set.par2")
-	out, err := exec.Command("par2", "c", "-s16384", "-c4", par2Path, correctName).CombinedOutput()
-	if err != nil {
-		t.Fatalf("par2 create: %v\n%s", err, out)
-	}
 
 	wrongName := filepath.Join(dir, "wrong_name.dat")
 	if err := os.WriteFile(wrongName, fileData, 0644); err != nil {
@@ -241,26 +195,9 @@ func TestAddCandidateFile(t *testing.T) {
 }
 
 func TestRenameMisnamedFile(t *testing.T) {
-	if !hasPar2Cmd() {
-		t.Skip("par2 binary not found in PATH")
-	}
-
-	dir := t.TempDir()
-	r := rand.New(rand.NewPCG(88, 88))
-	fileData := make([]byte, 64*1024)
-	for i := range fileData {
-		fileData[i] = byte(r.Uint32())
-	}
-
+	dir, par2Path, files := fixtureCorrectDat.load(t)
+	fileData := files["correct.dat"]
 	correctName := filepath.Join(dir, "correct.dat")
-	if err := os.WriteFile(correctName, fileData, 0644); err != nil {
-		t.Fatal(err)
-	}
-	par2Path := filepath.Join(dir, "set.par2")
-	out, err := exec.Command("par2", "c", "-s16384", "-c4", par2Path, correctName).CombinedOutput()
-	if err != nil {
-		t.Fatalf("par2 create: %v\n%s", err, out)
-	}
 
 	wrongName := filepath.Join(dir, "wrong_name.dat")
 	if err := os.Rename(correctName, wrongName); err != nil {
@@ -342,36 +279,10 @@ func TestRenameMisnamedFile(t *testing.T) {
 }
 
 func TestRenameMisnamedFile_CreatesDirectory(t *testing.T) {
-	if !hasPar2Cmd() {
-		t.Skip("par2 binary not found in PATH")
-	}
-
-	dir := t.TempDir()
-	r := rand.New(rand.NewPCG(88, 88))
-	fileData := make([]byte, 1024)
-	for i := range fileData {
-		fileData[i] = byte(r.Uint32())
-	}
-
-	// We want target to be nested: nested/dir/correct.dat
-	nestedTarget := filepath.Join("nested", "dir", "correct.dat")
-	correctName := filepath.Join(dir, nestedTarget)
-
-	// Create the directory temporarily to write correctName, then we will recreate the archive
-	if err := os.MkdirAll(filepath.Dir(correctName), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(correctName, fileData, 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	par2Path := filepath.Join(dir, "set.par2")
-	// Run par2 c relative to dir
-	cmd := exec.Command("par2", "c", "-s1024", "-c1", par2Path, correctName)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("par2 create: %v\n%s", err, out)
-	}
+	// The protected file is nested/dir/correct.dat.
+	dir, par2Path, files := fixtureRenameNested.load(t)
+	fileData := files["nested/dir/correct.dat"]
+	correctName := filepath.Join(dir, "nested", "dir", "correct.dat")
 
 	// Now rename the source and remove the nested directory structure
 	wrongName := filepath.Join(dir, "wrong_name.dat")

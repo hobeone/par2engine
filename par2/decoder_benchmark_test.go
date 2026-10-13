@@ -11,8 +11,7 @@ import (
 )
 
 func BenchmarkVerifyScans(b *testing.B) {
-	_, ok := hasPar2()
-	if !ok {
+	if _, err := exec.LookPath("par2"); err != nil {
 		b.Skip("par2 binary not found in PATH; skipping benchmark")
 	}
 

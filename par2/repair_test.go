@@ -5,9 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"fmt"
-	"math/rand/v2"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -77,51 +75,12 @@ func TestComputeChunkSize(t *testing.T) {
 	})
 }
 
-func hasPar2() (string, bool) {
-	path, err := exec.LookPath("par2")
-	if err != nil {
-		return "", false
-	}
-	return path, true
-}
-
 func TestDecoderEndToEnd(t *testing.T) {
-	_, ok := hasPar2()
-	if !ok {
-		t.Skip("par2 binary not found in PATH; skipping integration test")
-	}
-
-	dir := t.TempDir()
+	// 128 KB and 256 KB files in 16 KB blocks, with 4 recovery blocks.
+	dir, par2Path, files := fixtureTwoFiles.load(t)
 	inputFile1 := filepath.Join(dir, "file1.dat")
 	inputFile2 := filepath.Join(dir, "file2.dat")
-
-	// 1. Generate 128KB of random test data for file1, and 256KB for file2
-	r := rand.New(rand.NewPCG(42, 42))
-	generateData := func(size int) []byte {
-		data := make([]byte, size)
-		for i := range data {
-			data[i] = byte(r.Uint32())
-		}
-		return data
-	}
-
-	data1 := generateData(128 * 1024)
-	data2 := generateData(256 * 1024)
-	if err := os.WriteFile(inputFile1, data1, 0644); err != nil {
-		t.Fatalf("failed to write file1: %v", err)
-	}
-	if err := os.WriteFile(inputFile2, data2, 0644); err != nil {
-		t.Fatalf("failed to write file2: %v", err)
-	}
-
-	// 2. Use par2 CLI to create parity files (block size = 16KB, 4 parity blocks)
-	par2Path := filepath.Join(dir, "set.par2")
-	createCmd := exec.Command("par2", "c", "-s16384", "-c4", par2Path, inputFile1, inputFile2)
-	createCmd.Dir = dir
-	out, err := createCmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("failed to create par2 set: %v\n%s", err, out)
-	}
+	data1, data2 := files["file1.dat"], files["file2.dat"]
 
 	ctx := context.Background()
 

@@ -44,17 +44,6 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Five tests in par2/ call t.Skip when the reference par2cmdline binary is
-      # absent from PATH -- they generate PAR2 sets with the C++ implementation
-      # and cross-check this engine against them. Without this the suite still
-      # reports success while silently skipping them; par2 package coverage
-      # drops from ~86% to ~55%.
-      - name: Install reference par2cmdline
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y par2
-          par2 --version || true
-
       - name: Build
         run: go build ./...
 

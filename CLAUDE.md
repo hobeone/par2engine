@@ -27,7 +27,12 @@ go generate ./gf16/...
 
 # Run a single test by name
 go test -v -run TestFunctionName ./par2/...
+
+# Regenerate the checked-in PAR2 fixtures (needs par2cmdline on PATH)
+go test ./par2/ -run TestPar2Fixtures -update-fixtures
 ```
+
+**PAR2 fixtures** (`par2/testdata/fixtures/`) are sets created by the reference `par2cmdline`, checked in so the `par2/` cross-checks run without it. Only the `.par2` files are stored; each fixture's protected files are rebuilt from fixed seeds by its definition in `par2/fixture_test.go`, which `-update-fixtures` also uses. To change a fixture, edit its definition and regenerate; `TestPar2Fixtures` fails if a checked-in set no longer matches its definition. No test needs `par2cmdline` except the opt-in benchmarks, so CI does not install it.
 
 **Integration tests** (`tests/`) are self-sufficient — `TestMain` resolves the canonical `par2cmdline` fixture archives in three steps: the `tests/testdata/` cache from a previous run, then a sibling clone at `../../par2cmdline/tests/`, then downloading them from `parchive/par2cmdline` into `tests/testdata/`. It also builds the CLI from the current source into a temporary directory on every run, ignoring any `par2engine-cli` at the repository root, so no separate build step is needed and a stale binary can never be tested. Tests reach that binary through `cli(t)`, which also opens each package directory the CLI is built from and `go.mod`/`go.sum`, so editing the engine invalidates `go test`'s cached result for the suite (#38); call it rather than reading `builtCLI` directly. The only external requirement is network access on the first run.
 
