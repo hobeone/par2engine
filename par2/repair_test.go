@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"fmt"
 	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -235,7 +237,7 @@ type installTestFile struct {
 // newInstallTestPipeline returns a pipeline over a fresh sandbox holding each
 // file's original bytes, with an output temp file per file holding its rebuilt
 // bytes followed by zero padding that install must truncate away.
-func newInstallTestPipeline(t *testing.T, files ...installTestFile) (*repairPipeline, string) {
+func newInstallTestPipeline(t testing.TB, files ...installTestFile) (*repairPipeline, string) {
 	t.Helper()
 	dir := t.TempDir()
 	root, err := os.OpenRoot(dir)
@@ -274,7 +276,7 @@ func newInstallTestPipeline(t *testing.T, files ...installTestFile) (*repairPipe
 	return p, dir
 }
 
-func assertFileContents(t *testing.T, path string, want []byte) {
+func assertFileContents(t testing.TB, path string, want []byte) {
 	t.Helper()
 	got, err := os.ReadFile(path)
 	if err != nil {
@@ -352,6 +354,25 @@ func testRepairPipelineInstall(t *testing.T, aName, bName string) {
 
 		assertFileContents(t, filepath.Join(dir, aName), original)
 		assertFileContents(t, filepath.Join(dir, bName), original)
+		assertNoRepairTempFiles(t, dir)
+	})
+
+	// Files are checked concurrently; a failure in one must not hide another.
+	t.Run("every_mismatch_reported", func(t *testing.T) {
+		p, dir := newInstallTestPipeline(t,
+			installTestFile{aName, original, rebuilt, md5.Sum([]byte("something else"))},
+			installTestFile{bName, original, rebuilt, md5.Sum([]byte("something else"))},
+		)
+		err := p.install()
+		p.close()
+		if err == nil {
+			t.Fatal("install succeeded despite hash mismatches")
+		}
+		for _, name := range []string{aName, bName} {
+			if !strings.Contains(err.Error(), name) {
+				t.Errorf("error %q does not name %s", err, name)
+			}
+		}
 		assertNoRepairTempFiles(t, dir)
 	})
 
@@ -433,5 +454,34 @@ func TestShardCountsFilesNeedingRebuild(t *testing.T) {
 	}
 	if !sc.RepairNeeded() || !sc.RepairPossible() {
 		t.Errorf("RepairNeeded=%v RepairPossible=%v, want both true", sc.RepairNeeded(), sc.RepairPossible())
+	}
+}
+
+// BenchmarkRepairPipelineInstall measures install's final truncate, sync and
+// hash over several freshly rebuilt files. They are still in the page cache, so
+// on a RAM-backed temp directory the cost is mostly MD5 time.
+func BenchmarkRepairPipelineInstall(b *testing.B) {
+	const files, size = 8, 16 << 20
+	data := make([]byte, size)
+	for i := range data {
+		data[i] = byte(i * 7)
+	}
+	hash := md5.Sum(data)
+	var tfs []installTestFile
+	for i := range files {
+		tfs = append(tfs, installTestFile{fmt.Sprintf("f%d.dat", i), nil, data, hash})
+	}
+	b.SetBytes(files * size)
+	for b.Loop() {
+		b.StopTimer()
+		p, _ := newInstallTestPipeline(b, tfs...)
+		p.d.numGoroutines = runtime.GOMAXPROCS(0)
+		b.StartTimer()
+		if err := p.install(); err != nil {
+			b.Fatal(err)
+		}
+		b.StopTimer()
+		p.close()
+		b.StartTimer()
 	}
 }
