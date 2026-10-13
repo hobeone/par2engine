@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -37,7 +38,8 @@ var allArchives = []string{
 // fixturesDir is set once in TestMain; all tests read it.
 var fixturesDir string
 
-// cliPath is the absolute path to the par2engine-cli binary, built in TestMain.
+// cliPath is the absolute path to the par2engine-cli binary, built from the
+// current source into a temporary directory by TestMain.
 var cliPath string
 
 func TestMain(m *testing.M) {
@@ -48,12 +50,16 @@ func TestMain(m *testing.M) {
 	}
 	fixturesDir = dir
 
-	if err := ensureCLI(); err != nil {
+	cliDir, path, err := buildCLI()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "integration: CLI build failed: %v\n", err)
 		os.Exit(1)
 	}
+	cliPath = path
 
-	os.Exit(m.Run())
+	code := m.Run()
+	_ = os.RemoveAll(cliDir) // best-effort: a leftover temp dir is harmless
+	os.Exit(code)
 }
 
 // resolveFixtures finds or downloads the canonical par2cmdline test archives.
@@ -124,22 +130,24 @@ func downloadFile(url, dest string) error {
 	return err
 }
 
-// ensureCLI builds the par2engine-cli binary if it is not already present.
-func ensureCLI() error {
-	abs, err := filepath.Abs("../par2engine-cli")
+// buildCLI builds par2engine-cli from the current source into a new temporary
+// directory and returns that directory, for removal, and the binary's path. It always
+// builds rather than reusing ../par2engine-cli: that binary is whatever the
+// developer last built, so testing it lets these tests pass against stale code
+// (#28). The Go build cache makes an unchanged rebuild nearly free.
+func buildCLI() (dir, path string, err error) {
+	dir, err = os.MkdirTemp("", "par2engine-integration-")
 	if err != nil {
-		return err
+		return "", "", err
 	}
-	cliPath = abs
-	if _, err := os.Stat(cliPath); err == nil {
-		fmt.Printf("integration: using existing CLI at %s\n", cliPath)
-		return nil
+	path = filepath.Join(dir, "par2engine-cli")
+	if runtime.GOOS == "windows" {
+		path += ".exe"
 	}
-	fmt.Println("integration: building par2engine-cli...")
-	cmd := exec.Command("go", "build", "-o", cliPath, "../cmd/gopar")
+	cmd := exec.Command("go", "build", "-o", path, "../cmd/gopar")
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%v\n%s", err, out)
+		_ = os.RemoveAll(dir) // best-effort: a leftover temp dir is harmless
+		return "", "", fmt.Errorf("%v\n%s", err, out)
 	}
-	fmt.Println("integration: build complete")
-	return nil
+	return dir, path, nil
 }
