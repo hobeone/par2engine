@@ -29,7 +29,7 @@ go generate ./gf16/...
 go test -v -run TestFunctionName ./par2/...
 ```
 
-**Integration tests** (`tests/`) are self-sufficient — `TestMain` resolves the canonical `par2cmdline` fixture archives in three steps: the `tests/testdata/` cache from a previous run, then a sibling clone at `../../par2cmdline/tests/`, then downloading them from `parchive/par2cmdline` into `tests/testdata/`. It also builds the CLI from the current source into a temporary directory on every run, ignoring any `par2engine-cli` at the repository root, so no separate build step is needed and a stale binary can never be tested. The only external requirement is network access on the first run.
+**Integration tests** (`tests/`) are self-sufficient — `TestMain` resolves the canonical `par2cmdline` fixture archives in three steps: the `tests/testdata/` cache from a previous run, then a sibling clone at `../../par2cmdline/tests/`, then downloading them from `parchive/par2cmdline` into `tests/testdata/`. It also builds the CLI from the current source into a temporary directory on every run, ignoring any `par2engine-cli` at the repository root, so no separate build step is needed and a stale binary can never be tested. Tests reach that binary through `cli(t)`, which also opens each package directory the CLI is built from and `go.mod`/`go.sum`, so editing the engine invalidates `go test`'s cached result for the suite (#38); call it rather than reading `builtCLI` directly. The only external requirement is network access on the first run.
 
 **CI** (`.github/workflows/ci.yml`) runs build/vet/`-race` tests, the zero-allocation assertions, golangci-lint, a generated-assembly drift check, the integration suite, and cross-compile builds for 386/arm/arm64/darwin-arm64/windows.
 

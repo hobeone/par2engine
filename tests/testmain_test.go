@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -38,9 +40,59 @@ var allArchives = []string{
 // fixturesDir is set once in TestMain; all tests read it.
 var fixturesDir string
 
-// cliPath is the absolute path to the par2engine-cli binary, built from the
-// current source into a temporary directory by TestMain.
-var cliPath string
+// builtCLI is the absolute path to the par2engine-cli binary, built from the
+// current source into a temporary directory by TestMain. Tests reach it
+// through cli, never directly.
+var builtCLI string
+
+var openCLISourcesOnce = sync.OnceValue(openCLISources)
+
+// cli returns the path of the CLI built by TestMain. On first use it opens
+// the directory of every package in this module that the CLI is built from,
+// and go.mod and go.sum, so that go test's result cache depends on them.
+//
+// go test reuses a cached result only while the files a test opened are
+// unchanged, and for a directory that covers its listing and every entry's
+// size and modification time. It cannot see the go build that TestMain runs,
+// so without this an edit to the engine left a cached pass in place (#38).
+// TestMain cannot open them itself: go test records opens only once m.Run has
+// started.
+func cli(t testing.TB) string {
+	t.Helper()
+	if err := openCLISourcesOnce(); err != nil {
+		t.Fatalf("recording CLI sources for the test cache: %v", err)
+	}
+	return builtCLI
+}
+
+// openCLISources opens, and closes again, each path the CLI build depends on.
+func openCLISources() error {
+	// Each package of this module prints its directory and the module's go.mod.
+	out, err := exec.Command("go", "list", "-deps",
+		"-f", "{{with .Module}}{{if .Main}}{{$.Dir}}\n{{.GoMod}}{{end}}{{end}}", "../cmd/gopar").Output()
+	if err != nil {
+		return fmt.Errorf("go list: %w", err)
+	}
+	paths := make(map[string]bool)
+	for line := range strings.Lines(string(out)) {
+		p := strings.TrimSpace(line)
+		if p == "" {
+			continue
+		}
+		paths[p] = true
+		if filepath.Base(p) == "go.mod" {
+			paths[filepath.Join(filepath.Dir(p), "go.sum")] = true
+		}
+	}
+	for p := range paths {
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		_ = f.Close()
+	}
+	return nil
+}
 
 func TestMain(m *testing.M) {
 	dir, err := resolveFixtures()
@@ -55,7 +107,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "integration: CLI build failed: %v\n", err)
 		os.Exit(1)
 	}
-	cliPath = path
+	builtCLI = path
 
 	code := m.Run()
 	_ = os.RemoveAll(cliDir) // best-effort: a leftover temp dir is harmless
