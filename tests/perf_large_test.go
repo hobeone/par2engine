@@ -20,7 +20,6 @@ HOWTO Run Verification-Only Profiling:
 
    export PAR2_PERF_DIR=$HOME/par2_perf_data
    export PAR2_PERF_WORKSPACE=$HOME/par2_perf_scratch
-   go build -o par2engine-cli ./cmd/gopar
    go test -tags=perf -v ./tests/... -run=TestPerfLarge -args -perf.verify_only=true -perf.cpuprofile=cpu_verify.prof
 
 ---
@@ -29,13 +28,13 @@ HOWTO Run Full Repair Profiling:
    export PAR2_PERF_DIR=$HOME/par2_perf_data
    export PAR2_PERF_WORKSPACE=$HOME/par2_perf_scratch
 
-   go build -o par2engine-cli ./cmd/gopar
    go test -tags=perf -v ./tests/... -run=TestPerfLarge -args -perf.cpuprofile=cpu_repair.prof
 */
 
 import (
 	"bytes"
 	"crypto/md5"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -192,13 +191,7 @@ func TestPerfLarge(t *testing.T) {
 	fLarge.Close()
 	t.Log("Corruptions successfully applied (2 small files deleted, 4 large blocks corrupted).")
 
-	// Resolve absolute path to our par2engine-cli binary
-	cliPath, err := filepath.Abs("../par2engine-cli")
-	if err != nil {
-		t.Fatalf("failed to resolve CLI binary path: %v", err)
-	}
-
-	// 3. Execute verify command using par2engine-cli (Forward profiles if verifyOnly is true)
+	// 3. Execute verify command using the par2engine-cli TestMain built (Forward profiles if verifyOnly is true)
 	t.Log("Executing par2engine-cli verify...")
 	var verifyArgs []string
 	if *verifyOnly {
@@ -235,7 +228,7 @@ func TestPerfLarge(t *testing.T) {
 	var exitErr *exec.ExitError
 	if errVerify == nil {
 		t.Fatal("expected verify to fail with exit code 1, got 0")
-	} else if errorsIsExitError(errVerify, &exitErr) {
+	} else if errors.As(errVerify, &exitErr) {
 		if exitErr.ExitCode() != 1 {
 			t.Fatalf("expected verify exit code 1, got %d\n%s", exitErr.ExitCode(), outVerify)
 		}
