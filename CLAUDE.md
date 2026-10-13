@@ -86,9 +86,11 @@ These are correctness and security invariants — violations cause silent data c
 
 4. **Path sanitization**: Filenames from PAR2 packets are attacker-controlled. Always run through `DefangPath` (backslash normalization → `path.Clean` → traversal check → `filepath.FromSlash`).
 
-5. **Truncation gate**: After streamed repair, only truncate files where `needsWrite[filename] == true`. Truncating files that were not written causes permission errors on read-only descriptors.
+5. **Rebuild out of place**: `Repair` writes every file in `needsWrite` to `<name>.par2engine-tmp`, never to the target itself. Source files are opened read-only. Each temp file is truncated to its protected length and MD5-verified, and only after every file passes are the temp files renamed over their targets. Writing in place corrupts a file whose blocks were located inside itself at shifted offsets once a block spans several chunks (#26).
 
 6. **FileID sort order**: PAR2 spec requires `protectedFiles` sorted by FileID using little-endian byte comparison (last byte first). `FileIDLess` implements this — do not substitute `bytes.Compare`.
+
+7. **Repair decisions consult file state, not just block counts**: a file can have every block located and still be wrong on disk (missing, shifted, followed by extra bytes). `ShardCounts.FilesNeedingRebuild` carries that, and `RepairNeeded()` must include it (#22, #25).
 
 ## CLI Exit Codes
 

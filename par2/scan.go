@@ -55,6 +55,13 @@ type fileIntegrityState struct {
 	ShardLocations []shardLocation // maps expected shardIndex -> where it is actually located
 }
 
+// needsRebuild reports whether the file on disk is wrong — missing, the wrong
+// size, or failing its hash — and so must be rewritten, whether or not all of
+// its blocks were located.
+func (s *fileIntegrityState) needsRebuild() bool {
+	return s.Missing || s.SizeMismatch || s.HashMismatch
+}
+
 type checksumLocation struct {
 	fileID     FileID
 	shardIndex int
@@ -342,36 +349,14 @@ func (s *blockScanner) scan() error {
 // Lock discipline: acquires d.mu at entry, releases/re-acquires it for I/O,
 // and releases it on return. detectRenameCandidate must be called under the lock
 // (it drops/re-acquires internally for its own I/O).
-// Compute ShardCounts inline rather than calling d.ShardCounts() to avoid deadlock.
+// Uses shardCountsLocked rather than d.ShardCounts(), which would deadlock on d.mu.
 func (d *Decoder) postScanVerify(ctx context.Context) {
 	d.logger.DebugContext(ctx, "Starting post-scan MD5 hash verification phase")
 
 	d.mu.Lock()
 	d.verifyProtectedFilesHashes(ctx)
-
-	// Compute final shard tallies while still holding the lock — calling d.ShardCounts() here
-	// would deadlock because it also acquires d.mu.
-	usableData, unusableData, renamesNeeded := 0, 0, 0
-	for _, state := range d.fileIntegrity {
-		for _, loc := range state.ShardLocations {
-			if loc.Offset == -1 {
-				unusableData++
-			} else {
-				usableData++
-			}
-		}
-		if state.RenameSource != "" {
-			renamesNeeded++
-		}
-	}
+	finalCounts := d.shardCountsLocked()
 	d.mu.Unlock()
-
-	finalCounts := ShardCounts{
-		UsableDataShardCount:   usableData,
-		UnusableDataShardCount: unusableData,
-		UsableParityShardCount: len(d.parityShards),
-		RenamesNeeded:          renamesNeeded,
-	}
 
 	d.logVerificationReport(ctx, finalCounts)
 }
@@ -536,6 +521,10 @@ func (d *Decoder) logVerificationReport(ctx context.Context, finalCounts ShardCo
 			"damagedFiles", damagedCount,
 			"missingFiles", missingCount,
 			"availableParity", finalCounts.UsableParityShardCount)
+	case finalCounts.FilesNeedingRebuild > 0:
+		d.logger.Warn("Every block was located, but damaged file(s) must be rebuilt from them",
+			"filesToRebuild", finalCounts.FilesNeedingRebuild,
+			"filesToRename", finalCounts.RenamesNeeded)
 	case finalCounts.RenamesNeeded > 0:
 		d.logger.Info("All file content is intact — repair will rename misnamed file(s)",
 			"filesToRename", finalCounts.RenamesNeeded)

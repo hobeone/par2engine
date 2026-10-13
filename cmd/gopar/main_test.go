@@ -37,6 +37,18 @@ func TestHandleVerifyCommand(t *testing.T) {
 			expected: ExitRepairPossible,
 		},
 		{
+			// Every block was located, but a file is still wrong on disk: the
+			// rebuild is a reassembly that needs no parity.
+			name: "file needs rebuild with all blocks located",
+			counts: par2.ShardCounts{
+				UsableDataShardCount:   10,
+				UnusableDataShardCount: 0,
+				UsableParityShardCount: 0,
+				FilesNeedingRebuild:    1,
+			},
+			expected: ExitRepairPossible,
+		},
+		{
 			name: "repair not possible",
 			counts: par2.ShardCounts{
 				UsableDataShardCount:   8,

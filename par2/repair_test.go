@@ -3,10 +3,12 @@ package par2
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -218,4 +220,143 @@ func TestDecoderEndToEnd(t *testing.T) {
 			t.Fatalf("repaired file2 is not identical to original!")
 		}
 	})
+}
+
+// newInstallTestPipeline returns a pipeline over a fresh sandbox holding the
+// original file "a.dat" (mode 0600) and an output temp file for it containing
+// rebuilt, which install will check against wantHash.
+func newInstallTestPipeline(t *testing.T, original, rebuilt []byte, wantHash [16]byte) (*repairPipeline, string) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.dat"), original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+	fd := FileDescPacket{FileID: FileID{1}, Filename: "a.dat", ByteCount: len(rebuilt), Hash: wantHash}
+	d := &Decoder{root: root, protectedFiles: []FileDescPacket{fd}}
+	p := &repairPipeline{
+		d:         d,
+		plan:      &repairPlan{needsWrite: map[string]bool{"a.dat": true}},
+		sources:   make(map[string]*os.File),
+		outputs:   make(map[string]*os.File),
+		installed: make(map[string]bool),
+	}
+	f, err := p.getOutput("a.dat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Trailing bytes stand in for the zero padding of the last block, which
+	// install must truncate away before hashing.
+	if _, err := f.Write(append(append([]byte{}, rebuilt...), 0, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
+	return p, dir
+}
+
+func TestRepairPipelineInstall(t *testing.T) {
+	original := []byte("old contents")
+	rebuilt := []byte("rebuilt contents")
+
+	t.Run("hash_match_installs_and_keeps_mode", func(t *testing.T) {
+		p, dir := newInstallTestPipeline(t, original, rebuilt, md5.Sum(rebuilt))
+		if err := p.install(); err != nil {
+			t.Fatalf("install failed: %v", err)
+		}
+		p.close()
+
+		got, err := os.ReadFile(filepath.Join(dir, "a.dat"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, rebuilt) {
+			t.Errorf("a.dat = %q, want %q", got, rebuilt)
+		}
+		info, err := os.Stat(filepath.Join(dir, "a.dat"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
+			t.Errorf("a.dat mode = %v, want 0600 kept from the replaced file", info.Mode().Perm())
+		}
+		assertNoRepairTempFiles(t, dir)
+	})
+
+	t.Run("hash_mismatch_leaves_original_and_no_temp", func(t *testing.T) {
+		p, dir := newInstallTestPipeline(t, original, rebuilt, md5.Sum([]byte("something else")))
+		if err := p.install(); err == nil {
+			t.Fatal("install succeeded despite a hash mismatch")
+		}
+		p.close()
+
+		got, err := os.ReadFile(filepath.Join(dir, "a.dat"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, original) {
+			t.Errorf("a.dat = %q after a failed install, want the original %q", got, original)
+		}
+		assertNoRepairTempFiles(t, dir)
+	})
+}
+
+// TestRepairPipelineGetOutputRefusesProtectedTempName pins the guard against a
+// PAR2 set that protects both "x" and "x.par2engine-tmp": rebuilding "x" must
+// not truncate the other protected file.
+func TestRepairPipelineGetOutputRefusesProtectedTempName(t *testing.T) {
+	dir := t.TempDir()
+	other := []byte("another protected file")
+	if err := os.WriteFile(filepath.Join(dir, "x"+repairTempSuffix), other, 0644); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	d := &Decoder{root: root, protectedFiles: []FileDescPacket{
+		{Filename: "x"},
+		{Filename: "x" + repairTempSuffix},
+	}}
+	p := &repairPipeline{d: d, outputs: make(map[string]*os.File)}
+
+	if _, err := p.getOutput("x"); err == nil {
+		t.Fatal("getOutput accepted a temp name that is a protected file")
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "x"+repairTempSuffix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, other) {
+		t.Errorf("protected file was modified: %q", got)
+	}
+}
+
+func TestShardCountsFilesNeedingRebuild(t *testing.T) {
+	located := []shardLocation{{FileID: FileID{9}, Offset: 100}}
+	d := &Decoder{fileIntegrity: map[FileID]*fileIntegrityState{
+		{1}: {Verified: true, ShardLocations: located},
+		{2}: {Missing: true, ShardLocations: located},
+		{3}: {SizeMismatch: true, ShardLocations: located},
+		{4}: {HashMismatch: true, ShardLocations: located},
+		// A pending rename is counted as a rename, not also as a rebuild.
+		{5}: {HashMismatch: true, RenameSource: "other.dat", ShardLocations: located},
+	}}
+
+	sc := d.ShardCounts()
+	if sc.UnusableDataShardCount != 0 {
+		t.Fatalf("UnusableDataShardCount = %d, want 0", sc.UnusableDataShardCount)
+	}
+	if sc.FilesNeedingRebuild != 3 {
+		t.Errorf("FilesNeedingRebuild = %d, want 3", sc.FilesNeedingRebuild)
+	}
+	if sc.RenamesNeeded != 1 {
+		t.Errorf("RenamesNeeded = %d, want 1", sc.RenamesNeeded)
+	}
+	if !sc.RepairNeeded() || !sc.RepairPossible() {
+		t.Errorf("RepairNeeded=%v RepairPossible=%v, want both true", sc.RepairNeeded(), sc.RepairPossible())
+	}
 }

@@ -1135,6 +1135,29 @@ func TestPostScanVerifyTally(t *testing.T) {
 			}
 		}
 	})
+
+	// A file missing from disk whose every block was located elsewhere has no
+	// unusable shard, yet must not be reported as verified OK.
+	t.Run("rebuild_needed_all_blocks_located", func(t *testing.T) {
+		d, buf := newDecoder(t)
+
+		idMissing := FileID{0x04}
+		d.protectedFiles = []FileDescPacket{{FileID: idMissing, Filename: "missing.dat"}}
+		d.fileIntegrity[idMissing] = &fileIntegrityState{
+			Missing:        true,
+			ShardLocations: []shardLocation{{FileID: FileID{0x09}, Offset: 1000}},
+		}
+
+		d.postScanVerify(context.Background())
+
+		logOutput := buf.String()
+		if !strings.Contains(logOutput, "filesToRebuild=1") {
+			t.Errorf("log output missing filesToRebuild=1\nfull output:\n%s", logOutput)
+		}
+		if strings.Contains(logOutput, "All files verified OK") {
+			t.Errorf("a missing file was reported as verified OK\nfull output:\n%s", logOutput)
+		}
+	})
 }
 
 // TestPrescanCandidateMatches_FullHashMismatch confirms a candidate whose

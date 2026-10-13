@@ -309,6 +309,7 @@ func handleVerifyCommand(logger *slog.Logger, counts par2.ShardCounts) int {
 		logger.Warn("Repair is REQUIRED and POSSIBLE.",
 			"missingBlocks", counts.UnusableDataShardCount,
 			"availableParity", counts.UsableParityShardCount,
+			"filesToRebuild", counts.FilesNeedingRebuild,
 			"filesToRename", counts.RenamesNeeded)
 		return ExitRepairPossible
 	}
