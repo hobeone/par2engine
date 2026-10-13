@@ -10,7 +10,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -812,15 +811,12 @@ func (d *Decoder) renameMisnamedFiles(ctx context.Context) int {
 			continue
 		}
 
-		// Ensure the target directory exists using sandbox root.
-		if dir := filepath.Dir(fd.Filename); dir != "." {
-			if err := d.root.MkdirAll(dir, 0755); err != nil {
-				d.logger.WarnContext(ctx, "Failed to create directory for rename, falling back to repair",
-					"dir", dir, "err", err)
-				state.RenameSource = ""
-				state.HashMismatch = true
-				continue
-			}
+		if err := d.ensureParentDir(fd.Filename); err != nil {
+			d.logger.WarnContext(ctx, "Failed to create directory for rename, falling back to repair",
+				"file", fd.Filename, "err", err)
+			state.RenameSource = ""
+			state.HashMismatch = true
+			continue
 		}
 
 		if err := d.root.Rename(state.RenameSource, fd.Filename); err != nil {
