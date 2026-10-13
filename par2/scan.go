@@ -42,15 +42,29 @@ type shardLocation struct {
 	Offset int64  // byte offset in the file on disk. -1 if missing.
 }
 
+// fileDamage records what is wrong with a protected file under its expected
+// name. Exactly one value applies at a time, so moving a file between states
+// is a single assignment and contradictory states cannot be represented.
+type fileDamage uint8
+
+const (
+	damageUnchecked fileDamage = iota // not yet established
+	damageNone                        // full-file MD5 verified
+	damageMissing                     // no file under the expected name
+	damageWrongSize                   // present, but not the protected length
+	damageWrongHash                   // the right length, but wrong or unreadable content
+)
+
 // fileIntegrityState tracks which blocks are healthy and where they are located on disk.
 type fileIntegrityState struct {
-	FileID         FileID
-	Filename       string
-	Missing        bool
-	SizeMismatch   bool
-	HashMismatch   bool
-	Verified       bool            // true if full-file MD5 was already verified OK
-	RenameSource   string          // non-empty when a candidate file is a perfect content match under a different name
+	FileID   FileID
+	Filename string
+	Damage   fileDamage
+	// RenameSource is non-empty when a candidate file is a perfect content
+	// match under a different name. It is set only while Damage records the
+	// expected name as missing or wrong, so a rename that fails falls back to
+	// a rebuild without any further state change.
+	RenameSource   string
 	ShardLocations []shardLocation // maps expected shardIndex -> where it is actually located
 }
 
@@ -58,7 +72,17 @@ type fileIntegrityState struct {
 // size, or failing its hash — and so must be rewritten, whether or not all of
 // its blocks were located.
 func (s *fileIntegrityState) needsRebuild() bool {
-	return s.Missing || s.SizeMismatch || s.HashMismatch
+	switch s.Damage {
+	case damageMissing, damageWrongSize, damageWrongHash:
+		return true
+	}
+	return false
+}
+
+// skipsBlockScan reports whether the sliding-window scan has nothing to read
+// for this file: it is absent, or its full hash has already been verified.
+func (s *fileIntegrityState) skipsBlockScan() bool {
+	return s.Damage == damageMissing || s.Damage == damageNone
 }
 
 type checksumLocation struct {
@@ -182,7 +206,7 @@ func (d *Decoder) checkFileExistence(ctx context.Context) error {
 		f, err := d.root.Open(fd.Filename)
 		if errors.Is(err, fs.ErrNotExist) {
 			d.mu.Lock()
-			d.fileIntegrity[fd.FileID].Missing = true
+			d.fileIntegrity[fd.FileID].Damage = damageMissing
 			d.mu.Unlock()
 			continue
 		} else if err != nil {
@@ -198,11 +222,9 @@ func (d *Decoder) calculateBytesToScan() int64 {
 	var totalBytesToScan int64
 	for _, fd := range d.protectedFiles {
 		d.mu.Lock()
-		state := d.fileIntegrity[fd.FileID]
-		missing := state.Missing
-		verified := state.Verified
+		skip := d.fileIntegrity[fd.FileID].skipsBlockScan()
 		d.mu.Unlock()
-		if !missing && !verified {
+		if !skip {
 			totalBytesToScan += int64(fd.ByteCount)
 		}
 	}
@@ -299,11 +321,9 @@ func (s *blockScanner) scan() error {
 			break
 		}
 		s.d.mu.Lock()
-		state := s.d.fileIntegrity[fDesc.FileID]
-		missing := state.Missing
-		verified := state.Verified
+		skip := s.d.fileIntegrity[fDesc.FileID].skipsBlockScan()
 		s.d.mu.Unlock()
-		if missing || verified {
+		if skip {
 			continue
 		}
 		s.scanWg.Go(func() {
@@ -365,14 +385,14 @@ func (d *Decoder) postScanVerify(ctx context.Context) {
 func (d *Decoder) verifyProtectedFilesHashes(ctx context.Context) {
 	for _, fd := range d.protectedFiles {
 		state := d.fileIntegrity[fd.FileID]
-		if state.Verified || state.SizeMismatch {
+		// A rename found by the candidate prescan has already been verified.
+		if state.Damage == damageNone || state.Damage == damageWrongSize || state.RenameSource != "" {
 			continue
 		}
-		if state.Missing {
+		if state.Damage == damageMissing {
 			// The file doesn't exist under its expected name, but a candidate
 			// may have all the blocks. Check for a rename match before giving up.
 			if rename := d.detectRenameCandidate(ctx, fd, state); rename != "" {
-				state.Missing = false
 				state.RenameSource = rename
 				d.logger.InfoContext(ctx, "File found under different name",
 					"expected", fd.Filename,
@@ -389,13 +409,15 @@ func (d *Decoder) verifyProtectedFilesHashes(ctx context.Context) {
 			d.mu.Lock()
 		} else if rename := d.detectRenameCandidate(ctx, fd, state); rename != "" {
 			// All shards found in a single candidate file at consecutive offsets
-			// with a matching MD5 — this is just a misnamed file, not corruption.
+			// with a matching MD5 — this is just a misnamed file. The file under
+			// the expected name is still wrong, which matters if the rename fails.
+			state.Damage = damageWrongHash
 			state.RenameSource = rename
 			d.logger.InfoContext(ctx, "File found under different name",
 				"expected", fd.Filename,
 				"found", rename)
 		} else {
-			state.HashMismatch = true
+			state.Damage = damageWrongHash
 		}
 	}
 }
@@ -419,7 +441,7 @@ func (d *Decoder) verifySingleFileHash(ctx context.Context, fd FileDescPacket, s
 	f, err := d.root.Open(fd.Filename)
 	if err != nil {
 		d.mu.Lock()
-		state.Missing = true
+		state.Damage = damageMissing
 		d.mu.Unlock()
 		return
 	}
@@ -430,7 +452,7 @@ func (d *Decoder) verifySingleFileHash(ctx context.Context, fd FileDescPacket, s
 	if copyErr != nil {
 		d.logger.WarnContext(ctx, "I/O error during MD5 verification", "file", fd.Filename, "err", copyErr)
 		d.mu.Lock()
-		state.HashMismatch = true
+		state.Damage = damageWrongHash
 		d.mu.Unlock()
 		return
 	}
@@ -445,13 +467,10 @@ func (d *Decoder) verifySingleFileHash(ctx context.Context, fd FileDescPacket, s
 			"file", fd.Filename,
 			"expected", fmt.Sprintf("%x", fd.Hash),
 			"actual", fmt.Sprintf("%x", fileHash))
-		state.HashMismatch = true
+		state.Damage = damageWrongHash
 	} else {
 		d.logger.DebugContext(ctx, "File hash verified OK", "file", fd.Filename)
-		state.Verified = true
-		state.Missing = false
-		state.SizeMismatch = false
-		state.HashMismatch = false
+		state.Damage = damageNone
 	}
 }
 
@@ -468,15 +487,22 @@ func (d *Decoder) logVerificationReport(ctx context.Context, finalCounts ShardCo
 	for _, fd := range d.protectedFiles {
 		state := d.fileIntegrity[fd.FileID]
 		switch {
-		case state.Missing:
+		// A file with a rename planned is reported as misnamed, whatever state
+		// its expected name is in; the rename will resolve it.
+		case state.RenameSource != "":
+			d.logger.InfoContext(ctx, "File status: MISNAMED (will rename)",
+				"expected", fd.Filename,
+				"found", state.RenameSource)
+			renameCount++
+		case state.Damage == damageMissing:
 			d.logger.WarnContext(ctx, "File status: MISSING", "file", fd.Filename)
 			missingCount++
-		case state.SizeMismatch:
+		case state.Damage == damageWrongSize:
 			d.logger.WarnContext(ctx, "File status: SIZE MISMATCH",
 				"file", fd.Filename,
 				"expected", fd.ByteCount)
 			damagedCount++
-		case state.HashMismatch:
+		case state.Damage == damageWrongHash:
 			missing := 0
 			for _, loc := range state.ShardLocations {
 				if loc.Offset == -1 {
@@ -493,11 +519,6 @@ func (d *Decoder) logVerificationReport(ctx context.Context, finalCounts ShardCo
 					"file", fd.Filename)
 			}
 			damagedCount++
-		case state.RenameSource != "":
-			d.logger.InfoContext(ctx, "File status: MISNAMED (will rename)",
-				"expected", fd.Filename,
-				"found", state.RenameSource)
-			renameCount++
 		default:
 			d.logger.InfoContext(ctx, "File status: OK", "file", fd.Filename)
 			okCount++
@@ -579,7 +600,7 @@ func (d *Decoder) prescanCandidateMatches(ctx context.Context) map[string]bool {
 	d.mu.Lock()
 	for i := range d.protectedFiles {
 		fd := &d.protectedFiles[i]
-		if d.fileIntegrity[fd.FileID].Missing {
+		if d.fileIntegrity[fd.FileID].Damage == damageMissing {
 			missingByQuickKey[quickKey{int64(fd.ByteCount), fd.SixteenKHash}] = fd
 		}
 	}
@@ -635,7 +656,6 @@ func (d *Decoder) prescanCandidateMatches(ctx context.Context) map[string]bool {
 		d.mu.Lock()
 		state := d.fileIntegrity[fd.FileID]
 		state.RenameSource = candidatePath
-		state.Verified = true
 		for i := range state.ShardLocations {
 			state.ShardLocations[i] = shardLocation{
 				FileID: candidateID,
@@ -663,7 +683,7 @@ func (d *Decoder) prescanProtectedMatches(ctx context.Context) {
 		fd := &d.protectedFiles[i]
 
 		d.mu.Lock()
-		missing := d.fileIntegrity[fd.FileID].Missing
+		missing := d.fileIntegrity[fd.FileID].Damage == damageMissing
 		d.mu.Unlock()
 		if missing {
 			continue
@@ -710,10 +730,7 @@ func (d *Decoder) prescanProtectedMatches(ctx context.Context) {
 		// Perfect match: populate ShardLocations directly
 		d.mu.Lock()
 		state := d.fileIntegrity[fd.FileID]
-		state.Missing = false
-		state.SizeMismatch = false
-		state.HashMismatch = false
-		state.Verified = true
+		state.Damage = damageNone
 		for idx := range state.ShardLocations {
 			state.ShardLocations[idx] = shardLocation{
 				FileID: fd.FileID,
@@ -815,16 +832,15 @@ func (d *Decoder) renameMisnamedFiles(ctx context.Context) int {
 			d.logger.WarnContext(ctx, "Failed to create directory for rename, falling back to repair",
 				"file", fd.Filename, "err", err)
 			state.RenameSource = ""
-			state.HashMismatch = true
 			continue
 		}
 
 		if err := d.root.Rename(state.RenameSource, fd.Filename); err != nil {
 			d.logger.WarnContext(ctx, "Rename failed, falling back to repair",
 				"from", state.RenameSource, "to", fd.Filename, "err", err)
-			// Clear rename state and mark as needing reconstruction.
+			// Clear the rename; the file keeps the damage recorded for its
+			// expected name, so it is rebuilt instead.
 			state.RenameSource = ""
-			state.HashMismatch = true
 			continue
 		}
 
@@ -846,8 +862,7 @@ func (d *Decoder) renameMisnamedFiles(ctx context.Context) int {
 
 		// Update integrity state: file is now healthy under its correct name.
 		state.RenameSource = ""
-		state.Missing = false
-		state.HashMismatch = false
+		state.Damage = damageNone
 		for idx := range state.ShardLocations {
 			state.ShardLocations[idx] = shardLocation{
 				FileID: fd.FileID,
@@ -865,9 +880,9 @@ const scanChunkSize = 32 * 1024 * 1024
 func (s *blockScanner) scanFile(fd FileDescPacket) error {
 	f, err := s.d.root.Open(fd.Filename)
 	if errors.Is(err, fs.ErrNotExist) {
-		// Phase 4 of VerifyScans already logged and set Missing — nothing to do here.
+		// Phase 4 of VerifyScans already logged and set damageMissing — nothing to do here.
 		s.d.mu.Lock()
-		s.d.fileIntegrity[fd.FileID].Missing = true
+		s.d.fileIntegrity[fd.FileID].Damage = damageMissing
 		s.d.mu.Unlock()
 		return nil
 	} else if err != nil {
@@ -884,7 +899,7 @@ func (s *blockScanner) scanFile(fd FileDescPacket) error {
 	state := s.d.fileIntegrity[fd.FileID]
 	if stat.Size() != int64(fd.ByteCount) {
 		s.d.logger.Warn("File size mismatch", "file", fd.Filename, "expected", fd.ByteCount, "actual", stat.Size())
-		state.SizeMismatch = true
+		state.Damage = damageWrongSize
 	}
 	s.d.mu.Unlock()
 

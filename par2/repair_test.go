@@ -434,12 +434,12 @@ func TestRepairPipelineGetOutputLeavesExistingFilesAlone(t *testing.T) {
 func TestShardCountsFilesNeedingRebuild(t *testing.T) {
 	located := []shardLocation{{FileID: FileID{9}, Offset: 100}}
 	d := &Decoder{fileIntegrity: map[FileID]*fileIntegrityState{
-		{1}: {Verified: true, ShardLocations: located},
-		{2}: {Missing: true, ShardLocations: located},
-		{3}: {SizeMismatch: true, ShardLocations: located},
-		{4}: {HashMismatch: true, ShardLocations: located},
+		{1}: {Damage: damageNone, ShardLocations: located},
+		{2}: {Damage: damageMissing, ShardLocations: located},
+		{3}: {Damage: damageWrongSize, ShardLocations: located},
+		{4}: {Damage: damageWrongHash, ShardLocations: located},
 		// A pending rename is counted as a rename, not also as a rebuild.
-		{5}: {HashMismatch: true, RenameSource: "other.dat", ShardLocations: located},
+		{5}: {Damage: damageWrongHash, RenameSource: "other.dat", ShardLocations: located},
 	}}
 
 	sc := d.ShardCounts()

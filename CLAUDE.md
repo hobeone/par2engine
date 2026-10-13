@@ -90,7 +90,7 @@ These are correctness and security invariants — violations cause silent data c
 
 6. **FileID sort order**: PAR2 spec requires `protectedFiles` sorted by FileID using little-endian byte comparison (last byte first). `FileIDLess` implements this — do not substitute `bytes.Compare`.
 
-7. **Repair decisions consult file state, not just block counts**: a file can have every block located and still be wrong on disk (missing, shifted, followed by extra bytes). `ShardCounts.FilesNeedingRebuild` carries that, and `RepairNeeded()` must include it (#22, #25).
+7. **Repair decisions consult file state, not just block counts**: a file can have every block located and still be wrong on disk (missing, shifted, followed by extra bytes). `ShardCounts.FilesNeedingRebuild` carries that, and `RepairNeeded()` must include it (#22, #25). A file's state is one `fileDamage` value, never several flags; `RenameSource` is set only while that value says the expected name is missing or wrong, which is what lets a failed rename fall back to a rebuild.
 
 ## CLI Exit Codes
 
