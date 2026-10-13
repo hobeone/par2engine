@@ -81,6 +81,15 @@ var (
 	fixtureMultiChunk = fixture(par2Fixture{"multichunk", 10 * 1024 * 1024, 0, func() []fixtureFile {
 		return seededFiles(99, sized("bigfile.dat", 40*1024*1024))
 	}})
+	// An 8 KB file in 1 KB blocks whose bytes repeat every 251 bytes, so a
+	// window that starts off the block grid can equal a block exactly (#41).
+	fixturePeriodic = fixture(par2Fixture{"periodic", 1024, 2, func() []fixtureFile {
+		f := sized("a.bin", 8192)
+		for i := range f.data {
+			f.data[i] = byte(0x10 + i%251)
+		}
+		return []fixtureFile{f}
+	}})
 	fixtureFileState           = fixture(fileStateFixture("filestate", "f.dat", 4))
 	fixtureFileStateNoRecovery = fixture(fileStateFixture("filestate_no_recovery", "f.dat", 0))
 	fixtureFileStateNested     = fixture(fileStateFixture("filestate_nested", "sub/dir/f.dat", 4))

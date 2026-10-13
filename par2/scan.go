@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"hash/crc32"
 	"io"
 	"io/fs"
@@ -1020,6 +1021,15 @@ func (s *blockScanner) scanCandidateFile(path string, fileID FileID) error {
 	return s.scanLastPartialBlock(f, fileID, fileSize)
 }
 
+// scanChunk finds blocks among the windows that start in [start, end-
+// sliceByteCount]. Like par2cmdline, it first checks every window on the block
+// grid and claims the blocks that match where they lie, then slides a byte at
+// a time only through the unclaimed blocks between them. A match found while
+// sliding jumps a whole block, so in data that repeats with a period that does
+// not divide the block size, a window off the grid that equals some block
+// exactly would otherwise jump the scan over the true positions of the intact
+// blocks after it (#41). Claimed blocks are skipped, so such a jump can no
+// longer cost them.
 func (s *blockScanner) scanChunk(f *os.File, sourceFileID FileID, start, end int64) error {
 	bufferSize := end - start
 	if bufferSize < int64(s.d.sliceByteCount) {
@@ -1031,8 +1041,19 @@ func (s *blockScanner) scanChunk(f *os.File, sourceFileID FileID, start, end int
 		return fmt.Errorf("ReadAt offset %d: %w", start, err)
 	}
 
-	h := md5.New()
-	sumBuf := make([]byte, 0, 16)
+	bs := int64(s.d.sliceByteCount)
+	m := chunkMatcher{s: s, sourceFileID: sourceFileID, h: md5.New(), sumBuf: make([]byte, 0, 16)}
+
+	// claimed[i] reports that the block starting at firstAligned+i*bs matched.
+	firstAligned := (start + bs - 1) / bs * bs
+	var claimed []bool
+	for abs := firstAligned; abs-start <= int64(len(data))-bs; abs += bs {
+		slice := data[abs-start : abs-start+bs]
+		claimed = append(claimed, m.match(slice, crc32.ChecksumIEEE(slice), abs))
+	}
+	if s.ctx.Err() != nil {
+		return nil
+	}
 
 	var crcSlice uint32
 	justMissed := false
@@ -1045,6 +1066,14 @@ func (s *blockScanner) scanChunk(f *os.File, sourceFileID FileID, start, end int
 			}
 		}
 
+		absPos := start + int64(j)
+		blockStart := absPos / bs * bs
+		if i := (blockStart - firstAligned) / bs; blockStart >= firstAligned && i < int64(len(claimed)) && claimed[i] {
+			j = int(blockStart + bs - start)
+			justMissed = false
+			continue
+		}
+
 		slice := data[j : j+s.d.sliceByteCount]
 		if justMissed {
 			crcSlice = s.window.update(crcSlice, data[j-1], slice[len(slice)-1])
@@ -1052,61 +1081,70 @@ func (s *blockScanner) scanChunk(f *os.File, sourceFileID FileID, start, end int
 			crcSlice = crc32.ChecksumIEEE(slice)
 		}
 
-		absPos := start + int64(j)
-		atShardBoundary := absPos%int64(s.d.sliceByteCount) == 0
-
-		locations, found := s.lookupTable.Lookup(crcSlice)
-		if !found {
-			if atShardBoundary {
-				s.d.logger.DebugContext(s.ctx, "Shard boundary CRC miss",
-					"file", sourceFileID,
-					"absOffset", absPos,
-					"shardIdx", absPos/int64(s.d.sliceByteCount),
-					"viaRolling", justMissed,
-					"crc", fmt.Sprintf("%08x", crcSlice))
-			}
-			j++
-			justMissed = true
-			continue
-		}
-
-		h.Reset()
-		_, _ = h.Write(slice)
-		sumBuf = h.Sum(sumBuf[:0])
-		var blockHash [16]byte
-		copy(blockHash[:], sumBuf)
-		md5Matched := false
-		for _, loc := range locations {
-			if loc.md5Hash == blockHash {
-				md5Matched = true
-				s.matchChan <- matchEvent{
-					targetFileID: loc.fileID,
-					shardIndex:   loc.shardIndex,
-					sourceFileID: sourceFileID,
-					offset:       absPos,
-				}
-			}
-		}
-
-		if md5Matched {
+		if m.match(slice, crcSlice, absPos) {
 			// True shard match: advance past this block.
 			j += s.d.sliceByteCount
 			justMissed = false
 		} else {
-			// CRC collision with no MD5 confirmation — treat as a miss and slide
-			// one byte forward. Jumping by sliceByteCount here would skip past real
-			// shard boundaries that fall in the next sliceByteCount bytes.
-			if atShardBoundary {
-				s.d.logger.DebugContext(s.ctx, "Shard boundary CRC hit but MD5 mismatch",
-					"file", sourceFileID,
-					"absOffset", absPos,
-					"shardIdx", absPos/int64(s.d.sliceByteCount),
-					"viaRolling", justMissed,
-					"crc", fmt.Sprintf("%08x", crcSlice))
-			}
+			// No block here, or a CRC collision with no MD5 confirmation: slide
+			// one byte forward. Jumping by sliceByteCount here would skip past
+			// real shard boundaries that fall in the next sliceByteCount bytes.
 			j++
 			justMissed = true
 		}
 	}
 	return nil
+}
+
+// chunkMatcher holds one scanChunk call's MD5 state.
+type chunkMatcher struct {
+	s            *blockScanner
+	sourceFileID FileID
+	h            hash.Hash
+	sumBuf       []byte
+}
+
+// match reports whether slice, whose CRC32 is crc and which starts at absPos
+// in the source file, is a block of the set, confirmed by MD5. It sends a
+// matchEvent for every block slice equals.
+func (m *chunkMatcher) match(slice []byte, crc uint32, absPos int64) bool {
+	s := m.s
+	atShardBoundary := absPos%int64(s.d.sliceByteCount) == 0
+	locations, found := s.lookupTable.Lookup(crc)
+	if !found {
+		if atShardBoundary {
+			s.d.logger.DebugContext(s.ctx, "Shard boundary CRC miss",
+				"file", m.sourceFileID,
+				"absOffset", absPos,
+				"shardIdx", absPos/int64(s.d.sliceByteCount),
+				"crc", fmt.Sprintf("%08x", crc))
+		}
+		return false
+	}
+
+	m.h.Reset()
+	_, _ = m.h.Write(slice)
+	m.sumBuf = m.h.Sum(m.sumBuf[:0])
+	var blockHash [16]byte
+	copy(blockHash[:], m.sumBuf)
+	md5Matched := false
+	for _, loc := range locations {
+		if loc.md5Hash == blockHash {
+			md5Matched = true
+			s.matchChan <- matchEvent{
+				targetFileID: loc.fileID,
+				shardIndex:   loc.shardIndex,
+				sourceFileID: m.sourceFileID,
+				offset:       absPos,
+			}
+		}
+	}
+	if !md5Matched && atShardBoundary {
+		s.d.logger.DebugContext(s.ctx, "Shard boundary CRC hit but MD5 mismatch",
+			"file", m.sourceFileID,
+			"absOffset", absPos,
+			"shardIdx", absPos/int64(s.d.sliceByteCount),
+			"crc", fmt.Sprintf("%08x", crc))
+	}
+	return md5Matched
 }

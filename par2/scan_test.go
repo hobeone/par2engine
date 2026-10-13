@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -130,6 +131,102 @@ func TestScanChunkCRCCollisionDoesNotSkipShard(t *testing.T) {
 	}
 	if !found {
 		t.Error("shard 1 at absolute offset 8 was not found; CRC collision at j=0 may have caused it to be skipped")
+	}
+}
+
+// TestScanFlipInRepeatingData covers one flipped byte in a file whose bytes
+// repeat with a period that is not a multiple of the block size. Sliding past
+// the damage reaches windows off the block grid that equal some block exactly;
+// jumping a block from such a match steps over the true positions of the
+// intact blocks after it, which then count as missing too (#41). At most the
+// damaged block may count, so two recovery blocks repair it.
+func TestScanFlipInRepeatingData(t *testing.T) {
+	for _, off := range []int{0, 2048, 3000, 5000, 6500, 8191} {
+		t.Run(strconv.Itoa(off), func(t *testing.T) {
+			dir, par2Path, files := fixturePeriodic.load(t)
+			orig := files["a.bin"]
+			bad := append([]byte{}, orig...)
+			bad[off] ^= 0xFF
+			writeTestFile(t, filepath.Join(dir, "a.bin"), bad)
+
+			ctx := context.Background()
+			d, err := NewDecoder(ctx, par2Path, DecoderOptions{})
+			if err != nil {
+				t.Fatalf("NewDecoder: %v", err)
+			}
+			defer func() { _ = d.Close() }()
+			if err := d.VerifyScans(ctx, nil); err != nil {
+				t.Fatalf("VerifyScans: %v", err)
+			}
+			// The damaged block's bytes may also be found elsewhere in the
+			// file, so it need not count either.
+			if got := d.ShardCounts().UnusableDataShardCount; got > 1 {
+				t.Fatalf("missing blocks = %d, want at most 1 (the block holding offset %d)", got, off)
+			}
+			if err := d.Repair(ctx, nil); err != nil {
+				t.Fatalf("Repair: %v", err)
+			}
+			got, err := os.ReadFile(filepath.Join(dir, "a.bin"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, orig) {
+				t.Error("repaired file does not match the original")
+			}
+		})
+	}
+}
+
+// TestScanChunkMatchesEachGridBlockOnce checks that the byte-wise slide skips
+// the blocks the grid pass already matched. Without that, an intact file is
+// hashed twice: once on the grid and again as the slide meets each block.
+func TestScanChunkMatchesEachGridBlockOnce(t *testing.T) {
+	const sliceSize, blocks = 8, 8
+	data := make([]byte, sliceSize*blocks)
+	for i := range data {
+		data[i] = byte(i*37 + 5)
+	}
+	tmp := filepath.Join(t.TempDir(), "f")
+	writeTestFile(t, tmp, data)
+	f, err := os.Open(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	checksumMap := make(map[uint32][]checksumLocation)
+	for i := range blocks {
+		b := data[i*sliceSize : (i+1)*sliceSize]
+		crc := crc32.ChecksumIEEE(b)
+		checksumMap[crc] = append(checksumMap[crc], checksumLocation{shardIndex: i, md5Hash: md5.Sum(b)})
+	}
+	window, err := newCRC32Window(sliceSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := &blockScanner{
+		d:           &Decoder{sliceByteCount: sliceSize, logger: slog.Default()},
+		ctx:         context.Background(),
+		window:      window,
+		lookupTable: newCRCLookupTable(checksumMap),
+		matchChan:   make(chan matchEvent, 4*blocks),
+	}
+	if err := scanner.scanChunk(f, FileID{}, 0, int64(len(data))); err != nil {
+		t.Fatalf("scanChunk: %v", err)
+	}
+	close(scanner.matchChan)
+
+	seen := make(map[int]int)
+	for ev := range scanner.matchChan {
+		if ev.offset != int64(ev.shardIndex*sliceSize) {
+			t.Errorf("shard %d matched at offset %d, want %d", ev.shardIndex, ev.offset, ev.shardIndex*sliceSize)
+		}
+		seen[ev.shardIndex]++
+	}
+	for i := range blocks {
+		if seen[i] != 1 {
+			t.Errorf("shard %d matched %d times, want 1", i, seen[i])
+		}
 	}
 }
 
