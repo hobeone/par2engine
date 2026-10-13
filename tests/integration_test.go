@@ -265,7 +265,7 @@ func TestIntegration(t *testing.T) {
 
 func runCLI(t *testing.T, dir, subcmd, par2file string) int {
 	t.Helper()
-	cmd := exec.Command(cliPath, subcmd, par2file)
+	cmd := exec.Command(cli(t), subcmd, par2file)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err == nil {

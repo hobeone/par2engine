@@ -206,7 +206,7 @@ func TestPerfLarge(t *testing.T) {
 	}
 	verifyArgs = append(verifyArgs, "verify", par2Path)
 
-	cmdVerify := exec.Command(cliPath, verifyArgs...)
+	cmdVerify := exec.Command(cli(t), verifyArgs...)
 	cmdVerify.Dir = dir
 
 	startVerify := time.Now()
@@ -268,7 +268,7 @@ func TestPerfLarge(t *testing.T) {
 	}
 	repairArgs = append(repairArgs, "repair", par2Path)
 
-	cmdRepair := exec.Command(cliPath, repairArgs...)
+	cmdRepair := exec.Command(cli(t), repairArgs...)
 	cmdRepair.Dir = dir
 
 	startRepair := time.Now()
