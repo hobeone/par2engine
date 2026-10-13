@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"sync"
 
 	"github.com/hobeone/par2engine/rs"
 )
@@ -424,8 +425,8 @@ func (p *repairPipeline) executeChunk(ctx context.Context, chunkIdx int64) error
 
 // install finishes every rebuilt file: it truncates the temp file to the
 // protected length (dropping the zero padding of the last block), checks its
-// MD5 against the file description, and only once every file has passed
-// renames each temp file over its target. A hash mismatch installs nothing.
+// MD5 against the file description (see finishRebuiltFiles), and only once
+// every file has passed renames each temp file over its target. A hash mismatch installs nothing.
 // The renames themselves happen one file at a time, so a rename failure can
 // leave earlier files replaced; each of those has already passed its hash.
 func (p *repairPipeline) install() error {
@@ -439,14 +440,12 @@ func (p *repairPipeline) install() error {
 
 	var rebuilt []FileDescPacket
 	for _, fd := range p.d.protectedFiles {
-		f, ok := p.outputs[fd.Filename]
-		if !ok {
-			continue
+		if _, ok := p.outputs[fd.Filename]; ok {
+			rebuilt = append(rebuilt, fd)
 		}
-		if err := finishRebuiltFile(f, fd); err != nil {
-			return err
-		}
-		rebuilt = append(rebuilt, fd)
+	}
+	if err := p.finishRebuiltFiles(rebuilt); err != nil {
+		return err
 	}
 
 	// Every read and write is done. Release all handles before renaming: on
@@ -481,16 +480,36 @@ func (p *repairPipeline) install() error {
 	return nil
 }
 
+// finishRebuiltFiles runs finishRebuiltFile on every rebuilt file, up to
+// numGoroutines at a time. The files were just written and are usually still
+// in the page cache, so the work is mostly hashing, and one core per file pays
+// off. It returns every failure, in protectedFiles order.
+func (p *repairPipeline) finishRebuiltFiles(rebuilt []FileDescPacket) error {
+	errs := make([]error, len(rebuilt))
+	sem := make(chan struct{}, max(1, p.d.numGoroutines))
+	var wg sync.WaitGroup
+	for i, fd := range rebuilt {
+		f := p.outputs[fd.Filename]
+		sem <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			errs[i] = finishRebuiltFile(f, fd)
+		})
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
 // finishRebuiltFile truncates f to the protected file's length, flushes it, and
 // verifies its full MD5 against the file description. The flush comes before
 // the hash so that a file which passes is durable before it is renamed into
 // place; a crash after the rename must not leave a verified name with unwritten data.
 func finishRebuiltFile(f *os.File, fd FileDescPacket) error {
 	if err := f.Truncate(int64(fd.ByteCount)); err != nil {
-		return err
+		return fmt.Errorf("failed to truncate rebuilt %s: %w", fd.Filename, err)
 	}
 	if err := f.Sync(); err != nil {
-		return err
+		return fmt.Errorf("failed to sync rebuilt %s: %w", fd.Filename, err)
 	}
 	got, err := computeFileMD5(f)
 	if err != nil {
