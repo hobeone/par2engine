@@ -294,8 +294,9 @@ func TestRenameMisnamedFile(t *testing.T) {
 		state := d.fileIntegrity[fd.FileID]
 		if state.RenameSource != "" {
 			renameFound = true
-			if state.HashMismatch {
-				t.Error("file with RenameSource should not have HashMismatch set")
+			// The expected name holds no file; the rename, not a rebuild, fixes it.
+			if state.Damage != damageMissing {
+				t.Errorf("Damage = %v, want damageMissing for a file found only under another name", state.Damage)
 			}
 		}
 	}
@@ -597,7 +598,7 @@ func TestScanCandidateFile(t *testing.T) {
 }
 
 // TestVerifySingleFileHash covers the three code paths in verifySingleFileHash:
-// correct hash → Verified=true, wrong hash → HashMismatch=true, file missing → Missing=true.
+// correct hash → damageNone, wrong hash → damageWrongHash, file missing → damageMissing.
 //
 // Note: this path is defensive. In normal flow the prescan catches healthy files
 // and corrupt files fail isAllShardsConsecutive, so the integration suite rarely
@@ -622,30 +623,24 @@ func TestVerifySingleFileHash(t *testing.T) {
 	t.Run("correct_hash_sets_verified", func(t *testing.T) {
 		state := &fileIntegrityState{}
 		d.verifySingleFileHash(context.Background(), FileDescPacket{Filename: fname, Hash: actualMD5}, state)
-		if !state.Verified {
-			t.Error("expected Verified=true for correct hash")
-		}
-		if state.HashMismatch {
-			t.Error("expected HashMismatch=false for correct hash")
+		if state.Damage != damageNone {
+			t.Errorf("Damage = %v, want damageNone for correct hash", state.Damage)
 		}
 	})
 
 	t.Run("wrong_hash_sets_hash_mismatch", func(t *testing.T) {
 		state := &fileIntegrityState{}
 		d.verifySingleFileHash(context.Background(), FileDescPacket{Filename: fname, Hash: [16]byte{0xFF}}, state)
-		if !state.HashMismatch {
-			t.Error("expected HashMismatch=true for wrong hash")
-		}
-		if state.Verified {
-			t.Error("expected Verified=false for wrong hash")
+		if state.Damage != damageWrongHash {
+			t.Errorf("Damage = %v, want damageWrongHash for wrong hash", state.Damage)
 		}
 	})
 
 	t.Run("missing_file_sets_missing", func(t *testing.T) {
 		state := &fileIntegrityState{}
 		d.verifySingleFileHash(context.Background(), FileDescPacket{Filename: "no_such_file.dat", Hash: actualMD5}, state)
-		if !state.Missing {
-			t.Error("expected Missing=true for inaccessible file")
+		if state.Damage != damageMissing {
+			t.Errorf("Damage = %v, want damageMissing for inaccessible file", state.Damage)
 		}
 	})
 }
@@ -780,25 +775,28 @@ func TestVerificationReporting(t *testing.T) {
 		ShardLocations: []shardLocation{{FileID: idOK, Offset: 0}},
 	}
 	d.fileIntegrity[idMissing] = &fileIntegrityState{
-		Missing:        true,
+		Damage:         damageMissing,
 		ShardLocations: []shardLocation{{FileID: idMissing, Offset: -1}},
 	}
 	d.fileIntegrity[idMismatch] = &fileIntegrityState{
-		SizeMismatch:   true,
+		Damage:         damageWrongSize,
 		ShardLocations: []shardLocation{{FileID: idMismatch, Offset: -1}},
 	}
+	// Missing under its expected name, as the candidate prescan leaves it: a
+	// planned rename is reported as misnamed, not missing.
 	d.fileIntegrity[idRename] = &fileIntegrityState{
+		Damage:         damageMissing,
 		RenameSource:   "rename_src.dat",
 		ShardLocations: []shardLocation{{FileID: idRename, Offset: -1}},
 	}
 	d.fileIntegrity[idDamaged] = &fileIntegrityState{
-		HashMismatch:   true,
+		Damage:         damageWrongHash,
 		ShardLocations: []shardLocation{{FileID: idDamaged, Offset: -1}},
 	}
 	// All blocks present (no -1 offsets) but the hash still doesn't match: real
 	// corruption, not missing data — distinct log branch from idDamaged above.
 	d.fileIntegrity[idCorrupt] = &fileIntegrityState{
-		HashMismatch:   true,
+		Damage:         damageWrongHash,
 		ShardLocations: []shardLocation{{FileID: idCorrupt, Offset: 0}},
 	}
 
@@ -881,10 +879,12 @@ func TestRenameMisnamedFiles_ErrorPaths(t *testing.T) {
 	}
 
 	d.fileIntegrity[idMkdirFail] = &fileIntegrityState{
+		Damage:         damageMissing,
 		RenameSource:   "source1.dat",
 		ShardLocations: []shardLocation{{Offset: -1}},
 	}
 	d.fileIntegrity[idRenameFail] = &fileIntegrityState{
+		Damage:         damageMissing,
 		RenameSource:   "nonexistent_source.dat",
 		ShardLocations: []shardLocation{{Offset: -1}},
 	}
@@ -895,13 +895,13 @@ func TestRenameMisnamedFiles_ErrorPaths(t *testing.T) {
 	}
 
 	state1 := d.fileIntegrity[idMkdirFail]
-	if state1.RenameSource != "" || !state1.HashMismatch {
-		t.Errorf("expected fallback to repair for MkdirAll failure, got RenameSource=%q HashMismatch=%v", state1.RenameSource, state1.HashMismatch)
+	if state1.RenameSource != "" || !state1.needsRebuild() {
+		t.Errorf("expected fallback to repair for MkdirAll failure, got RenameSource=%q Damage=%v", state1.RenameSource, state1.Damage)
 	}
 
 	state2 := d.fileIntegrity[idRenameFail]
-	if state2.RenameSource != "" || !state2.HashMismatch {
-		t.Errorf("expected fallback to repair for Rename failure, got RenameSource=%q HashMismatch=%v", state2.RenameSource, state2.HashMismatch)
+	if state2.RenameSource != "" || !state2.needsRebuild() {
+		t.Errorf("expected fallback to repair for Rename failure, got RenameSource=%q Damage=%v", state2.RenameSource, state2.Damage)
 	}
 }
 
@@ -930,6 +930,7 @@ func TestRenameMisnamedFiles_Success(t *testing.T) {
 	fid := FileID{0x01}
 	d.protectedFiles = []FileDescPacket{{FileID: fid, Filename: "dest.dat", ByteCount: 4}}
 	d.fileIntegrity[fid] = &fileIntegrityState{
+		Damage:         damageMissing,
 		RenameSource:   "source.dat",
 		ShardLocations: []shardLocation{{Offset: -1}},
 	}
@@ -939,6 +940,75 @@ func TestRenameMisnamedFiles_Success(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "dest.dat")); err != nil {
 		t.Errorf("dest.dat should exist after rename: %v", err)
+	}
+	// The renamed file was verified as a candidate, so nothing is left to rebuild.
+	if state := d.fileIntegrity[fid]; state.Damage != damageNone || state.needsRebuild() {
+		t.Errorf("after rename Damage = %v, want damageNone", state.Damage)
+	}
+}
+
+// TestVerifyProtectedFilesHashes_RenameKeepsDamage pins what a found rename
+// records about the expected name: still missing, or wrong when a file of the
+// right size is there. A rename that later fails then falls back to a rebuild
+// because the damage is still recorded.
+func TestVerifyProtectedFilesHashes_RenameKeepsDamage(t *testing.T) {
+	content := []byte("rename candidate file content")
+	const candidateName = "candidate.dat"
+	targetID, candidateID := FileID{0x01}, FileID{0x02}
+
+	for _, tc := range []struct {
+		name   string
+		target []byte // nil: no file under the expected name
+		before fileDamage
+		want   fileDamage
+	}{
+		{"expected_name_missing", nil, damageMissing, damageMissing},
+		{"expected_name_wrong_content", bytes.Repeat([]byte{'x'}, len(content)), damageUnchecked, damageWrongHash},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, candidateName), content, 0644); err != nil {
+				t.Fatal(err)
+			}
+			if tc.target != nil {
+				if err := os.WriteFile(filepath.Join(dir, "target.dat"), tc.target, 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := &Decoder{
+				root:           root,
+				logger:         slog.Default(),
+				sliceByteCount: len(content),
+				candidateFiles: map[string]FileID{candidateName: candidateID},
+				candidateByID:  map[FileID]string{candidateID: candidateName},
+				fileIntegrity:  make(map[FileID]*fileIntegrityState),
+			}
+			defer func() { _ = d.Close() }()
+			d.protectedFiles = []FileDescPacket{{FileID: targetID, Filename: "target.dat", ByteCount: len(content), Hash: md5.Sum(content)}}
+			state := &fileIntegrityState{
+				Damage:         tc.before,
+				ShardLocations: []shardLocation{{FileID: candidateID, Offset: 0}},
+			}
+			d.fileIntegrity[targetID] = state
+
+			d.mu.Lock()
+			d.verifyProtectedFilesHashes(context.Background())
+			d.mu.Unlock()
+
+			if state.RenameSource != candidateName {
+				t.Fatalf("RenameSource = %q, want %q", state.RenameSource, candidateName)
+			}
+			if state.Damage != tc.want {
+				t.Errorf("Damage = %v, want %v", state.Damage, tc.want)
+			}
+			if !state.needsRebuild() {
+				t.Error("needsRebuild() = false: a failed rename would leave the file unrepaired")
+			}
+		})
 	}
 }
 
@@ -1055,9 +1125,9 @@ func TestScanProgressAdd(t *testing.T) {
 }
 
 // TestPostScanVerifyTally confirms the usable/unusable/rename tallies
-// postScanVerify computes from ShardLocations. Pre-Verified states make
-// verifyProtectedFilesHashes skip its I/O entirely (see its
-// "state.Verified || state.SizeMismatch" guard), isolating the tally
+// postScanVerify computes from ShardLocations. Pre-verified states (damageNone,
+// or a rename already found) make verifyProtectedFilesHashes skip its I/O
+// entirely, isolating the tally
 // arithmetic from the hash-verification path already covered elsewhere.
 // The tallies are local to postScanVerify, so this reads them back out of
 // the log line logVerificationReport emits rather than a stored field.
@@ -1097,12 +1167,12 @@ func TestPostScanVerifyTally(t *testing.T) {
 		}
 		// 2 usable shards.
 		d.fileIntegrity[idHealthy] = &fileIntegrityState{
-			Verified:       true,
+			Damage:         damageNone,
 			ShardLocations: []shardLocation{{FileID: idHealthy, Offset: 0}, {FileID: idHealthy, Offset: 8}},
 		}
 		// 1 usable + 1 unusable shard.
 		d.fileIntegrity[idPartial] = &fileIntegrityState{
-			Verified:       true,
+			Damage:         damageNone,
 			ShardLocations: []shardLocation{{FileID: idPartial, Offset: 0}, {Offset: -1}},
 		}
 
@@ -1122,7 +1192,7 @@ func TestPostScanVerifyTally(t *testing.T) {
 		idRenamed := FileID{0x03}
 		d.protectedFiles = []FileDescPacket{{FileID: idRenamed, Filename: "renamed.dat"}}
 		d.fileIntegrity[idRenamed] = &fileIntegrityState{
-			Verified:       true,
+			Damage:         damageMissing,
 			RenameSource:   "old_name.dat",
 			ShardLocations: []shardLocation{{FileID: idRenamed, Offset: 0}},
 		}
@@ -1145,7 +1215,7 @@ func TestPostScanVerifyTally(t *testing.T) {
 		idMissing := FileID{0x04}
 		d.protectedFiles = []FileDescPacket{{FileID: idMissing, Filename: "missing.dat"}}
 		d.fileIntegrity[idMissing] = &fileIntegrityState{
-			Missing:        true,
+			Damage:         damageMissing,
 			ShardLocations: []shardLocation{{FileID: FileID{0x09}, Offset: 1000}},
 		}
 
@@ -1201,15 +1271,15 @@ func TestPrescanCandidateMatches_FullHashMismatch(t *testing.T) {
 		Hash:         md5.Sum(genuine),
 	}
 	d.protectedFiles = []FileDescPacket{fd}
-	d.fileIntegrity[fd.FileID] = &fileIntegrityState{FileID: fd.FileID, Missing: true}
+	d.fileIntegrity[fd.FileID] = &fileIntegrityState{FileID: fd.FileID, Damage: damageMissing}
 
 	resolved := d.prescanCandidateMatches(context.Background())
 
 	if resolved["candidate.dat"] {
 		t.Error("candidate resolved despite full-file MD5 mismatch after a matching quick hash")
 	}
-	if state := d.fileIntegrity[fd.FileID]; state.Verified {
-		t.Error("target marked Verified despite full-file MD5 mismatch")
+	if state := d.fileIntegrity[fd.FileID]; state.RenameSource != "" {
+		t.Errorf("target given rename source %q despite full-file MD5 mismatch", state.RenameSource)
 	}
 }
 
@@ -1334,7 +1404,7 @@ func TestRenameMisnamedFiles_RemapsOtherFilesBlocks(t *testing.T) {
 		ShardLocations: []shardLocation{{FileID: candID, Offset: 0}},
 	}
 	d.fileIntegrity[idB] = &fileIntegrityState{
-		HashMismatch:   true,
+		Damage:         damageWrongHash,
 		ShardLocations: []shardLocation{{FileID: candID, Offset: 100}, {FileID: idB, Offset: 4}, {Offset: -1}},
 	}
 
@@ -1344,5 +1414,28 @@ func TestRenameMisnamedFiles_RemapsOtherFilesBlocks(t *testing.T) {
 	want := []shardLocation{{FileID: idA, Offset: 100}, {FileID: idB, Offset: 4}, {Offset: -1}}
 	if got := d.fileIntegrity[idB].ShardLocations; !slices.Equal(got, want) {
 		t.Errorf("b.dat locations = %+v, want %+v", got, want)
+	}
+}
+
+// TestCalculateBytesToScan pins which files the sliding-window scan reads: a
+// file whose full hash is already verified, or that is absent, is skipped,
+// while one not yet checked or found the wrong size is scanned.
+func TestCalculateBytesToScan(t *testing.T) {
+	d := &Decoder{fileIntegrity: make(map[FileID]*fileIntegrityState)}
+	for i, tc := range []struct {
+		damage fileDamage
+		size   int
+	}{
+		{damageUnchecked, 1},
+		{damageWrongSize, 10},
+		{damageNone, 100},
+		{damageMissing, 1000},
+	} {
+		id := FileID{byte(i + 1)}
+		d.protectedFiles = append(d.protectedFiles, FileDescPacket{FileID: id, ByteCount: tc.size})
+		d.fileIntegrity[id] = &fileIntegrityState{Damage: tc.damage}
+	}
+	if got := d.calculateBytesToScan(); got != 11 {
+		t.Errorf("calculateBytesToScan() = %d, want 11 (unchecked + wrong size only)", got)
 	}
 }

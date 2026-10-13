@@ -49,12 +49,12 @@ func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) erro
 			continue
 		}
 		state := d.fileIntegrity[f.FileID]
-		switch {
-		case state.Missing:
+		switch state.Damage {
+		case damageMissing:
 			d.logger.InfoContext(ctx, "Repairing file: recreating from scratch", "file", f.Filename)
-		case state.SizeMismatch:
+		case damageWrongSize:
 			d.logger.InfoContext(ctx, "Repairing file: size mismatch, rewriting", "file", f.Filename)
-		case state.HashMismatch:
+		case damageWrongHash:
 			d.logger.InfoContext(ctx, "Repairing file: corrupt blocks, reconstructing", "file", f.Filename)
 		default:
 			d.logger.InfoContext(ctx, "Repairing file: blocks found in wrong location, rewriting", "file", f.Filename)
