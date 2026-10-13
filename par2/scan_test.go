@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1297,5 +1298,51 @@ func TestCheckFileExistence_NonNotExistError(t *testing.T) {
 
 	if err := d.checkFileExistence(context.Background()); err == nil {
 		t.Error("expected a permission error, got nil")
+	}
+}
+
+// TestRenameMisnamedFiles_RemapsOtherFilesBlocks pins that when a candidate is
+// renamed to a protected name, blocks of other files located inside it follow
+// it to the new name; otherwise a rebuild reading them opens the old path.
+func TestRenameMisnamedFiles_RemapsOtherFilesBlocks(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "cand.bin"), []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &Decoder{
+		root:          root,
+		logger:        slog.Default(),
+		fileIntegrity: make(map[FileID]*fileIntegrityState),
+	}
+	defer func() { _ = d.Close() }()
+	if err := d.AddCandidateFile("cand.bin"); err != nil {
+		t.Fatal(err)
+	}
+	candID := d.candidateFiles["cand.bin"]
+
+	idA, idB := FileID{0x01}, FileID{0x02}
+	d.protectedFiles = []FileDescPacket{
+		{FileID: idA, Filename: "a.dat", ByteCount: 4},
+		{FileID: idB, Filename: "b.dat", ByteCount: 8},
+	}
+	d.fileIntegrity[idA] = &fileIntegrityState{
+		RenameSource:   "cand.bin",
+		ShardLocations: []shardLocation{{FileID: candID, Offset: 0}},
+	}
+	d.fileIntegrity[idB] = &fileIntegrityState{
+		HashMismatch:   true,
+		ShardLocations: []shardLocation{{FileID: candID, Offset: 100}, {FileID: idB, Offset: 4}, {Offset: -1}},
+	}
+
+	if renamed := d.renameMisnamedFiles(context.Background()); renamed != 1 {
+		t.Fatalf("renameMisnamedFiles returned %d, want 1", renamed)
+	}
+	want := []shardLocation{{FileID: idA, Offset: 100}, {FileID: idB, Offset: 4}, {Offset: -1}}
+	if got := d.fileIntegrity[idB].ShardLocations; !slices.Equal(got, want) {
+		t.Errorf("b.dat locations = %+v, want %+v", got, want)
 	}
 }

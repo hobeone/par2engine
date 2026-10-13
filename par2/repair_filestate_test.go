@@ -204,7 +204,7 @@ func TestRepairRebuildsFilesWhoseBlocksAreAllLocated(t *testing.T) {
 // assertNoRepairTempFiles fails if a repair left a temporary file behind.
 func assertNoRepairTempFiles(t *testing.T, dir string) {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(dir, "*"+repairTempSuffix))
+	matches, err := filepath.Glob(filepath.Join(dir, "*"+repairTempMarker+"*"+repairTempExt))
 	if err != nil {
 		t.Fatal(err)
 	}

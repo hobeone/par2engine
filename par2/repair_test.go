@@ -222,39 +222,64 @@ func TestDecoderEndToEnd(t *testing.T) {
 	})
 }
 
-// newInstallTestPipeline returns a pipeline over a fresh sandbox holding the
-// original file "a.dat" (mode 0600) and an output temp file for it containing
-// rebuilt, which install will check against wantHash.
-func newInstallTestPipeline(t *testing.T, original, rebuilt []byte, wantHash [16]byte) (*repairPipeline, string) {
+// installTestFile describes one protected file for newInstallTestPipeline: its
+// current bytes on disk (mode 0600), the bytes rebuilt for it, and the hash
+// install checks those rebuilt bytes against.
+type installTestFile struct {
+	name     string
+	original []byte
+	rebuilt  []byte
+	wantHash [16]byte
+}
+
+// newInstallTestPipeline returns a pipeline over a fresh sandbox holding each
+// file's original bytes, with an output temp file per file holding its rebuilt
+// bytes followed by zero padding that install must truncate away.
+func newInstallTestPipeline(t *testing.T, files ...installTestFile) (*repairPipeline, string) {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "a.dat"), original, 0600); err != nil {
-		t.Fatal(err)
-	}
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = root.Close() })
-	fd := FileDescPacket{FileID: FileID{1}, Filename: "a.dat", ByteCount: len(rebuilt), Hash: wantHash}
-	d := &Decoder{root: root, protectedFiles: []FileDescPacket{fd}}
+
+	d := &Decoder{root: root}
 	p := &repairPipeline{
 		d:         d,
-		plan:      &repairPlan{needsWrite: map[string]bool{"a.dat": true}},
+		plan:      &repairPlan{needsWrite: make(map[string]bool)},
 		sources:   make(map[string]*os.File),
 		outputs:   make(map[string]*os.File),
-		installed: make(map[string]bool),
+		tempNames: make(map[string]string),
 	}
-	f, err := p.getOutput("a.dat")
+	for i, tf := range files {
+		if err := os.WriteFile(filepath.Join(dir, tf.name), tf.original, 0600); err != nil {
+			t.Fatal(err)
+		}
+		d.protectedFiles = append(d.protectedFiles, FileDescPacket{
+			FileID: FileID{byte(i + 1)}, Filename: tf.name, ByteCount: len(tf.rebuilt), Hash: tf.wantHash,
+		})
+		p.plan.needsWrite[tf.name] = true
+		f, err := p.getOutput(tf.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write(append(append([]byte{}, tf.rebuilt...), 0, 0, 0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return p, dir
+}
+
+func assertFileContents(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Trailing bytes stand in for the zero padding of the last block, which
-	// install must truncate away before hashing.
-	if _, err := f.Write(append(append([]byte{}, rebuilt...), 0, 0, 0)); err != nil {
-		t.Fatal(err)
+	if !bytes.Equal(got, want) {
+		t.Errorf("%s = %q, want %q", filepath.Base(path), got, want)
 	}
-	return p, dir
 }
 
 func TestRepairPipelineInstall(t *testing.T) {
@@ -262,19 +287,13 @@ func TestRepairPipelineInstall(t *testing.T) {
 	rebuilt := []byte("rebuilt contents")
 
 	t.Run("hash_match_installs_and_keeps_mode", func(t *testing.T) {
-		p, dir := newInstallTestPipeline(t, original, rebuilt, md5.Sum(rebuilt))
+		p, dir := newInstallTestPipeline(t, installTestFile{"a.dat", original, rebuilt, md5.Sum(rebuilt)})
 		if err := p.install(); err != nil {
 			t.Fatalf("install failed: %v", err)
 		}
 		p.close()
 
-		got, err := os.ReadFile(filepath.Join(dir, "a.dat"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(got, rebuilt) {
-			t.Errorf("a.dat = %q, want %q", got, rebuilt)
-		}
+		assertFileContents(t, filepath.Join(dir, "a.dat"), rebuilt)
 		info, err := os.Stat(filepath.Join(dir, "a.dat"))
 		if err != nil {
 			t.Fatal(err)
@@ -286,52 +305,86 @@ func TestRepairPipelineInstall(t *testing.T) {
 	})
 
 	t.Run("hash_mismatch_leaves_original_and_no_temp", func(t *testing.T) {
-		p, dir := newInstallTestPipeline(t, original, rebuilt, md5.Sum([]byte("something else")))
+		p, dir := newInstallTestPipeline(t, installTestFile{"a.dat", original, rebuilt, md5.Sum([]byte("something else"))})
 		if err := p.install(); err == nil {
 			t.Fatal("install succeeded despite a hash mismatch")
 		}
 		p.close()
 
-		got, err := os.ReadFile(filepath.Join(dir, "a.dat"))
-		if err != nil {
-			t.Fatal(err)
+		assertFileContents(t, filepath.Join(dir, "a.dat"), original)
+		assertNoRepairTempFiles(t, dir)
+	})
+
+	// One file passing its hash must not be installed while another fails:
+	// a hash mismatch anywhere installs nothing.
+	t.Run("one_mismatch_installs_no_file", func(t *testing.T) {
+		otherRebuilt := []byte("other rebuilt")
+		p, dir := newInstallTestPipeline(t,
+			installTestFile{"a.dat", original, rebuilt, md5.Sum(rebuilt)},
+			installTestFile{"b.dat", original, otherRebuilt, md5.Sum([]byte("something else"))},
+		)
+		if err := p.install(); err == nil {
+			t.Fatal("install succeeded despite a hash mismatch")
 		}
-		if !bytes.Equal(got, original) {
-			t.Errorf("a.dat = %q after a failed install, want the original %q", got, original)
+		p.close()
+
+		assertFileContents(t, filepath.Join(dir, "a.dat"), original)
+		assertFileContents(t, filepath.Join(dir, "b.dat"), original)
+		assertNoRepairTempFiles(t, dir)
+	})
+
+	// A file marked for writing that never got an output must fail the repair
+	// rather than be reported as rebuilt.
+	t.Run("file_without_output_fails", func(t *testing.T) {
+		p, dir := newInstallTestPipeline(t, installTestFile{"a.dat", original, rebuilt, md5.Sum(rebuilt)})
+		p.plan.needsWrite["never-written.dat"] = true
+		if err := p.install(); err == nil {
+			t.Fatal("install succeeded although a file marked for writing has no output")
 		}
+		p.close()
+
+		assertFileContents(t, filepath.Join(dir, "a.dat"), original)
 		assertNoRepairTempFiles(t, dir)
 	})
 }
 
-// TestRepairPipelineGetOutputRefusesProtectedTempName pins the guard against a
-// PAR2 set that protects both "x" and "x.par2engine-tmp": rebuilding "x" must
-// not truncate the other protected file.
-func TestRepairPipelineGetOutputRefusesProtectedTempName(t *testing.T) {
+// TestRepairPipelineGetOutputLeavesExistingFilesAlone pins that the temp file
+// is a new file: a file already in the directory whose name looks like a temp
+// file (here, one left by an older version) is not opened, truncated or
+// removed.
+func TestRepairPipelineGetOutputLeavesExistingFilesAlone(t *testing.T) {
 	dir := t.TempDir()
-	other := []byte("another protected file")
-	if err := os.WriteFile(filepath.Join(dir, "x"+repairTempSuffix), other, 0644); err != nil {
-		t.Fatal(err)
+	existing := []byte("not ours")
+	for _, name := range []string{"x.par2engine-tmp", "x" + repairTempMarker + "AAAAAAAAAAAAAAAA" + repairTempExt} {
+		if err := os.WriteFile(filepath.Join(dir, name), existing, 0644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = root.Close() }()
-	d := &Decoder{root: root, protectedFiles: []FileDescPacket{
-		{Filename: "x"},
-		{Filename: "x" + repairTempSuffix},
-	}}
-	p := &repairPipeline{d: d, outputs: make(map[string]*os.File)}
-
-	if _, err := p.getOutput("x"); err == nil {
-		t.Fatal("getOutput accepted a temp name that is a protected file")
+	p := &repairPipeline{
+		d:         &Decoder{root: root},
+		sources:   make(map[string]*os.File),
+		outputs:   make(map[string]*os.File),
+		tempNames: make(map[string]string),
 	}
-	got, err := os.ReadFile(filepath.Join(dir, "x"+repairTempSuffix))
+
+	f, err := p.getOutput("x")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got, other) {
-		t.Errorf("protected file was modified: %q", got)
+	if _, err := f.Write([]byte("partial")); err != nil {
+		t.Fatal(err)
+	}
+	p.close()
+
+	assertFileContents(t, filepath.Join(dir, "x.par2engine-tmp"), existing)
+	assertFileContents(t, filepath.Join(dir, "x"+repairTempMarker+"AAAAAAAAAAAAAAAA"+repairTempExt), existing)
+	if _, err := os.Stat(filepath.Join(dir, p.tempNames["x"])); !os.IsNotExist(err) {
+		t.Errorf("close left this repair's temp file behind (stat err %v)", err)
 	}
 }
 

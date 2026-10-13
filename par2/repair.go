@@ -2,16 +2,21 @@ package par2
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 
 	"github.com/hobeone/par2engine/rs"
 )
 
-// Repair performs pipelined, strict memory-limited reconstruction of missing shards.
+// Repair rebuilds every damaged or misplaced protected file: it reconstructs
+// missing blocks with Reed-Solomon where needed, reassembles located blocks,
+// and streams the result in memory-limited chunks through a temp file that is
+// renamed over the target once its hash is verified.
 func (d *Decoder) Repair(ctx context.Context, progressChan chan<- Progress) error {
 	// Phase 0: Rename misnamed files before doing any reconstruction.
 	// This is much cheaper than running the RS pipeline for files that are
@@ -223,9 +228,9 @@ func (d *Decoder) buildFlatLocs(fileIDToFilename map[FileID]string, totalDataSha
 	return flatLocs
 }
 
-// buildNeedsWrite returns the set of protected filenames that require write access
-// during repair — either because they are damaged, or because their shards were
-// found elsewhere (e.g., in a candidate file) and must be copied into place.
+// buildNeedsWrite returns the set of protected filenames that repair must rebuild:
+// files that are missing, the wrong size or fail their hash, and files whose
+// blocks were located somewhere other than their own expected offsets.
 func (d *Decoder) buildNeedsWrite() map[string]bool {
 	needsWrite := make(map[string]bool)
 	for _, f := range d.protectedFiles {
@@ -246,6 +251,13 @@ func (d *Decoder) buildNeedsWrite() map[string]bool {
 }
 
 // repairPipeline coordinates the reader, processor (Reed-Solomon), and writer loops for memory-bounded streaming.
+//
+// Each file in plan.needsWrite is rebuilt in a temp file of its own and renamed
+// over its target only after every chunk is written and its hash verified. So
+// repair never overwrites bytes it may still read — a file whose blocks were
+// found inside itself at shifted offsets is its own source — and a repair that
+// returns an error, including on cancellation, leaves every original untouched
+// and removes its temp files. A hard kill can leave temp files behind.
 type repairPipeline struct {
 	d                  *Decoder
 	plan               *repairPlan
@@ -255,16 +267,16 @@ type repairPipeline struct {
 	activeParityShards [][]byte
 	coder              *rs.Coder
 	sources            map[string]*os.File // read-only handles on the files blocks are read from
-	outputs            map[string]*os.File // target filename -> temp file being rebuilt
-	installed          map[string]bool     // targets whose temp file has been renamed into place
+	outputs            map[string]*os.File // target filename -> open temp file being rebuilt
+	tempNames          map[string]string   // target filename -> its temp file's name
 }
 
-// repairTempSuffix names the temp file a protected file is rebuilt in. The file
-// is renamed over its target only after every chunk is written and its hash
-// verified, so repair never overwrites bytes it may still read — a file whose
-// blocks were found inside itself at shifted offsets is its own source — and
-// an interrupted or failed repair leaves the original untouched.
-const repairTempSuffix = ".par2engine-tmp"
+// repairTempMarker and repairTempExt bracket the random part of a temp file's
+// name: "<target>.par2engine-<16 random base32 characters>.tmp".
+const (
+	repairTempMarker = ".par2engine-"
+	repairTempExt    = ".tmp"
+)
 
 func newRepairPipeline(d *Decoder, plan *repairPlan) (*repairPipeline, error) {
 	dataBuffers := make([][]byte, plan.totalDataShards)
@@ -292,7 +304,7 @@ func newRepairPipeline(d *Decoder, plan *repairPlan) (*repairPipeline, error) {
 		coder:              coder,
 		sources:            make(map[string]*os.File),
 		outputs:            make(map[string]*os.File),
-		installed:          make(map[string]bool),
+		tempNames:          make(map[string]string),
 	}, nil
 }
 
@@ -310,48 +322,40 @@ func (p *repairPipeline) getSource(name string) (*os.File, error) {
 }
 
 // getOutput returns the temp file that target is being rebuilt in, creating it
-// (and any missing parent directory) on first use. A stale temp file left by an
-// earlier interrupted repair is truncated.
+// (and any missing parent directory) on first use. The name carries a random
+// part and is created with O_EXCL, so an existing file — another protected
+// file, a candidate, or anything else in the directory — is never truncated.
 func (p *repairPipeline) getOutput(target string) (*os.File, error) {
 	if f, ok := p.outputs[target]; ok {
 		return f, nil
-	}
-	tmp := target + repairTempSuffix
-	// Filenames come from the PAR2 set, so a set could protect both "x" and
-	// "x.par2engine-tmp"; truncating the second to rebuild the first would
-	// destroy a file repair may still read from.
-	for _, fd := range p.d.protectedFiles {
-		if fd.Filename == tmp {
-			return nil, fmt.Errorf("cannot rebuild %s: its temp file name %s is itself a protected file", target, tmp)
-		}
-	}
-	if _, isCandidate := p.d.candidateFiles[tmp]; isCandidate {
-		return nil, fmt.Errorf("cannot rebuild %s: its temp file name %s is a candidate file", target, tmp)
 	}
 	if dir := filepath.Dir(target); dir != "." {
 		if err := p.d.root.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
 	}
-	f, err := p.d.root.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
+	tmp := target + repairTempMarker + rand.Text()[:16] + repairTempExt
+	f, err := p.d.root.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create temp file for %s: %w", target, err)
 	}
 	p.outputs[target] = f
+	p.tempNames[target] = tmp
 	return f, nil
 }
 
-// close releases every handle and removes any temp file that was not installed,
-// so a failed repair leaves no partial output behind.
+// close releases every handle still open and removes every temp file. A temp
+// file that install renamed into place no longer exists under its temp name,
+// so only the leftovers of a failed repair are removed.
 func (p *repairPipeline) close() {
 	for _, f := range p.sources {
 		_ = f.Close()
 	}
-	for target, f := range p.outputs {
+	for _, f := range p.outputs {
 		_ = f.Close()
-		if !p.installed[target] {
-			_ = p.d.root.Remove(target + repairTempSuffix)
-		}
+	}
+	for _, tmp := range p.tempNames {
+		_ = p.d.root.Remove(tmp)
 	}
 }
 
@@ -425,42 +429,65 @@ func (p *repairPipeline) executeChunk(ctx context.Context, chunkIdx int64) error
 // protected length (dropping the zero padding of the last block), checks its
 // MD5 against the file description, and only once every file has passed
 // renames each temp file over its target. A hash mismatch installs nothing.
+// The renames themselves happen one file at a time, so a rename failure can
+// leave earlier files replaced; each of those has already passed its hash.
 func (p *repairPipeline) install() error {
-	var rebuilt []FileDescPacket
-	for _, fd := range p.d.protectedFiles {
-		if f, ok := p.outputs[fd.Filename]; ok {
-			if err := finishRebuiltFile(f, fd); err != nil {
-				return err
-			}
-			rebuilt = append(rebuilt, fd)
+	// A file marked for writing that never got a temp file would otherwise be
+	// reported repaired while it is still damaged on disk.
+	for target := range p.plan.needsWrite {
+		if _, ok := p.outputs[target]; !ok {
+			return fmt.Errorf("repair produced no output for %s", target)
 		}
 	}
 
-	// Every read is done. Release the sources before renaming over them, which
-	// fails on Windows while a handle is open.
+	var rebuilt []FileDescPacket
+	for _, fd := range p.d.protectedFiles {
+		f, ok := p.outputs[fd.Filename]
+		if !ok {
+			continue
+		}
+		if err := finishRebuiltFile(f, fd); err != nil {
+			return err
+		}
+		rebuilt = append(rebuilt, fd)
+	}
+
+	// Every read and write is done. Release all handles before renaming: on
+	// Windows a file cannot be renamed, or renamed over, while a handle is open.
 	for name, f := range p.sources {
 		_ = f.Close()
 		delete(p.sources, name)
 	}
+	for target, f := range p.outputs {
+		delete(p.outputs, target)
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("failed to close rebuilt %s: %w", target, err)
+		}
+	}
 
 	for _, fd := range rebuilt {
-		tmp := fd.Filename + repairTempSuffix
+		tmp := p.tempNames[fd.Filename]
 		// Keep the permissions of a file that is being replaced rather than recreated.
-		if info, err := p.d.root.Stat(fd.Filename); err == nil {
+		info, err := p.d.root.Stat(fd.Filename)
+		switch {
+		case err == nil:
 			if err := p.d.root.Chmod(tmp, info.Mode().Perm()); err != nil {
 				return fmt.Errorf("failed to set permissions on rebuilt %s: %w", fd.Filename, err)
 			}
+		case !errors.Is(err, fs.ErrNotExist):
+			return fmt.Errorf("failed to stat %s before replacing it: %w", fd.Filename, err)
 		}
 		if err := p.d.root.Rename(tmp, fd.Filename); err != nil {
 			return fmt.Errorf("failed to install rebuilt %s: %w", fd.Filename, err)
 		}
-		p.installed[fd.Filename] = true
 	}
 	return nil
 }
 
 // finishRebuiltFile truncates f to the protected file's length, flushes it, and
-// verifies its full MD5 against the file description.
+// verifies its full MD5 against the file description. The flush comes before
+// the hash so that a file which passes is durable before it is renamed into
+// place; a crash after the rename must not leave a verified name with unwritten data.
 func finishRebuiltFile(f *os.File, fd FileDescPacket) error {
 	if err := f.Truncate(int64(fd.ByteCount)); err != nil {
 		return err

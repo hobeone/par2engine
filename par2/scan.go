@@ -835,6 +835,19 @@ func (d *Decoder) renameMisnamedFiles(ctx context.Context) int {
 		d.logger.InfoContext(ctx, "Renamed misnamed file",
 			"from", state.RenameSource, "to", fd.Filename)
 
+		// Blocks of other files located inside the candidate now live under the
+		// protected name, at the same offsets. Point them there, or a rebuild that
+		// reads them would open the candidate's old path and fail.
+		if candidateID, ok := d.candidateFiles[state.RenameSource]; ok {
+			for _, other := range d.fileIntegrity {
+				for idx, loc := range other.ShardLocations {
+					if loc.FileID == candidateID && loc.Offset != -1 {
+						other.ShardLocations[idx].FileID = fd.FileID
+					}
+				}
+			}
+		}
+
 		// Update integrity state: file is now healthy under its correct name.
 		state.RenameSource = ""
 		state.Missing = false

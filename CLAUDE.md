@@ -70,7 +70,7 @@ Three things here are load-bearing:
 Key internal types:
 - `FileIntegrityState.ShardLocations` — maps `shardIndex → ShardLocation{FileID, Offset}`. `Offset == -1` means missing.
 - `crcLookupTable` — hand-rolled open-addressing hash table (avoids `map` alloc overhead in the scan hot path).
-- `Repair` streams data in `chunkSize`-aligned chunks (derived from `memoryLimit / totalShards`) to cap memory regardless of file size.
+- `Repair` streams data in `chunkSize`-aligned chunks (derived from `memoryLimit / (totalDataShards + unusableDataShards)`) to cap memory regardless of file size.
 
 **All target file I/O goes through `d.root` (`os.Root`)**. Never use raw `os.Open`/`os.Create` for data files. The sandbox path is resolved via `filepath.EvalSymlinks` at construction to handle `/tmp` symlinks in CI.
 
@@ -86,7 +86,7 @@ These are correctness and security invariants — violations cause silent data c
 
 4. **Path sanitization**: Filenames from PAR2 packets are attacker-controlled. Always run through `DefangPath` (backslash normalization → `path.Clean` → traversal check → `filepath.FromSlash`).
 
-5. **Rebuild out of place**: `Repair` writes every file in `needsWrite` to `<name>.par2engine-tmp`, never to the target itself. Source files are opened read-only. Each temp file is truncated to its protected length and MD5-verified, and only after every file passes are the temp files renamed over their targets. Writing in place corrupts a file whose blocks were located inside itself at shifted offsets once a block spans several chunks (#26).
+5. **Rebuild out of place**: `Repair` writes every file in `needsWrite` to its own temp file, `<name>.par2engine-<random>.tmp`, created with `O_EXCL` so no existing file is ever truncated, and never to the target itself. Source files are opened read-only. Each temp file is truncated to its protected length, synced and MD5-verified; only after every file passes are all handles closed (Windows cannot rename an open file) and the temp files renamed over their targets. Writing in place corrupts a file whose blocks were located inside itself at shifted offsets once a block spans several chunks (#26). The cost is temporary disk space equal to the rebuilt files' size.
 
 6. **FileID sort order**: PAR2 spec requires `protectedFiles` sorted by FileID using little-endian byte comparison (last byte first). `FileIDLess` implements this — do not substitute `bytes.Compare`.
 
