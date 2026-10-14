@@ -89,6 +89,7 @@ type checksumLocation struct {
 	fileID     FileID
 	shardIndex int
 	md5Hash    [16]byte
+	reported   *atomic.Bool // set by newCRCLookupTable; see blockScanner.matchBlock
 }
 
 type matchEvent struct {
@@ -1017,7 +1018,9 @@ func (s *blockScanner) scanCandidateFile(path string, fileID FileID) error {
 // blocks after it (#41). Claimed blocks are skipped, so such a jump can no
 // longer cost them. A grid window that holds some other block is not claimed:
 // in such data the windows of shifted blocks can equal other blocks exactly,
-// and claiming them would hide the shifted blocks inside (#44).
+// and claiming them would hide the shifted blocks inside (#44). For the same
+// reason a match while sliding jumps only when it is a block not reported
+// before; see matchBlock.
 func (s *blockScanner) scanChunk(f *os.File, sourceFileID FileID, start, end int64) error {
 	bufferSize := end - start
 	if bufferSize < int64(s.d.sliceByteCount) {
@@ -1065,14 +1068,15 @@ func (s *blockScanner) scanChunk(f *os.File, sourceFileID FileID, start, end int
 			crcSlice = crc32.ChecksumIEEE(slice)
 		}
 
-		if matched, _ := s.matchBlock(sourceFileID, slice, crcSlice, absPos); matched {
-			// True shard match: advance past this block.
+		if s.matchBlock(sourceFileID, slice, crcSlice, absPos).reportedNew {
+			// A block not reported before: advance past it.
 			j += bs
 			justMissed = false
 		} else {
-			// No block here, or a CRC collision with no MD5 confirmation: slide
-			// one byte forward. Jumping by sliceByteCount here would skip past
-			// real shard boundaries that fall in the next sliceByteCount bytes.
+			// No block here, a CRC collision with no MD5 confirmation, or only
+			// blocks already reported: slide one byte forward. Jumping by
+			// sliceByteCount here would skip past real shard boundaries that
+			// fall in the next sliceByteCount bytes.
 			j++
 			justMissed = true
 		}
@@ -1091,19 +1095,35 @@ func (s *blockScanner) claimGrid(sourceFileID FileID, data []byte, start int64) 
 	claimed = make([]bool, 0, max(0, (lastWindow-(firstAligned-start))/bs+1))
 	for abs := firstAligned; abs-start <= lastWindow; abs += bs {
 		slice := data[abs-start : abs-start+bs]
-		_, inPlace := s.matchBlock(sourceFileID, slice, crc32.ChecksumIEEE(slice), abs)
-		claimed = append(claimed, inPlace)
+		claimed = append(claimed, s.matchBlock(sourceFileID, slice, crc32.ChecksumIEEE(slice), abs).inPlace)
 	}
 	return firstAligned, claimed
 }
 
-// matchBlock reports whether slice, whose CRC32 is crc and which starts at
-// absPos in the file sourceFileID, is a block of the set, confirmed by MD5. It
-// sends a matchEvent for every block slice equals. inPlace reports that one of
-// those blocks is the one expected at absPos: block absPos/sliceByteCount of
-// sourceFileID itself or, since a candidate file has no blocks of its own, of
-// any file when sourceFileID is a candidate.
-func (s *blockScanner) matchBlock(sourceFileID FileID, slice []byte, crc uint32, absPos int64) (matched, inPlace bool) {
+// blockMatch is what matchBlock found in one window.
+type blockMatch struct {
+	inPlace     bool // the window is the block expected at its offset
+	reportedNew bool // the window is a block that no earlier window reported
+}
+
+// matchBlock reports what slice, whose CRC32 is crc and which starts at absPos
+// in the file sourceFileID, is, confirmed by MD5. It sends a matchEvent for
+// every block slice equals, so blocks with the same content all find this
+// copy. inPlace reports that one of those blocks is the one expected at
+// absPos: block absPos/sliceByteCount of sourceFileID itself or, since a
+// candidate file has no blocks of its own, of any file when sourceFileID is a
+// candidate.
+//
+// reportedNew reports that one of those blocks had not been reported by any
+// earlier window. As in par2cmdline, a match that repeats blocks already
+// reported is a duplicate, and the slide steps past it rather than jumping a
+// block from it (#44).
+//
+// Once every block with this CRC has been reported, a window off the grid has
+// nothing left to report, so it is not hashed: in a run of repeated content
+// longer than the set holds, such as zero-filled damage, hashing a block at
+// every byte would make the slide quadratic, as it is in par2cmdline.
+func (s *blockScanner) matchBlock(sourceFileID FileID, slice []byte, crc uint32, absPos int64) (m blockMatch) {
 	shardIdx := int(absPos / int64(s.d.sliceByteCount))
 	atShardBoundary := absPos%int64(s.d.sliceByteCount) == 0
 	locations, found := s.lookupTable.Lookup(crc)
@@ -1115,24 +1135,32 @@ func (s *blockScanner) matchBlock(sourceFileID FileID, slice []byte, crc uint32,
 				"shardIdx", shardIdx,
 				"crc", fmt.Sprintf("%08x", crc))
 		}
-		return false, false
+		return m
+	}
+	if !atShardBoundary && allReported(locations) {
+		return m
 	}
 
 	blockHash := md5.Sum(slice)
-	ownBlock, someFilesBlock := false, false // block shardIdx of sourceFileID, or of any file
+	matched := false
+	own, other := false, false // slice is block shardIdx of sourceFileID, or of another file
 	for _, loc := range locations {
-		if loc.md5Hash == blockHash {
-			matched = true
-			if atShardBoundary && loc.shardIndex == shardIdx {
-				someFilesBlock = true
-				ownBlock = ownBlock || loc.fileID == sourceFileID
-			}
-			s.matchChan <- matchEvent{
-				targetFileID: loc.fileID,
-				shardIndex:   loc.shardIndex,
-				sourceFileID: sourceFileID,
-				offset:       absPos,
-			}
+		if loc.md5Hash != blockHash {
+			continue
+		}
+		matched = true
+		if atShardBoundary && loc.shardIndex == shardIdx {
+			own = own || loc.fileID == sourceFileID
+			other = other || loc.fileID != sourceFileID
+		}
+		if !loc.reported.Load() && loc.reported.CompareAndSwap(false, true) {
+			m.reportedNew = true
+		}
+		s.matchChan <- matchEvent{
+			targetFileID: loc.fileID,
+			shardIndex:   loc.shardIndex,
+			sourceFileID: sourceFileID,
+			offset:       absPos,
 		}
 	}
 	if !matched && atShardBoundary {
@@ -1142,9 +1170,22 @@ func (s *blockScanner) matchBlock(sourceFileID FileID, slice []byte, crc uint32,
 			"shardIdx", shardIdx,
 			"crc", fmt.Sprintf("%08x", crc))
 	}
-	if !ownBlock && someFilesBlock {
-		_, isCandidate := s.d.candidateByID[sourceFileID]
-		return matched, isCandidate
+	m.inPlace = own || other && s.isCandidate(sourceFileID)
+	return m
+}
+
+// isCandidate reports whether id is a file registered with AddCandidateFile.
+func (s *blockScanner) isCandidate(id FileID) bool {
+	_, ok := s.d.candidateByID[id]
+	return ok
+}
+
+// allReported reports whether a match has reported every one of locations.
+func allReported(locations []checksumLocation) bool {
+	for _, loc := range locations {
+		if !loc.reported.Load() {
+			return false
+		}
 	}
-	return matched, ownBlock
+	return true
 }
