@@ -974,7 +974,7 @@ func (s *blockScanner) scanLastPartialBlock(f *os.File, sourceFileID FileID, byt
 		return err
 	}
 
-	_, _ = s.matchBlock(sourceFileID, paddedBlock, crc32.ChecksumIEEE(paddedBlock), lastBlockStart)
+	s.matchBlock(sourceFileID, paddedBlock, crc32.ChecksumIEEE(paddedBlock), lastBlockStart)
 	return nil
 }
 
@@ -1104,6 +1104,7 @@ func (s *blockScanner) claimGrid(sourceFileID FileID, data []byte, start int64) 
 // sourceFileID itself or, since a candidate file has no blocks of its own, of
 // any file when sourceFileID is a candidate.
 func (s *blockScanner) matchBlock(sourceFileID FileID, slice []byte, crc uint32, absPos int64) (matched, inPlace bool) {
+	shardIdx := int(absPos / int64(s.d.sliceByteCount))
 	atShardBoundary := absPos%int64(s.d.sliceByteCount) == 0
 	locations, found := s.lookupTable.Lookup(crc)
 	if !found {
@@ -1111,23 +1112,20 @@ func (s *blockScanner) matchBlock(sourceFileID FileID, slice []byte, crc uint32,
 			s.d.logger.DebugContext(s.ctx, "Shard boundary CRC miss",
 				"file", sourceFileID,
 				"absOffset", absPos,
-				"shardIdx", absPos/int64(s.d.sliceByteCount),
+				"shardIdx", shardIdx,
 				"crc", fmt.Sprintf("%08x", crc))
 		}
 		return false, false
 	}
 
 	blockHash := md5.Sum(slice)
-	expectedShard := -1
-	if atShardBoundary {
-		expectedShard = int(absPos / int64(s.d.sliceByteCount))
-	}
+	ownBlock, someFilesBlock := false, false // block shardIdx of sourceFileID, or of any file
 	for _, loc := range locations {
 		if loc.md5Hash == blockHash {
 			matched = true
-			if loc.shardIndex == expectedShard && !inPlace {
-				_, isCandidate := s.d.candidateByID[sourceFileID]
-				inPlace = loc.fileID == sourceFileID || isCandidate
+			if atShardBoundary && loc.shardIndex == shardIdx {
+				someFilesBlock = true
+				ownBlock = ownBlock || loc.fileID == sourceFileID
 			}
 			s.matchChan <- matchEvent{
 				targetFileID: loc.fileID,
@@ -1141,8 +1139,12 @@ func (s *blockScanner) matchBlock(sourceFileID FileID, slice []byte, crc uint32,
 		s.d.logger.DebugContext(s.ctx, "Shard boundary CRC hit but MD5 mismatch",
 			"file", sourceFileID,
 			"absOffset", absPos,
-			"shardIdx", absPos/int64(s.d.sliceByteCount),
+			"shardIdx", shardIdx,
 			"crc", fmt.Sprintf("%08x", crc))
 	}
-	return matched, inPlace
+	if !ownBlock && someFilesBlock {
+		_, isCandidate := s.d.candidateByID[sourceFileID]
+		return matched, isCandidate
+	}
+	return matched, ownBlock
 }
