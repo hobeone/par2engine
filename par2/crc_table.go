@@ -1,5 +1,10 @@
 package par2
 
+import (
+	"slices"
+	"sync/atomic"
+)
+
 // crcTableEntry is one slot in the open-addressing CRC lookup table.
 type crcTableEntry struct {
 	crc   uint32
@@ -15,7 +20,16 @@ type crcLookupTable struct {
 	table []crcTableEntry
 }
 
+// newCRCLookupTable builds the table from checksumMap, giving each location a
+// reported flag of its own, all cleared. Each block of the set appears at
+// exactly one location, so its flag is its own.
 func newCRCLookupTable(checksumMap map[uint32][]checksumLocation) *crcLookupTable {
+	numLocs := 0
+	for _, locs := range checksumMap {
+		numLocs += len(locs)
+	}
+	flags := make([]atomic.Bool, numLocs)
+
 	numEntries := len(checksumMap)
 	size := 16
 	for size < numEntries*4 {
@@ -28,6 +42,11 @@ func newCRCLookupTable(checksumMap map[uint32][]checksumLocation) *crcLookupTabl
 	}
 
 	for crc, locs := range checksumMap {
+		locs = slices.Clone(locs)
+		for i := range locs {
+			locs[i].reported = &flags[0]
+			flags = flags[1:]
+		}
 		idx := crc & t.mask
 		for {
 			if !t.table[idx].valid {
@@ -44,6 +63,7 @@ func newCRCLookupTable(checksumMap map[uint32][]checksumLocation) *crcLookupTabl
 	return t
 }
 
+// Lookup returns the locations whose block has CRC32 crc.
 func (t *crcLookupTable) Lookup(crc uint32) ([]checksumLocation, bool) {
 	idx := crc & t.mask
 	for {

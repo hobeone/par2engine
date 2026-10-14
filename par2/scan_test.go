@@ -134,45 +134,51 @@ func TestScanChunkCRCCollisionDoesNotSkipShard(t *testing.T) {
 	}
 }
 
+// repairPeriodic writes damaged over the periodic fixture's file, verifies,
+// checks that at most maxMissing blocks are missing, then repairs and checks
+// that the file is restored.
+func repairPeriodic(t *testing.T, damaged []byte, maxMissing int) {
+	t.Helper()
+	dir, par2Path, files := fixturePeriodic.load(t)
+	writeTestFile(t, filepath.Join(dir, "a.bin"), damaged)
+
+	ctx := context.Background()
+	d, err := NewDecoder(ctx, par2Path, DecoderOptions{})
+	if err != nil {
+		t.Fatalf("NewDecoder: %v", err)
+	}
+	defer func() { _ = d.Close() }()
+	if err := d.VerifyScans(ctx, nil); err != nil {
+		t.Fatalf("VerifyScans: %v", err)
+	}
+	if got := d.ShardCounts().UnusableDataShardCount; got > maxMissing {
+		t.Fatalf("missing blocks = %d, want at most %d", got, maxMissing)
+	}
+	if err := d.Repair(ctx, nil); err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "a.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, files["a.bin"]) {
+		t.Error("repaired file does not match the original")
+	}
+}
+
 // TestScanFlipInRepeatingData covers one flipped byte in a file whose bytes
 // repeat with a period that is not a multiple of the block size. Sliding past
 // the damage reaches windows off the block grid that equal some block exactly;
 // jumping a block from such a match steps over the true positions of the
 // intact blocks after it, which then count as missing too (#41). At most the
-// damaged block may count, so two recovery blocks repair it.
+// damaged block may count, so two recovery blocks repair it; its bytes may
+// also be found elsewhere in the file, so it need not count either.
 func TestScanFlipInRepeatingData(t *testing.T) {
 	for _, off := range []int{0, 2048, 3000, 5000, 6500, 8191} {
 		t.Run(strconv.Itoa(off), func(t *testing.T) {
-			dir, par2Path, files := fixturePeriodic.load(t)
-			orig := files["a.bin"]
-			bad := append([]byte{}, orig...)
+			bad := fixturePeriodic.files()[0].data
 			bad[off] ^= 0xFF
-			writeTestFile(t, filepath.Join(dir, "a.bin"), bad)
-
-			ctx := context.Background()
-			d, err := NewDecoder(ctx, par2Path, DecoderOptions{})
-			if err != nil {
-				t.Fatalf("NewDecoder: %v", err)
-			}
-			defer func() { _ = d.Close() }()
-			if err := d.VerifyScans(ctx, nil); err != nil {
-				t.Fatalf("VerifyScans: %v", err)
-			}
-			// The damaged block's bytes may also be found elsewhere in the
-			// file, so it need not count either.
-			if got := d.ShardCounts().UnusableDataShardCount; got > 1 {
-				t.Fatalf("missing blocks = %d, want at most 1 (the block holding offset %d)", got, off)
-			}
-			if err := d.Repair(ctx, nil); err != nil {
-				t.Fatalf("Repair: %v", err)
-			}
-			got, err := os.ReadFile(filepath.Join(dir, "a.bin"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Equal(got, orig) {
-				t.Error("repaired file does not match the original")
-			}
+			repairPeriodic(t, bad, 1)
 		})
 	}
 }
@@ -242,6 +248,154 @@ func scanChunkMatches(t *testing.T, sliceSize int, orig, onDisk []byte, start in
 // pseudoRandom returns n bytes from a fixed PCG stream.
 func pseudoRandom(n int) []byte {
 	return seededFiles(1, sized("", n))[0].data
+}
+
+// TestScanShiftInRepeatingData covers bytes inserted or deleted in a file
+// whose bytes repeat every 251 bytes, which shifts every block after them off
+// the block grid (#44). Sliding through the shifted blocks reaches windows
+// that equal blocks already located earlier in the file; jumping a block from
+// such a duplicate stepped over the true positions of shifted blocks still to
+// be found. Each case allows no more missing blocks than par2cmdline 0.8.1
+// reports for it, and must then repair.
+func TestScanShiftInRepeatingData(t *testing.T) {
+	tests := []struct {
+		name    string
+		at      int
+		insert  int // bytes inserted at at
+		delete  int // bytes deleted at at
+		par2cmd int // missing blocks par2cmdline 0.8.1 reports
+	}{
+		{"insert_1_at_3000", 3000, 1, 0, 1},
+		{"insert_120_at_3000", 3000, 120, 0, 1},
+		{"insert_700_at_3000", 3000, 700, 0, 1},
+		{"insert_120_at_5000", 5000, 120, 0, 1},
+		{"insert_1_at_5000", 5000, 1, 0, 1},
+		{"insert_1000_at_1500", 1500, 1000, 0, 1},
+		{"delete_1_at_3000", 3000, 0, 1, 1},
+		{"delete_120_at_3000", 3000, 0, 120, 2},
+		{"delete_700_at_5000", 5000, 0, 700, 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			orig := fixturePeriodic.files()[0].data
+			repairPeriodic(t, splice(orig, tt.at, bytes.Repeat([]byte{0x5A}, tt.insert), tt.delete), tt.par2cmd)
+		})
+	}
+}
+
+// TestScanChunkIdenticalBlocksShifted covers a file of identical blocks, here
+// all zeros, shifted by one byte. Every window after the first byte equals
+// every block, so after the first match every window is a duplicate. The scan
+// must not hash and report every block at each byte of them: the grid windows
+// hold their own blocks and are claimed, and the slide passes duplicates off
+// the grid without hashing them.
+func TestScanChunkIdenticalBlocksShifted(t *testing.T) {
+	const sliceSize, blocks = 1024, 16
+	orig := make([]byte, sliceSize*blocks)
+	s, finish := newChunkScanner(t, sliceSize, map[FileID][]byte{{}: orig})
+	path := filepath.Join(t.TempDir(), "f")
+	writeTestFile(t, path, append([]byte{1}, orig...))
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	err = s.scanChunk(f, FileID{}, 0, int64(sliceSize*blocks+1))
+	found := finish()
+	if err != nil {
+		t.Fatalf("scanChunk: %v", err)
+	}
+
+	// Each match reports every block, since they are identical; a scan that
+	// hashes only the grid windows makes about one match per block.
+	events := 0
+	for _, offsets := range found {
+		events += len(offsets)
+	}
+	if limit := 2 * blocks * blocks; events > limit {
+		t.Errorf("%d match events, want at most %d: the scan stepped through duplicates", events, limit)
+	}
+	for i := range blocks {
+		if len(found[i]) == 0 {
+			t.Errorf("shard %d not found", i)
+		}
+	}
+}
+
+// TestScanChunkRunLongerThanTheSet covers a run of one block's content much
+// longer than the set holds, as zero-filled damage over a file with a single
+// zero block leaves. Once that block is reported, every window in the run is
+// a duplicate; hashing each would cost a whole block per byte, as it does in
+// par2cmdline. Off the grid such a window is passed over unhashed, so the run
+// reports the block about once per grid window rather than once per byte.
+func TestScanChunkRunLongerThanTheSet(t *testing.T) {
+	const sliceSize, blocks, run = 1024, 8, 40
+	orig := pseudoRandom(sliceSize * blocks)
+	clear(orig[3*sliceSize : 4*sliceSize]) // shard 3 is all zeros
+	onDisk := slices.Concat(orig[:3*sliceSize], make([]byte, run*sliceSize), orig[3*sliceSize:])
+
+	path := filepath.Join(t.TempDir(), "f")
+	writeTestFile(t, path, onDisk)
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	s, finish := newChunkScanner(t, sliceSize, map[FileID][]byte{{}: orig})
+	err = s.scanChunk(f, FileID{}, 0, int64(len(onDisk)))
+	found := finish()
+	if err != nil {
+		t.Fatalf("scanChunk: %v", err)
+	}
+	if limit := 2 * (run + blocks); len(found[3]) == 0 || len(found[3]) > limit {
+		t.Errorf("shard 3 reported %d times, want 1 to %d", len(found[3]), limit)
+	}
+}
+
+// TestMatchBlockReportsOnlyItsOwnContent puts a block of other content under
+// the same CRC as the window's block. A match may mark as reported only blocks
+// it equals: marking the other would make every block under that CRC look
+// reported, so a later window that is the other block would not be hashed.
+func TestMatchBlockReportsOnlyItsOwnContent(t *testing.T) {
+	const sliceSize = 8
+	block := pseudoRandom(sliceSize)
+	crc := crc32.ChecksumIEEE(block)
+	s, finish := newChunkScanner(t, sliceSize, nil)
+	s.lookupTable = newCRCLookupTable(map[uint32][]checksumLocation{crc: {
+		{shardIndex: 9, md5Hash: [16]byte{0xFF}}, // other content, same CRC
+		{shardIndex: 0, md5Hash: md5.Sum(block)},
+	}})
+	locs, _ := s.lookupTable.Lookup(crc)
+	first := s.matchBlock(FileID{}, block, crc, 3)
+	second := s.matchBlock(FileID{}, block, crc, 3)
+	finish()
+
+	if !first.reportedNew || second.reportedNew {
+		t.Errorf("reportedNew = %v then %v, want true then false", first.reportedNew, second.reportedNew)
+	}
+	if locs[0].reported.Load() {
+		t.Error("the block of other content was marked reported")
+	}
+}
+
+// TestClaimGridAfterBlocksReported checks that a grid window holding the
+// block expected there is claimed even when an earlier match has already
+// reported that block, as when a second copy of the data is scanned. Claiming
+// only blocks not yet reported would leave every window of the copy to the
+// byte-wise slide, where each is a duplicate and the slide steps one byte at
+// a time.
+func TestClaimGridAfterBlocksReported(t *testing.T) {
+	const sliceSize, blocks = 8, 8
+	data := pseudoRandom(sliceSize * blocks)
+	s, finish := newChunkScanner(t, sliceSize, map[FileID][]byte{{}: data})
+	_, first := s.claimGrid(FileID{}, data, 0)
+	_, second := s.claimGrid(FileID{}, data, 0)
+	finish()
+
+	want := slices.Repeat([]bool{true}, blocks)
+	if !slices.Equal(first, want) || !slices.Equal(second, want) {
+		t.Errorf("claimed = %v, then %v; want %v both times", first, second, want)
+	}
 }
 
 // TestScanChunkMatchesEachGridBlockOnce checks that the byte-wise slide skips
