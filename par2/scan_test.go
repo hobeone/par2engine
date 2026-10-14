@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -130,6 +131,152 @@ func TestScanChunkCRCCollisionDoesNotSkipShard(t *testing.T) {
 	}
 	if !found {
 		t.Error("shard 1 at absolute offset 8 was not found; CRC collision at j=0 may have caused it to be skipped")
+	}
+}
+
+// TestScanFlipInRepeatingData covers one flipped byte in a file whose bytes
+// repeat with a period that is not a multiple of the block size. Sliding past
+// the damage reaches windows off the block grid that equal some block exactly;
+// jumping a block from such a match steps over the true positions of the
+// intact blocks after it, which then count as missing too (#41). At most the
+// damaged block may count, so two recovery blocks repair it.
+func TestScanFlipInRepeatingData(t *testing.T) {
+	for _, off := range []int{0, 2048, 3000, 5000, 6500, 8191} {
+		t.Run(strconv.Itoa(off), func(t *testing.T) {
+			dir, par2Path, files := fixturePeriodic.load(t)
+			orig := files["a.bin"]
+			bad := append([]byte{}, orig...)
+			bad[off] ^= 0xFF
+			writeTestFile(t, filepath.Join(dir, "a.bin"), bad)
+
+			ctx := context.Background()
+			d, err := NewDecoder(ctx, par2Path, DecoderOptions{})
+			if err != nil {
+				t.Fatalf("NewDecoder: %v", err)
+			}
+			defer func() { _ = d.Close() }()
+			if err := d.VerifyScans(ctx, nil); err != nil {
+				t.Fatalf("VerifyScans: %v", err)
+			}
+			// The damaged block's bytes may also be found elsewhere in the
+			// file, so it need not count either.
+			if got := d.ShardCounts().UnusableDataShardCount; got > 1 {
+				t.Fatalf("missing blocks = %d, want at most 1 (the block holding offset %d)", got, off)
+			}
+			if err := d.Repair(ctx, nil); err != nil {
+				t.Fatalf("Repair: %v", err)
+			}
+			got, err := os.ReadFile(filepath.Join(dir, "a.bin"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, orig) {
+				t.Error("repaired file does not match the original")
+			}
+		})
+	}
+}
+
+// scanChunkMatches runs scanChunk over [start, len(onDisk)) of a file holding
+// onDisk, against a set whose blocks are orig cut into sliceSize pieces, and
+// returns the offsets at which each shard was matched.
+func scanChunkMatches(t *testing.T, sliceSize int, orig, onDisk []byte, start int64) map[int][]int64 {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "f")
+	writeTestFile(t, path, onDisk)
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	checksumMap := make(map[uint32][]checksumLocation)
+	for i := 0; i+sliceSize <= len(orig); i += sliceSize {
+		b := orig[i : i+sliceSize]
+		crc := crc32.ChecksumIEEE(b)
+		checksumMap[crc] = append(checksumMap[crc], checksumLocation{shardIndex: i / sliceSize, md5Hash: md5.Sum(b)})
+	}
+	window, err := newCRC32Window(sliceSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches := make(chan matchEvent)
+	scanner := &blockScanner{
+		d:           &Decoder{sliceByteCount: sliceSize, logger: slog.Default()},
+		ctx:         context.Background(),
+		window:      window,
+		lookupTable: newCRCLookupTable(checksumMap),
+		matchChan:   matches,
+	}
+	found := make(map[int][]int64)
+	done := make(chan struct{})
+	go func() {
+		for ev := range matches {
+			found[ev.shardIndex] = append(found[ev.shardIndex], ev.offset)
+		}
+		close(done)
+	}()
+	err = scanner.scanChunk(f, FileID{}, start, int64(len(onDisk)))
+	close(matches)
+	<-done
+	if err != nil {
+		t.Fatalf("scanChunk: %v", err)
+	}
+	return found
+}
+
+// pseudoRandom returns n bytes from a fixed PCG stream.
+func pseudoRandom(n int) []byte {
+	return seededFiles(1, sized("", n))[0].data
+}
+
+// TestScanChunkMatchesEachGridBlockOnce checks that the byte-wise slide skips
+// the blocks the grid pass already matched. Without that, an intact file is
+// hashed twice: once on the grid and again as the slide meets each block.
+func TestScanChunkMatchesEachGridBlockOnce(t *testing.T) {
+	const sliceSize, blocks = 8, 8
+	data := pseudoRandom(sliceSize * blocks)
+	found := scanChunkMatches(t, sliceSize, data, data, 0)
+	for i := range blocks {
+		if want := []int64{int64(i * sliceSize)}; !slices.Equal(found[i], want) {
+			t.Errorf("shard %d matched at %v, want %v", i, found[i], want)
+		}
+	}
+}
+
+// TestScanChunkUnalignedStart repeats the #41 scenario in a chunk that does
+// not start on the block grid, as every chunk after the first does when the
+// block size does not divide scanChunkSize. The grid must still be the file's
+// block grid, not one counted from the chunk's start.
+func TestScanChunkUnalignedStart(t *testing.T) {
+	orig := fixturePeriodic.files()[0].data
+	bad := append([]byte{}, orig...)
+	bad[5000] ^= 0xFF
+	found := scanChunkMatches(t, 1024, orig, bad, 100)
+	for _, shard := range []int{1, 2, 3, 5, 6, 7} {
+		if !slices.Contains(found[shard], int64(shard*1024)) {
+			t.Errorf("shard %d matched at %v, want it found in place at %d", shard, found[shard], shard*1024)
+		}
+	}
+}
+
+// TestScanChunkSlideAfterClaimedBlock covers a slide that misses, reaches a
+// claimed block and skips it. The window after the skip must be hashed afresh:
+// rolling the CRC on from the window before the skip gives a wrong CRC for
+// every window after it, so the shifted blocks there would all be missed.
+func TestScanChunkSlideAfterClaimedBlock(t *testing.T) {
+	const sliceSize, blocks = 16, 8
+	orig := pseudoRandom(sliceSize * blocks)
+	bad := splice(orig, 2*sliceSize, []byte("12345"), 0) // shard 2 onwards 5 bytes late
+	bad[3] ^= 0xFF                                       // shard 0 damaged; shard 1 intact in place
+	found := scanChunkMatches(t, sliceSize, orig, bad, 0)
+	if want := []int64{sliceSize}; !slices.Equal(found[1], want) {
+		t.Errorf("shard 1 matched at %v, want %v", found[1], want)
+	}
+	for shard := 2; shard < blocks; shard++ {
+		if want := []int64{int64(shard*sliceSize + 5)}; !slices.Equal(found[shard], want) {
+			t.Errorf("shard %d matched at %v, want %v", shard, found[shard], want)
+		}
 	}
 }
 
