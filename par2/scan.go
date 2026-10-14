@@ -974,7 +974,7 @@ func (s *blockScanner) scanLastPartialBlock(f *os.File, sourceFileID FileID, byt
 		return err
 	}
 
-	s.matchBlock(sourceFileID, paddedBlock, crc32.ChecksumIEEE(paddedBlock), lastBlockStart)
+	_, _ = s.matchBlock(sourceFileID, paddedBlock, crc32.ChecksumIEEE(paddedBlock), lastBlockStart)
 	return nil
 }
 
@@ -1009,13 +1009,15 @@ func (s *blockScanner) scanCandidateFile(path string, fileID FileID) error {
 
 // scanChunk finds blocks among the windows that start in [start, end-
 // sliceByteCount]. Like par2cmdline, it first checks every window on the block
-// grid and claims the blocks that match where they lie, then slides a byte at
-// a time only through the unclaimed blocks between them. A match found while
+// grid and claims those that hold the block expected there, then slides a byte
+// at a time only through the unclaimed blocks between them. A match found while
 // sliding jumps a whole block, so in data that repeats with a period that does
 // not divide the block size, a window off the grid that equals some block
 // exactly would otherwise jump the scan over the true positions of the intact
 // blocks after it (#41). Claimed blocks are skipped, so such a jump can no
-// longer cost them.
+// longer cost them. A grid window that holds some other block is not claimed:
+// in such data the windows of shifted blocks can equal other blocks exactly,
+// and claiming them would hide the shifted blocks inside (#44).
 func (s *blockScanner) scanChunk(f *os.File, sourceFileID FileID, start, end int64) error {
 	bufferSize := end - start
 	if bufferSize < int64(s.d.sliceByteCount) {
@@ -1029,14 +1031,7 @@ func (s *blockScanner) scanChunk(f *os.File, sourceFileID FileID, start, end int
 
 	bs := int64(s.d.sliceByteCount)
 	lastWindow := int64(len(data)) - bs // last window start, relative to start
-
-	// claimed[i] reports that the block starting at firstAligned+i*bs matched.
-	firstAligned := (start + bs - 1) / bs * bs
-	claimed := make([]bool, 0, max(0, (lastWindow-(firstAligned-start))/bs+1))
-	for abs := firstAligned; abs-start <= lastWindow; abs += bs {
-		slice := data[abs-start : abs-start+bs]
-		claimed = append(claimed, s.matchBlock(sourceFileID, slice, crc32.ChecksumIEEE(slice), abs))
-	}
+	firstAligned, claimed := s.claimGrid(sourceFileID, data, start)
 
 	var crcSlice uint32
 	justMissed := false
@@ -1070,7 +1065,7 @@ func (s *blockScanner) scanChunk(f *os.File, sourceFileID FileID, start, end int
 			crcSlice = crc32.ChecksumIEEE(slice)
 		}
 
-		if s.matchBlock(sourceFileID, slice, crcSlice, absPos) {
+		if matched, _ := s.matchBlock(sourceFileID, slice, crcSlice, absPos); matched {
 			// True shard match: advance past this block.
 			j += bs
 			justMissed = false
@@ -1085,10 +1080,30 @@ func (s *blockScanner) scanChunk(f *os.File, sourceFileID FileID, start, end int
 	return nil
 }
 
+// claimGrid checks every window of data, which starts at offset start in the
+// file sourceFileID, that lies on the block grid. claimed[i] reports that the
+// window at firstAligned+i*sliceByteCount holds the block expected there; see
+// matchBlock.
+func (s *blockScanner) claimGrid(sourceFileID FileID, data []byte, start int64) (firstAligned int64, claimed []bool) {
+	bs := int64(s.d.sliceByteCount)
+	lastWindow := int64(len(data)) - bs
+	firstAligned = (start + bs - 1) / bs * bs
+	claimed = make([]bool, 0, max(0, (lastWindow-(firstAligned-start))/bs+1))
+	for abs := firstAligned; abs-start <= lastWindow; abs += bs {
+		slice := data[abs-start : abs-start+bs]
+		_, inPlace := s.matchBlock(sourceFileID, slice, crc32.ChecksumIEEE(slice), abs)
+		claimed = append(claimed, inPlace)
+	}
+	return firstAligned, claimed
+}
+
 // matchBlock reports whether slice, whose CRC32 is crc and which starts at
 // absPos in the file sourceFileID, is a block of the set, confirmed by MD5. It
-// sends a matchEvent for every block slice equals.
-func (s *blockScanner) matchBlock(sourceFileID FileID, slice []byte, crc uint32, absPos int64) bool {
+// sends a matchEvent for every block slice equals. inPlace reports that one of
+// those blocks is the one expected at absPos: block absPos/sliceByteCount of
+// sourceFileID itself or, since a candidate file has no blocks of its own, of
+// any file when sourceFileID is a candidate.
+func (s *blockScanner) matchBlock(sourceFileID FileID, slice []byte, crc uint32, absPos int64) (matched, inPlace bool) {
 	atShardBoundary := absPos%int64(s.d.sliceByteCount) == 0
 	locations, found := s.lookupTable.Lookup(crc)
 	if !found {
@@ -1099,14 +1114,21 @@ func (s *blockScanner) matchBlock(sourceFileID FileID, slice []byte, crc uint32,
 				"shardIdx", absPos/int64(s.d.sliceByteCount),
 				"crc", fmt.Sprintf("%08x", crc))
 		}
-		return false
+		return false, false
 	}
 
 	blockHash := md5.Sum(slice)
-	matched := false
+	expectedShard := -1
+	if atShardBoundary {
+		expectedShard = int(absPos / int64(s.d.sliceByteCount))
+	}
 	for _, loc := range locations {
 		if loc.md5Hash == blockHash {
 			matched = true
+			if loc.shardIndex == expectedShard && !inPlace {
+				_, isCandidate := s.d.candidateByID[sourceFileID]
+				inPlace = loc.fileID == sourceFileID || isCandidate
+			}
 			s.matchChan <- matchEvent{
 				targetFileID: loc.fileID,
 				shardIndex:   loc.shardIndex,
@@ -1122,5 +1144,5 @@ func (s *blockScanner) matchBlock(sourceFileID FileID, slice []byte, crc uint32,
 			"shardIdx", absPos/int64(s.d.sliceByteCount),
 			"crc", fmt.Sprintf("%08x", crc))
 	}
-	return matched
+	return matched, inPlace
 }

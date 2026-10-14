@@ -177,31 +177,25 @@ func TestScanFlipInRepeatingData(t *testing.T) {
 	}
 }
 
-// scanChunkMatches runs scanChunk over [start, len(onDisk)) of a file holding
-// onDisk, against a set whose blocks are orig cut into sliceSize pieces, and
-// returns the offsets at which each shard was matched.
-func scanChunkMatches(t *testing.T, sliceSize int, orig, onDisk []byte, start int64) map[int][]int64 {
+// newChunkScanner returns a blockScanner for a set protecting files, each
+// cut into sliceSize blocks. finish stops it and returns the offsets at which
+// each shard, of any file, was matched.
+func newChunkScanner(t *testing.T, sliceSize int, files map[FileID][]byte) (s *blockScanner, finish func() map[int][]int64) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "f")
-	writeTestFile(t, path, onDisk)
-	f, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = f.Close() }()
-
 	checksumMap := make(map[uint32][]checksumLocation)
-	for i := 0; i+sliceSize <= len(orig); i += sliceSize {
-		b := orig[i : i+sliceSize]
-		crc := crc32.ChecksumIEEE(b)
-		checksumMap[crc] = append(checksumMap[crc], checksumLocation{shardIndex: i / sliceSize, md5Hash: md5.Sum(b)})
+	for id, data := range files {
+		for i := 0; i+sliceSize <= len(data); i += sliceSize {
+			b := data[i : i+sliceSize]
+			crc := crc32.ChecksumIEEE(b)
+			checksumMap[crc] = append(checksumMap[crc], checksumLocation{fileID: id, shardIndex: i / sliceSize, md5Hash: md5.Sum(b)})
+		}
 	}
 	window, err := newCRC32Window(sliceSize)
 	if err != nil {
 		t.Fatal(err)
 	}
 	matches := make(chan matchEvent)
-	scanner := &blockScanner{
+	s = &blockScanner{
 		d:           &Decoder{sliceByteCount: sliceSize, logger: slog.Default()},
 		ctx:         context.Background(),
 		window:      window,
@@ -216,9 +210,29 @@ func scanChunkMatches(t *testing.T, sliceSize int, orig, onDisk []byte, start in
 		}
 		close(done)
 	}()
-	err = scanner.scanChunk(f, FileID{}, start, int64(len(onDisk)))
-	close(matches)
-	<-done
+	return s, func() map[int][]int64 {
+		close(matches)
+		<-done
+		return found
+	}
+}
+
+// scanChunkMatches runs scanChunk over [start, len(onDisk)) of a file holding
+// onDisk, against a set whose blocks are orig cut into sliceSize pieces, and
+// returns the offsets at which each shard was matched.
+func scanChunkMatches(t *testing.T, sliceSize int, orig, onDisk []byte, start int64) map[int][]int64 {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "f")
+	writeTestFile(t, path, onDisk)
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	s, finish := newChunkScanner(t, sliceSize, map[FileID][]byte{{}: orig})
+	err = s.scanChunk(f, FileID{}, start, int64(len(onDisk)))
+	found := finish()
 	if err != nil {
 		t.Fatalf("scanChunk: %v", err)
 	}
@@ -298,6 +312,86 @@ func TestDecoderEndToEndMultiChunk(t *testing.T) {
 	if counts.UnusableDataShardCount != 0 {
 		t.Errorf("expected 0 unusable shards, got %d — a shard crossing a chunk boundary was likely missed",
 			counts.UnusableDataShardCount)
+	}
+}
+
+// TestClaimGridOnlyTheBlockExpectedThere covers bytes inserted in data that
+// repeats every 251 bytes. 120 bytes inserted at offset 3000 move the blocks
+// after it so that the grid windows of shards 6 and 7 hold exact copies of
+// shards 0 and 1. Claiming those windows would hide the shifted shards 6 and
+// 7, which start 120 bytes inside them, from the slide (#44). Only the windows
+// that hold their own block, shards 0 and 1, may be claimed.
+func TestClaimGridOnlyTheBlockExpectedThere(t *testing.T) {
+	orig := fixturePeriodic.files()[0].data
+	bad := splice(orig, 3000, bytes.Repeat([]byte{0x5A}, 120), 0)
+	s, finish := newChunkScanner(t, 1024, map[FileID][]byte{{}: orig})
+	_, claimed := s.claimGrid(FileID{}, bad, 0)
+	found := finish()
+
+	for _, shard := range []int{0, 1} {
+		if !slices.Contains(found[shard], int64(6+shard)*1024) {
+			t.Fatalf("shard %d matched at %v; the grid window at %d no longer holds a copy of it, so this test checks nothing", shard, found[shard], (6+shard)*1024)
+		}
+	}
+	want := []bool{true, true, false, false, false, false, false, false}
+	if !slices.Equal(claimed, want) {
+		t.Errorf("claimed = %v, want %v", claimed, want)
+	}
+}
+
+// TestClaimGridOnlyOwnBlocks checks that in a protected file the grid pass
+// claims a window only for that file's own block, as par2cmdline does: block
+// k of another file at position k is reported but not claimed, so the slide
+// still searches the window for the file's own block k.
+func TestClaimGridOnlyOwnBlocks(t *testing.T) {
+	const sliceSize, blocks = 8, 8
+	both := pseudoRandom(2 * sliceSize * blocks)
+	a, b := both[:sliceSize*blocks], both[sliceSize*blocks:]
+	onDisk := append([]byte{}, a...)
+	copy(onDisk[3*sliceSize:4*sliceSize], b[3*sliceSize:4*sliceSize])
+
+	fileA, fileB := FileID{1}, FileID{2}
+	s, finish := newChunkScanner(t, sliceSize, map[FileID][]byte{fileA: a, fileB: b})
+	_, claimed := s.claimGrid(fileA, onDisk, 0)
+	found := finish()
+
+	if !slices.Contains(found[3], 3*sliceSize) {
+		t.Fatalf("shard 3 matched at %v; the window at %d should hold file B's shard 3", found[3], 3*sliceSize)
+	}
+	want := []bool{true, true, true, false, true, true, true, true}
+	if !slices.Equal(claimed, want) {
+		t.Errorf("claimed = %v, want %v", claimed, want)
+	}
+}
+
+// TestClaimGridInCandidateFile checks that the grid pass claims blocks in a
+// file registered with AddCandidateFile. A candidate has a FileID of its own
+// that no block of the set carries, so requiring the block of the file being
+// scanned would claim nothing there, and the slide would hash every intact
+// block of it a second time.
+func TestClaimGridInCandidateFile(t *testing.T) {
+	const sliceSize, blocks = 8, 8
+	data := pseudoRandom(sliceSize * blocks)
+	path := filepath.Join(t.TempDir(), "copy")
+	writeTestFile(t, path, data)
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+
+	candidate := FileID{1}
+	s, finish := newChunkScanner(t, sliceSize, map[FileID][]byte{{}: data})
+	s.d.candidateByID = map[FileID]string{candidate: "copy"}
+	err = s.scanChunk(f, candidate, 0, int64(len(data)))
+	found := finish()
+	if err != nil {
+		t.Fatalf("scanChunk: %v", err)
+	}
+	for i := range blocks {
+		if want := []int64{int64(i * sliceSize)}; !slices.Equal(found[i], want) {
+			t.Errorf("shard %d matched at %v, want %v", i, found[i], want)
+		}
 	}
 }
 
