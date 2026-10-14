@@ -180,7 +180,8 @@ func (d *Decoder) Close() error {
 // when a file has been renamed or is otherwise not recognised by its name but
 // its content may match one of the protected files in the PAR2 set. path must
 // be relative to the PAR2 directory and within the sandbox (no traversal).
-// Call before VerifyScans; duplicate registrations are silently ignored.
+// Call before VerifyScans, never while it runs: the scan reads the registered
+// candidates without the lock. Duplicate registrations are silently ignored.
 func (d *Decoder) AddCandidateFile(path string) error {
 	defanged, err := DefangPath(path)
 	if err != nil {
