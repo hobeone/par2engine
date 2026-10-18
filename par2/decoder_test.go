@@ -1,6 +1,7 @@
 package par2
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"log/slog"
@@ -230,6 +231,48 @@ func TestNewDecoder_VolumeAsParseFile(t *testing.T) {
 			defer func() { _ = d.Close() }()
 			if got, want := d.ShardCounts().UsableParityShardCount, fixtureFileState.recovery; got != want {
 				t.Errorf("usable recovery blocks = %d, want %d (every volume of the set)", got, want)
+			}
+		})
+	}
+}
+
+// TestRepair_VolumeAsParseFile repairs a damaged block of a set with no index
+// file from each of its recovery volumes in turn. A volume repeats the File
+// Description packet once per recovery block it holds, and each file must
+// still be protected once.
+func TestRepair_VolumeAsParseFile(t *testing.T) {
+	for _, parse := range []string{"set.vol0+1.par2", "set.vol1+2.par2", "set.vol3+1.par2"} {
+		t.Run(parse, func(t *testing.T) {
+			dir, index, files := fixtureFileState.load(t)
+			if err := os.Remove(index); err != nil {
+				t.Fatal(err)
+			}
+			orig := files["f.dat"]
+			bad := append([]byte{}, orig...)
+			bad[5*fileStateSliceSize+10] ^= 0xFF
+			writeTestFile(t, filepath.Join(dir, "f.dat"), bad)
+
+			ctx := context.Background()
+			d, err := NewDecoder(ctx, filepath.Join(dir, parse), DecoderOptions{})
+			if err != nil {
+				t.Fatalf("NewDecoder: %v", err)
+			}
+			defer func() { _ = d.Close() }()
+			if got := len(d.protectedFiles); got != 1 {
+				t.Errorf("protected files = %d, want 1: a repeated File Description is one file", got)
+			}
+			if err := d.VerifyScans(ctx, nil); err != nil {
+				t.Fatalf("VerifyScans: %v", err)
+			}
+			if err := d.Repair(ctx, nil); err != nil {
+				t.Fatalf("Repair: %v", err)
+			}
+			got, err := os.ReadFile(filepath.Join(dir, "f.dat"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, orig) {
+				t.Error("repaired f.dat differs from the original")
 			}
 		})
 	}
