@@ -314,6 +314,12 @@ func (d *Decoder) handlePacket(ctx context.Context, h Header, body []byte, filen
 			}
 			return nil
 		}
+		// A recovery volume repeats each File Description once per recovery
+		// block it holds, so a volume read as the index file names each file
+		// several times.
+		if slices.ContainsFunc(d.protectedFiles, func(f FileDescPacket) bool { return f.FileID == p.FileID }) {
+			return nil
+		}
 		d.protectedFiles = append(d.protectedFiles, *p)
 		d.logger.DebugContext(ctx, "PAR2 set contains protected file", "file", p.Filename, "size", p.ByteCount)
 
