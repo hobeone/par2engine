@@ -196,3 +196,41 @@ func TestEnsureParentDir(t *testing.T) {
 		t.Error("expected an error when a parent path is a regular file")
 	}
 }
+
+func TestSetBaseName(t *testing.T) {
+	for name, want := range map[string]string{
+		"set.par2":              "set",
+		"SET.PAR2":              "SET",
+		"set.vol0+1.par2":       "set",
+		"set.vol01+02.PAR2":     "set",
+		"set.VOL3-1.par2":       "set",
+		"my.volume.par2":        "my.volume",
+		"set.vol0+1.extra.par2": "set.vol0+1.extra",
+	} {
+		if got := setBaseName(name); got != want {
+			t.Errorf("setBaseName(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+// TestNewDecoder_VolumeAsParseFile opens a set with no index file from each of
+// its recovery volumes in turn: every sibling volume must load, not only the
+// one parsed.
+func TestNewDecoder_VolumeAsParseFile(t *testing.T) {
+	for _, parse := range []string{"set.vol0+1.par2", "set.vol1+2.par2", "set.vol3+1.par2"} {
+		t.Run(parse, func(t *testing.T) {
+			dir, index, _ := fixtureFileState.load(t)
+			if err := os.Remove(index); err != nil {
+				t.Fatal(err)
+			}
+			d, err := NewDecoder(context.Background(), filepath.Join(dir, parse), DecoderOptions{})
+			if err != nil {
+				t.Fatalf("NewDecoder: %v", err)
+			}
+			defer func() { _ = d.Close() }()
+			if got, want := d.ShardCounts().UsableParityShardCount, fixtureFileState.recovery; got != want {
+				t.Errorf("usable recovery blocks = %d, want %d (every volume of the set)", got, want)
+			}
+		})
+	}
+}
