@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -365,8 +366,23 @@ func (d *Decoder) shardCountsLocked() ShardCounts {
 	return sc
 }
 
+// volumeTag matches the ".volNN+MM" (or ".volNN-MM") that names a recovery
+// volume, at the end of a name whose ".par2" has been removed.
+var volumeTag = regexp.MustCompile(`(?i)\.vol\d+[+-]\d+$`)
+
+// setBaseName returns the name a set's files share: name without its ".par2"
+// extension and, when name is a recovery volume, without its volume tag. A
+// set with no index file is parsed from one of its volumes, and its siblings
+// carry other tags, so the tag cannot be part of the prefix.
+func setBaseName(name string) string {
+	if strings.HasSuffix(strings.ToLower(name), ".par2") {
+		name = name[:len(name)-len(".par2")]
+	}
+	return volumeTag.ReplaceAllString(name, "")
+}
+
 func (d *Decoder) loadVolumeFiles(ctx context.Context, indexFilename string) error {
-	prefix := strings.TrimSuffix(indexFilename, ".par2")
+	prefix := setBaseName(indexFilename)
 
 	// Open the sandbox root directory to list files safely within the sandbox.
 	dirFile, err := d.root.Open(".")
