@@ -1,6 +1,7 @@
 package rs
 
 import (
+	"encoding/binary"
 	"errors"
 	"unsafe"
 
@@ -12,6 +13,15 @@ import (
 type Matrix struct {
 	rows, cols int
 	elements   []gf16.T
+}
+
+// init rejects big-endian hosts, where castTToByteSlice would hand the gf16
+// kernels byte-swapped elements and every matrix operation would silently
+// compute the wrong result.
+func init() {
+	if binary.NativeEndian.Uint16([]byte{1, 0}) != 1 {
+		panic("rs: big-endian CPUs are not supported")
+	}
 }
 
 func checkDims(rows, cols int) error {
@@ -126,9 +136,10 @@ func (m Matrix) swapRows(i, j int) {
 	}
 }
 
-// castTToByteSlice safely casts a []gf16.T to []byte using modern unsafe.Slice (Go 1.17+).
+// castTToByteSlice reinterprets a []gf16.T as []byte in place using unsafe.Slice.
 // Zero-allocation and compiler-optimized.
-// NOTE: assumes little-endian host (x86/ARM64). PAR2 uses LE byte order.
+// The gf16 kernels read the bytes as little-endian, so the cast is only valid on a
+// little-endian host; init refuses to run anywhere else.
 func castTToByteSlice(ts []gf16.T) []byte {
 	if len(ts) == 0 {
 		return nil
