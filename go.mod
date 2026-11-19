@@ -1,9 +1,9 @@
 module github.com/hobeone/par2engine
 
-go 1.27.2
+go 1.27.4
 
 require (
-	github.com/klauspost/cpuid/v2 v2.4.1
+	github.com/klauspost/cpuid/v2 v2.4.2
 	github.com/mmcloughlin/avo v0.6.0
 )
 
